@@ -43,6 +43,9 @@ dnl JIT compiler options.
 AC_ARG_ENABLE(jit-compiler,  [  --enable-jit-compiler   enable JIT compiler [default=yes]], [WANT_JIT=$enableval], [WANT_JIT=yes])
 AC_ARG_ENABLE(jit-debug,     [  --enable-jit-debug      activate native code disassemblers [default=no]], [WANT_JIT_DEBUG=$enableval], [WANT_JIT_DEBUG=no])
 
+dnl Web streaming option (headless mode, no SDL/X11).
+AC_ARG_ENABLE(webstreaming,  [  --enable-webstreaming   enable headless WebSocket streaming [default=no]], [WANT_WEBSTREAMING=$enableval], [WANT_WEBSTREAMING=no])
+
 dnl FPU emulation core.
 AC_ARG_ENABLE(fpe,
 [  --enable-fpe=FPE        specify which fpu emulator to use [default=auto]],
@@ -285,6 +288,12 @@ LIBS="$saved_LIBS"; CPPFLAGS="$saved_CPPFLAGS"; $4]
   AS_VAR_POPDEF([ac_Framework])
 ])
 
+dnl Webstreaming mode is mutually exclusive with SDL (headless only)
+if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
+  WANT_SDL_VIDEO=no
+  WANT_SDL_AUDIO=no
+fi
+
 dnl Do we need SDL?
 WANT_SDL=no
 if [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
@@ -371,8 +380,8 @@ else
   SDL_SUPPORT="none"
 fi
 
-dnl We need X11, if not using SDL or Mac GUI.
-if [[ "x$WANT_SDL_VIDEO" = "xno" -a "x$WANT_MACOSX_GUI" = "xno" ]]; then
+dnl We need X11, if not using SDL, Mac GUI, or webstreaming mode.
+if [[ "x$WANT_SDL_VIDEO" = "xno" -a "x$WANT_MACOSX_GUI" = "xno" -a "x$WANT_WEBSTREAMING" = "xno" ]]; then
   AC_PATH_XTRA
   if [[ "x$no_x" = "xyes" ]]; then
     AC_MSG_ERROR([You need X11 to run Basilisk II.])
@@ -860,6 +869,24 @@ AS_IF([test "x$with_vdeplug" = "xyes"], [
   AC_CHECK_LIB(vdeplug, vde_close, [], [have_vdeplug=no])
 ])
 
+dnl Web streaming support
+if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
+  AC_CHECK_LIB(websockets, lws_create_context, [
+    AC_DEFINE(ENABLE_WEBSTREAMING, 1, [Define to enable WebSocket streaming for browser access])
+    LIBS="$LIBS -lwebsockets -lpthread"
+    CPPFLAGS="$CPPFLAGS -I../../../web-streaming/server"
+    WEBSTREAMING_SRCS="../../../web-streaming/server/websocket_server.cpp ../../../web-streaming/server/basilisk_integration.cpp"
+  ], [
+    AC_MSG_ERROR([libwebsockets not found. Install libwebsockets-dev or disable --enable-webstreaming])
+  ])
+fi
+AC_SUBST(WEBSTREAMING_SRCS)
+
+dnl Webstreaming implies headless mode
+if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
+  AC_DEFINE(ENABLE_HEADLESS, 1, [Define to enable headless mode (no SDL/X11)])
+fi
+
 if [[ "x$WANT_MACOSX_GUI" = "xyes" ]]; then
   CPPFLAGS="$CPPFLAGS -I../MacOSX"
   LIBS="$LIBS -framework CoreAudio -framework AudioUnit -framework AudioToolbox"
@@ -891,7 +918,13 @@ if [[ "x$WANT_SDL" = "xyes" ]]; then
     EXTRASYSSRCS="$EXTRASYSSRCS ../SDL/SDLMain.m"
   fi
 fi
-if [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
+dnl Video source selection - webstreaming is mutually exclusive with SDL/X11
+if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
+  dnl Webstreaming mode - no local display, WebSocket streaming only
+  VIDEOSRCS="../SDL/video_headless.cpp"
+  KEYCODES="../SDL/keycodes"
+  EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"
+elif [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
   AC_DEFINE(USE_SDL_VIDEO, 1, [Define to enable SDL video graphics support])
   VIDEOSRCS="../SDL/video_sdl.cpp ../SDL/video_sdl2.cpp ../SDL/video_sdl3.cpp "
   KEYCODES="../SDL/keycodes"
@@ -957,7 +990,7 @@ if [[ "x$HAVE_PTHREADS" = "xno" ]]; then
   ETHERSRC=../dummy/ether_dummy.cpp
   AUDIOSRC=../dummy/audio_dummy.cpp
 fi
-SYSSRCS="$VIDEOSRCS $EXTFSSRC $SERIALSRC $ETHERSRC $SCSISRC $AUDIOSRC $SEMSRC $UISRCS $MONSRCS $EXTRASYSSRCS"
+SYSSRCS="$VIDEOSRCS $EXTFSSRC $SERIALSRC $ETHERSRC $SCSISRC $AUDIOSRC $SEMSRC $UISRCS $MONSRCS $WEBSTREAMING_SRCS $EXTRASYSSRCS"
 
 dnl Define a macro that translates a yesno-variable into a C macro definition
 dnl to be put into the config.h file
@@ -1510,7 +1543,8 @@ if [[ "x$OS_TYPE" = "xdarwin" ]]; then
 fi
 
 dnl Enable VOSF screen updates with this feature is requested and feasible
-if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" ]]; then
+dnl VOSF is not needed for webstreaming mode (we stream the full buffer)
+if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" -a "x$WANT_WEBSTREAMING" != "xyes" ]]; then
     AC_DEFINE(ENABLE_VOSF, 1, [Define if using video enabled on SEGV signals.])
 else
     WANT_VOSF=no
@@ -1979,5 +2013,6 @@ echo Floating-Point emulation core .......... : $FPE_CORE
 echo Assembly optimizations ................. : $ASM_OPTIMIZATIONS
 echo Addressing mode ........................ : $ADDRESSING_MODE
 echo Bad memory access recovery type ........ : $sigsegv_recovery
+echo WebSocket streaming .................... : $WANT_WEBSTREAMING
 echo
 echo "Configuration done. Now type \"make\" (or \"gmake\")."

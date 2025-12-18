@@ -107,7 +107,8 @@
 #endif
 
 /* Direct Addressing requires Video on SEGV signals in plain X11 mode */
-#if DIRECT_ADDRESSING && (!ENABLE_VOSF && !USE_SDL_VIDEO)
+/* (But not in headless mode where we don't have X11) */
+#if DIRECT_ADDRESSING && (!ENABLE_VOSF && !USE_SDL_VIDEO && !ENABLE_HEADLESS)
 # undef  ENABLE_VOSF
 # define ENABLE_VOSF 1
 #endif

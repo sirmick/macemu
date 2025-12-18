@@ -33,7 +33,7 @@
 #endif
 #endif
 
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 # include <X11/Xlib.h>
 #endif
 
@@ -144,7 +144,7 @@ bool TwentyFourBitAddressing;
 
 
 // Global variables
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 extern char *x_display_name;						// X11 display name
 extern Display *x_display;							// X11 display handle
 #ifdef X11_LOCK_TYPE
@@ -204,6 +204,9 @@ static timer_t timer;				// 60Hz timer
 #ifdef ENABLE_MON
 static struct sigaction sigint_sa;	// sigaction for SIGINT handler
 static void sigint_handler(...);
+#elif defined(ENABLE_HEADLESS)
+static struct sigaction sigint_sa;	// sigaction for SIGINT handler
+static void sigint_handler(int sig);
 #endif
 
 #if REAL_ADDRESSING
@@ -469,7 +472,7 @@ int main(int argc, char **argv)
 	for (int i=1; i<argc; i++) {
 		if (strcmp(argv[i], "--help") == 0) {
 			usage(argv[0]);
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 		} else if (strcmp(argv[i], "--display") == 0) {
 			i++; // don't remove the argument, gtk_init() needs it too
 			if (i < argc)
@@ -585,7 +588,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 	// Open display
 	x_display = XOpenDisplay(x_display_name);
 	if (x_display == NULL) {
@@ -628,7 +631,7 @@ int main(int argc, char **argv)
 	// menu bar in-place.
 	disable_SDL2_macosx_menu_bar_keyboard_shortcuts();
 #endif
-	
+
 #endif
 
 	// Init system routines
@@ -879,6 +882,12 @@ int main(int argc, char **argv)
 	sigint_sa.sa_handler = (void (*)(int))sigint_handler;
 	sigint_sa.sa_flags = 0;
 	sigaction(SIGINT, &sigint_sa, NULL);
+#elif defined(ENABLE_HEADLESS)
+	// Setup SIGINT handler to quit cleanly in headless mode
+	sigemptyset(&sigint_sa.sa_mask);
+	sigint_sa.sa_handler = sigint_handler;
+	sigint_sa.sa_flags = 0;
+	sigaction(SIGINT, &sigint_sa, NULL);
 #endif
 
 #ifndef USE_CPU_EMUL_SERVICES
@@ -1046,7 +1055,7 @@ void QuitEmulator(void)
 	PrefsExit();
 
 	// Close X11 server connection
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 	if (x_display)
 		XCloseDisplay(x_display);
 #endif
@@ -1102,6 +1111,12 @@ static void sigint_handler(...)
 	VideoQuitFullScreen();
 	const char *arg[4] = {"mon", "-m", "-r", NULL};
 	mon(3, arg);
+	QuitEmulator();
+}
+#elif defined(ENABLE_HEADLESS)
+static void sigint_handler(int sig)
+{
+	printf("\nHeadless: Received signal %d, shutting down...\n", sig);
 	QuitEmulator();
 }
 #endif
@@ -1701,13 +1716,13 @@ void ErrorAlert(const char *text)
 			rpc_method_wait_for_reply(gui_connection, RPC_TYPE_INVALID) == RPC_ERROR_NO_ERROR)
 			return;
 	}
-#ifdef ENABLE_GTK
-#ifndef USE_SDL_VIDEO
+#if defined(ENABLE_GTK) && !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 	if (x_display == NULL) {
 		printf(GetString(STR_SHELL_ERROR_PREFIX), text);
 		return;
 	}
 #endif
+#ifdef ENABLE_GTK
 	VideoQuitFullScreen();
 	display_alert(STR_ERROR_ALERT_TITLE, STR_GUI_ERROR_PREFIX, STR_QUIT_BUTTON, text);
 #else
@@ -1727,13 +1742,13 @@ void WarningAlert(const char *text)
 			rpc_method_wait_for_reply(gui_connection, RPC_TYPE_INVALID) == RPC_ERROR_NO_ERROR)
 			return;
 	}
-#ifdef ENABLE_GTK
-#ifndef USE_SDL_VIDEO
+#if defined(ENABLE_GTK) && !defined(USE_SDL_VIDEO) && !defined(ENABLE_HEADLESS)
 	if (x_display == NULL) {
 		printf(GetString(STR_SHELL_WARNING_PREFIX), text);
 		return;
 	}
 #endif
+#ifdef ENABLE_GTK
 	display_alert(STR_WARNING_ALERT_TITLE, STR_GUI_WARNING_PREFIX, STR_OK_BUTTON, text);
 #else
 	printf(GetString(STR_SHELL_WARNING_PREFIX), text);

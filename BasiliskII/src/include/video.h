@@ -274,4 +274,9 @@ extern void VideoQuitFullScreen(void);
 extern void VideoInterrupt(void);
 extern void VideoRefresh(void);
 
+// Guest OS Screen Width
+extern uint32 MacScreenWidth;
+// Guest OS Screen Height
+extern uint32 MacScreenHeight;
+
 #endif
