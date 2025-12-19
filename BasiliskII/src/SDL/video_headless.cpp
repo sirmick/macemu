@@ -53,7 +53,14 @@
 #include "vm_alloc.h"
 
 #ifdef ENABLE_WEBSTREAMING
-#include "basilisk_integration.h"
+#include "gstreamer_webrtc.h"
+// Map to unified API names
+#define ws_streaming_init      gst_webrtc_init
+#define ws_streaming_exit      gst_webrtc_exit
+#define ws_streaming_enabled   gst_webrtc_enabled
+#define ws_streaming_client_count gst_webrtc_peer_count
+#define ws_streaming_send_frame gst_webrtc_push_frame
+#define ws_set_input_callbacks gst_webrtc_set_input_callbacks
 #endif
 
 #define DEBUG 0
@@ -344,8 +351,8 @@ static void video_refresh_thread()
 		last_frame_time = now;
 
 #ifdef ENABLE_WEBSTREAMING
-		// Only convert and send if we have clients
-		if (ws_streaming_enabled() && ws_streaming_client_count() > 0) {
+		// Always push frames - webrtcsink needs data flowing to register as producer
+		if (ws_streaming_enabled()) {
 			convert_to_rgba();
 			ws_streaming_send_frame(rgba_buffer.data(), frame_width, frame_height,
 			                        frame_width * 4);
@@ -506,12 +513,22 @@ static bool Headless_VideoInit(bool classic)
 	classic_mode = classic;
 
 #ifdef ENABLE_WEBSTREAMING
-	// Initialize WebSocket streaming
+	// Initialize streaming backend (WebRTC or WebSocket)
 	int ws_port = PrefsFindInt32("webstreamingport");
 	if (ws_port <= 0) ws_port = 8090;
 
+#if defined(ENABLE_WEBRTC)
+	fprintf(stderr, "Headless: Initializing WebRTC streaming on port %d\n", ws_port);
+#else
+	fprintf(stderr, "Headless: Initializing WebSocket streaming on port %d\n", ws_port);
+#endif
+
 	if (!ws_streaming_init(ws_port)) {
+#if defined(ENABLE_WEBRTC)
+		fprintf(stderr, "Headless: WebRTC streaming failed to initialize\n");
+#else
 		fprintf(stderr, "Headless: WebSocket streaming failed to initialize\n");
+#endif
 		return false;
 	}
 
@@ -591,8 +608,8 @@ static bool Headless_VideoInit(bool classic)
 		}
 	);
 #else
-	fprintf(stderr, "Headless: ERROR - Built without WebSocket streaming support!\n");
-	fprintf(stderr, "Headless: Rebuild with --enable-webstreaming\n");
+	fprintf(stderr, "Headless: ERROR - Built without streaming support!\n");
+	fprintf(stderr, "Headless: Rebuild with --enable-webstreaming or --enable-webrtc\n");
 	return false;
 #endif
 

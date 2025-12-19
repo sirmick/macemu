@@ -43,8 +43,8 @@ dnl JIT compiler options.
 AC_ARG_ENABLE(jit-compiler,  [  --enable-jit-compiler   enable JIT compiler [default=yes]], [WANT_JIT=$enableval], [WANT_JIT=yes])
 AC_ARG_ENABLE(jit-debug,     [  --enable-jit-debug      activate native code disassemblers [default=no]], [WANT_JIT_DEBUG=$enableval], [WANT_JIT_DEBUG=no])
 
-dnl Web streaming option (headless mode, no SDL/X11).
-AC_ARG_ENABLE(webstreaming,  [  --enable-webstreaming   enable headless WebSocket streaming [default=no]], [WANT_WEBSTREAMING=$enableval], [WANT_WEBSTREAMING=no])
+dnl Web streaming option (headless mode with WebRTC via GStreamer).
+AC_ARG_ENABLE(webstreaming,  [  --enable-webstreaming   enable headless WebRTC streaming [default=no]], [WANT_WEBSTREAMING=$enableval], [WANT_WEBSTREAMING=no])
 
 dnl FPU emulation core.
 AC_ARG_ENABLE(fpe,
@@ -869,16 +869,17 @@ AS_IF([test "x$with_vdeplug" = "xyes"], [
   AC_CHECK_LIB(vdeplug, vde_close, [], [have_vdeplug=no])
 ])
 
-dnl Web streaming support
+dnl Web streaming support using GStreamer WebRTC
 if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-  AC_CHECK_LIB(websockets, lws_create_context, [
-    AC_DEFINE(ENABLE_WEBSTREAMING, 1, [Define to enable WebSocket streaming for browser access])
-    LIBS="$LIBS -lwebsockets -lpthread"
-    CPPFLAGS="$CPPFLAGS -I../../../web-streaming/server"
-    WEBSTREAMING_SRCS="../../../web-streaming/server/websocket_server.cpp ../../../web-streaming/server/basilisk_integration.cpp"
+  PKG_CHECK_MODULES(GSTREAMER, [gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-1.0], [
+    AC_DEFINE(ENABLE_WEBSTREAMING, 1, [Define to enable streaming for browser access])
+    CPPFLAGS="$CPPFLAGS $GSTREAMER_CFLAGS -I../../../web-streaming/server"
+    LIBS="$LIBS $GSTREAMER_LIBS -lpthread"
+    WEBSTREAMING_SRCS="../../../web-streaming/server/gstreamer_webrtc.cpp"
   ], [
-    AC_MSG_ERROR([libwebsockets not found. Install libwebsockets-dev or disable --enable-webstreaming])
+    AC_MSG_ERROR([GStreamer WebRTC libraries not found. Install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev])
   ])
+  AC_MSG_NOTICE([NOTE: WebRTC streaming requires gst-plugins-rs (webrtcsink). Install gstreamer1.0-plugins-rs or build from source.])
 fi
 AC_SUBST(WEBSTREAMING_SRCS)
 
@@ -920,7 +921,7 @@ if [[ "x$WANT_SDL" = "xyes" ]]; then
 fi
 dnl Video source selection - webstreaming is mutually exclusive with SDL/X11
 if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-  dnl Webstreaming mode - no local display, WebSocket streaming only
+  dnl Webstreaming mode - no local display, WebRTC streaming only
   VIDEOSRCS="../SDL/video_headless.cpp"
   KEYCODES="../SDL/keycodes"
   EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"
@@ -2013,6 +2014,6 @@ echo Floating-Point emulation core .......... : $FPE_CORE
 echo Assembly optimizations ................. : $ASM_OPTIMIZATIONS
 echo Addressing mode ........................ : $ADDRESSING_MODE
 echo Bad memory access recovery type ........ : $sigsegv_recovery
-echo WebSocket streaming .................... : $WANT_WEBSTREAMING
+echo WebRTC streaming ....................... : $WANT_WEBSTREAMING
 echo
 echo "Configuration done. Now type \"make\" (or \"gmake\")."
