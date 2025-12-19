@@ -2,182 +2,167 @@
 
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fPIC
-LDFLAGS = -lwebsockets -lpthread
-
-# GStreamer flags for WebRTC support
-# Note: gstreamer-webrtc-1.0 is part of libgstreamer-plugins-bad1.0-dev
-GST_CFLAGS = $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-1.0 2>/dev/null)
-GST_LIBS = $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-1.0 2>/dev/null)
+LDFLAGS = -lpthread
 
 # Directories
 SERVER_DIR = server
 CLIENT_DIR = client
 BUILD_DIR = build
 
-# Source files (WebSocket-based streaming)
-SERVER_SRCS = $(SERVER_DIR)/websocket_server.cpp
-INTEGRATION_SRCS = $(SERVER_DIR)/basilisk_integration.cpp
-TEST_SERVER_SRCS = $(SERVER_DIR)/test_server.cpp
+# libdatachannel paths
+LIBDATACHANNEL_DIR = libdatachannel
+LIBDATACHANNEL_BUILD = $(LIBDATACHANNEL_DIR)/build
+LIBDATACHANNEL_LIB = $(LIBDATACHANNEL_BUILD)/libdatachannel.a
+LIBDATACHANNEL_INCLUDES = -I$(LIBDATACHANNEL_DIR)/include
 
-# Source files (WebRTC-based streaming)
-GSTREAMER_SRCS = $(SERVER_DIR)/gstreamer_webrtc.cpp
+# usrsctp library - needs symbol renaming to avoid conflicts with slirp
+USRSCTP_ORIG = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
+USRSCTP_FIXED = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp_fixed.a
+
+# Symbols that conflict with slirp and need to be localized
+CONFLICTING_SYMBOLS = ip_defttl ip_id m_adj m_cat m_free m_get socreate sofree solisten
+
+# libvpx (system package)
+VPX_CFLAGS = $(shell pkg-config --cflags vpx 2>/dev/null)
+VPX_LIBS = $(shell pkg-config --libs vpx 2>/dev/null || echo "-lvpx")
+
+# Combined flags for datachannel backend
+DATACHANNEL_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(VPX_CFLAGS)
+DATACHANNEL_LIBS = $(LIBDATACHANNEL_LIB) $(VPX_LIBS) -lpthread
+
+# Source files (libdatachannel-based streaming)
+DATACHANNEL_SRCS = $(SERVER_DIR)/datachannel_webrtc.cpp
 
 # Object files
-SERVER_OBJS = $(BUILD_DIR)/websocket_server.o
-INTEGRATION_OBJS = $(BUILD_DIR)/basilisk_integration.o
-TEST_SERVER_OBJS = $(BUILD_DIR)/test_server.o
-GSTREAMER_OBJS = $(BUILD_DIR)/gstreamer_webrtc.o
+DATACHANNEL_OBJS = $(BUILD_DIR)/datachannel_webrtc.o
 
 # Targets
-TEST_SERVER = $(BUILD_DIR)/test_server
-TEST_GSTREAMER = $(BUILD_DIR)/test_gstreamer
-STATIC_LIB = $(BUILD_DIR)/libwebstreaming.a
-SHARED_LIB = $(BUILD_DIR)/libwebstreaming.so
-STATIC_LIB_WEBRTC = $(BUILD_DIR)/libwebrtcstreaming.a
+STATIC_LIB_DATACHANNEL = $(BUILD_DIR)/libdatachannelstreaming.a
+TEST_DATACHANNEL = $(BUILD_DIR)/test_datachannel
 
 # Default target
-all: dirs $(TEST_SERVER) $(STATIC_LIB)
+all: deps-check libdatachannel dirs $(STATIC_LIB_DATACHANNEL)
+	@echo ""
+	@echo "Build complete!"
+	@echo "Static library: $(STATIC_LIB_DATACHANNEL)"
+	@echo ""
+	@echo "To use with Basilisk II:"
+	@echo "  cd ../BasiliskII/src/Unix"
+	@echo "  ./configure --enable-webstreaming"
+	@echo "  make"
 
 # Create build directory
 dirs:
 	@mkdir -p $(BUILD_DIR)
 
-# Test server (WebSocket)
-$(TEST_SERVER): $(SERVER_OBJS) $(TEST_SERVER_OBJS)
-	$(CXX) -o $@ $^ $(LDFLAGS)
+# Build libdatachannel
+libdatachannel: $(LIBDATACHANNEL_LIB)
 
-# Static library for linking with Basilisk II (WebSocket version)
-$(STATIC_LIB): $(SERVER_OBJS) $(INTEGRATION_OBJS)
+$(LIBDATACHANNEL_LIB):
+	@echo "Building libdatachannel..."
+	@mkdir -p $(LIBDATACHANNEL_BUILD)
+	cd $(LIBDATACHANNEL_BUILD) && cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DNO_WEBSOCKET=OFF \
+		-DNO_MEDIA=OFF \
+		-DNO_EXAMPLES=ON \
+		-DNO_TESTS=ON \
+		-DUSE_GNUTLS=OFF \
+		-DUSE_MBEDTLS=OFF \
+		-DUSE_NICE=OFF \
+		-DBUILD_SHARED_LIBS=OFF
+	$(MAKE) -C $(LIBDATACHANNEL_BUILD) -j$$(nproc)
+	@echo "libdatachannel built successfully"
+	@echo "Fixing usrsctp symbol conflicts with slirp..."
+	@cp $(USRSCTP_ORIG) $(USRSCTP_FIXED)
+	@for sym in $(CONFLICTING_SYMBOLS); do \
+		objcopy --redefine-sym $$sym=__usrsctp_$$sym $(USRSCTP_FIXED); \
+	done
+	@echo "Symbol conflicts fixed in $(USRSCTP_FIXED)"
+
+# Static library for libdatachannel version
+$(STATIC_LIB_DATACHANNEL): $(DATACHANNEL_OBJS)
 	ar rcs $@ $^
 
-# Shared library (alternative)
-$(SHARED_LIB): $(SERVER_OBJS) $(INTEGRATION_OBJS)
-	$(CXX) -shared -o $@ $^ $(LDFLAGS)
+# Compile datachannel source
+$(BUILD_DIR)/datachannel_webrtc.o: $(SERVER_DIR)/datachannel_webrtc.cpp $(SERVER_DIR)/datachannel_webrtc.h $(LIBDATACHANNEL_LIB)
+	$(CXX) $(CXXFLAGS) $(DATACHANNEL_CFLAGS) -c $< -o $@
 
-# Static library for WebRTC version
-$(STATIC_LIB_WEBRTC): $(GSTREAMER_OBJS)
-	ar rcs $@ $^
+# Test harness for datachannel
+$(BUILD_DIR)/test_datachannel.o: $(SERVER_DIR)/test_datachannel.cpp $(SERVER_DIR)/datachannel_webrtc.h
+	$(CXX) $(CXXFLAGS) $(DATACHANNEL_CFLAGS) -c $< -o $@
 
-# Compile server sources (WebSocket)
-$(BUILD_DIR)/websocket_server.o: $(SERVER_DIR)/websocket_server.cpp $(SERVER_DIR)/websocket_server.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(TEST_DATACHANNEL): $(DATACHANNEL_OBJS) $(BUILD_DIR)/test_datachannel.o
+	$(CXX) -o $@ $^ $(DATACHANNEL_LIBS)
 
-$(BUILD_DIR)/basilisk_integration.o: $(SERVER_DIR)/basilisk_integration.cpp $(SERVER_DIR)/basilisk_integration.h $(SERVER_DIR)/websocket_server.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/test_server.o: $(SERVER_DIR)/test_server.cpp $(SERVER_DIR)/websocket_server.h
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Compile GStreamer WebRTC source
-$(BUILD_DIR)/gstreamer_webrtc.o: $(SERVER_DIR)/gstreamer_webrtc.cpp $(SERVER_DIR)/gstreamer_webrtc.h
-	$(CXX) $(CXXFLAGS) $(GST_CFLAGS) -c $< -o $@
-
-# Test harness for GStreamer WebRTC
-$(BUILD_DIR)/test_gstreamer.o: $(SERVER_DIR)/test_gstreamer.cpp $(SERVER_DIR)/gstreamer_webrtc.h
-	$(CXX) $(CXXFLAGS) $(GST_CFLAGS) -c $< -o $@
-
-$(TEST_GSTREAMER): $(GSTREAMER_OBJS) $(BUILD_DIR)/test_gstreamer.o
-	$(CXX) -o $@ $^ $(GST_LIBS) -lpthread
-
-# Run test server (WebSocket)
-run: $(TEST_SERVER)
-	./$(BUILD_DIR)/test_server -p 8090
-
-# Run test server (WebRTC)
-run-webrtc: $(TEST_GSTREAMER)
-	./$(BUILD_DIR)/test_gstreamer
+# Run test server
+run: $(TEST_DATACHANNEL)
+	./$(BUILD_DIR)/test_datachannel
 
 # Serve client files (requires Python)
 serve-client:
 	@echo "Starting HTTP server for client files on port 8000..."
-	@echo "Open http://localhost:8000 in your browser"
+	@echo "Open http://localhost:8000/index_datachannel.html in your browser"
 	cd $(CLIENT_DIR) && python3 -m http.server 8000
 
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
 
-# Install library to system (for Basilisk II to link against)
-install: $(STATIC_LIB) $(STATIC_LIB_WEBRTC)
-	@mkdir -p /usr/local/lib /usr/local/include/webstreaming
-	cp $(STATIC_LIB) /usr/local/lib/
-	cp $(STATIC_LIB_WEBRTC) /usr/local/lib/
-	cp $(SERVER_DIR)/basilisk_integration.h /usr/local/include/webstreaming/
-	cp $(SERVER_DIR)/websocket_server.h /usr/local/include/webstreaming/
-	cp $(SERVER_DIR)/gstreamer_webrtc.h /usr/local/include/webstreaming/
+# Clean everything including libdatachannel
+distclean: clean
+	rm -rf $(LIBDATACHANNEL_BUILD)
+
+# Check dependencies
+deps-check:
+	@echo "Checking dependencies..."
+	@which cmake >/dev/null 2>&1 || (echo "ERROR: cmake not found. Install with: sudo apt install cmake" && exit 1)
+	@which pkg-config >/dev/null 2>&1 || (echo "ERROR: pkg-config not found. Install with: sudo apt install pkg-config" && exit 1)
+	@pkg-config --exists vpx 2>/dev/null || (echo "ERROR: libvpx not found. Install with: sudo apt install libvpx-dev" && exit 1)
+	@pkg-config --exists openssl 2>/dev/null || (echo "ERROR: openssl not found. Install with: sudo apt install libssl-dev" && exit 1)
+	@echo "All dependencies found!"
 
 # Install dependencies (Ubuntu/Debian)
 deps:
-	sudo apt-get install -y libwebsockets-dev
+	sudo apt-get install -y cmake pkg-config libvpx-dev libssl-dev
 
-# Install WebRTC dependencies (Ubuntu/Debian)
-deps-webrtc:
-	sudo apt-get install -y \
-		gstreamer1.0-tools \
-		gstreamer1.0-plugins-base \
-		gstreamer1.0-plugins-good \
-		gstreamer1.0-plugins-bad \
-		libgstreamer1.0-dev \
-		libgstreamer-plugins-base1.0-dev \
-		libgstreamer-plugins-bad1.0-dev
-	@echo ""
-	@echo "NOTE: You also need gst-plugins-rs for webrtcsink:"
-	@echo "  Ubuntu 24.04+: sudo apt install gstreamer1.0-plugins-rs"
-	@echo "  Or build from: https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
-
-# Check if WebRTC dependencies are available
-check-webrtc:
-	@echo "Checking GStreamer..."
-	@pkg-config --exists gstreamer-1.0 && echo "  gstreamer-1.0: OK" || echo "  gstreamer-1.0: MISSING"
-	@pkg-config --exists gstreamer-app-1.0 && echo "  gstreamer-app-1.0: OK" || echo "  gstreamer-app-1.0: MISSING"
-	@pkg-config --exists gstreamer-webrtc-1.0 && echo "  gstreamer-webrtc-1.0: OK" || echo "  gstreamer-webrtc-1.0: MISSING (install libgstreamer-plugins-bad1.0-dev)"
-	@echo "Checking webrtcsink plugin..."
-	@gst-inspect-1.0 webrtcsink >/dev/null 2>&1 && echo "  webrtcsink: OK" || echo "  webrtcsink: MISSING (install gst-plugins-rs)"
+# Install library and headers for Basilisk II
+install: $(STATIC_LIB_DATACHANNEL) $(LIBDATACHANNEL_LIB)
+	@mkdir -p /usr/local/lib /usr/local/include/datachannel
+	cp $(STATIC_LIB_DATACHANNEL) /usr/local/lib/
+	cp $(LIBDATACHANNEL_LIB) /usr/local/lib/
+	cp -r $(LIBDATACHANNEL_DIR)/include/rtc /usr/local/include/
+	cp $(SERVER_DIR)/datachannel_webrtc.h /usr/local/include/datachannel/
 
 # Help
 help:
-	@echo "Basilisk II Web Streaming Build System"
+	@echo "Basilisk II Web Streaming Build System (libdatachannel)"
 	@echo ""
-	@echo "WebSocket Streaming Targets:"
-	@echo "  all          - Build WebSocket streaming (default)"
-	@echo "  lib          - Build static library for Basilisk II integration"
-	@echo "  run          - Build and run test server on port 8090"
+	@echo "Targets:"
+	@echo "  all          - Build everything (default)"
+	@echo "  libdatachannel - Build libdatachannel library only"
+	@echo "  run          - Build and run test server"
 	@echo "  serve-client - Serve client files via HTTP on port 8000"
-	@echo ""
-	@echo "WebRTC Streaming Targets:"
-	@echo "  webrtc       - Build WebRTC streaming library"
-	@echo "  test_gstreamer - Build WebRTC test harness"
-	@echo "  run-webrtc   - Run WebRTC test server"
-	@echo "  check-webrtc - Check WebRTC dependencies"
-	@echo "  deps-webrtc  - Install WebRTC dependencies"
-	@echo ""
-	@echo "Common Targets:"
-	@echo "  install      - Install libraries to /usr/local"
 	@echo "  clean        - Remove build files"
-	@echo "  deps         - Install WebSocket dependencies"
+	@echo "  distclean    - Remove all build files including libdatachannel"
+	@echo "  deps         - Install system dependencies"
+	@echo "  deps-check   - Check if dependencies are installed"
+	@echo "  install      - Install libraries to /usr/local"
 	@echo "  help         - Show this help"
 	@echo ""
-	@echo "Usage (WebSocket):"
-	@echo "  1. Build: make"
-	@echo "  2. Run test server: make run"
-	@echo "  3. In another terminal: make serve-client"
-	@echo "  4. Open http://localhost:8000 in browser"
+	@echo "Quick Start:"
+	@echo "  1. Install deps: make deps"
+	@echo "  2. Build: make"
+	@echo "  3. Build Basilisk II:"
+	@echo "     cd ../BasiliskII/src/Unix"
+	@echo "     ./configure --enable-webstreaming"
+	@echo "     make"
 	@echo ""
-	@echo "Usage (WebRTC):"
-	@echo "  1. Install deps: make deps-webrtc"
-	@echo "  2. Check deps: make check-webrtc"
-	@echo "  3. Build: make webrtc"
-	@echo "  4. Run: make run-webrtc"
-	@echo "  5. Open http://localhost:8000/index_webrtc.html in browser"
-	@echo ""
-	@echo "For Basilisk II integration:"
-	@echo "  WebSocket: Link with -L$(BUILD_DIR) -lwebstreaming -lwebsockets"
-	@echo "  WebRTC:    Link with -L$(BUILD_DIR) -lwebrtcstreaming $(GST_LIBS)"
+	@echo "For testing standalone:"
+	@echo "  1. make run          (in one terminal)"
+	@echo "  2. make serve-client (in another terminal)"
+	@echo "  3. Open http://localhost:8000/index_datachannel.html"
 
-lib: dirs $(STATIC_LIB)
+test_datachannel: dirs libdatachannel $(TEST_DATACHANNEL)
 
-webrtc: dirs $(STATIC_LIB_WEBRTC)
-
-test_gstreamer: dirs $(TEST_GSTREAMER)
-
-.PHONY: all dirs run run-webrtc serve-client clean deps deps-webrtc check-webrtc help lib webrtc test_gstreamer install
+.PHONY: all dirs run serve-client clean distclean deps deps-check help libdatachannel test_datachannel install

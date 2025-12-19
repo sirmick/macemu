@@ -9,7 +9,7 @@
 | **BasiliskII** | 68k Macintosh emulator | System 0.x through MacOS 8.1 |
 | **SheepShaver** | PowerPC Macintosh emulator | MacOS 9.x and X 10.0 |
 | **cxmon** | Command-line debugger/monitor | Multi-architecture |
-| **web-streaming** | Headless browser access | WebSocket-based remote display |
+| **web-streaming** | Headless browser access | WebRTC-based remote display |
 
 **License:** GNU General Public License (GPL)
 
@@ -37,9 +37,10 @@ macemu/
 ├── cxmon/                # Standalone debugger tool
 │   └── src/              # Disassemblers for multiple architectures
 │
-├── web-streaming/        # WebSocket streaming server
-│   ├── server/           # C++ WebSocket server (libwebsockets)
-│   └── client/           # JavaScript/HTML web client
+├── web-streaming/        # WebRTC streaming for headless mode
+│   ├── libdatachannel/   # WebRTC library (git submodule)
+│   ├── server/           # C++ WebRTC server + VP8 encoder
+│   └── client/           # JavaScript/HTML web client (embedded)
 │
 └── docs/                 # Documentation (this folder)
 ```

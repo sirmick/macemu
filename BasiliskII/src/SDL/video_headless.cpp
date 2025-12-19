@@ -53,14 +53,13 @@
 #include "vm_alloc.h"
 
 #ifdef ENABLE_WEBSTREAMING
-#include "gstreamer_webrtc.h"
-// Map to unified API names
-#define ws_streaming_init      gst_webrtc_init
-#define ws_streaming_exit      gst_webrtc_exit
-#define ws_streaming_enabled   gst_webrtc_enabled
-#define ws_streaming_client_count gst_webrtc_peer_count
-#define ws_streaming_send_frame gst_webrtc_push_frame
-#define ws_set_input_callbacks gst_webrtc_set_input_callbacks
+#include "datachannel_webrtc.h"
+#define ws_streaming_init      dc_webrtc_init
+#define ws_streaming_exit      dc_webrtc_exit
+#define ws_streaming_enabled   dc_webrtc_enabled
+#define ws_streaming_client_count dc_webrtc_peer_count
+#define ws_streaming_send_frame dc_webrtc_push_frame
+#define ws_set_input_callbacks dc_webrtc_set_input_callbacks
 #endif
 
 #define DEBUG 0
@@ -103,6 +102,11 @@ static int frame_bytes_per_row;
 static std::thread video_thread;
 static std::atomic<bool> video_thread_running(false);
 static std::mutex frame_mutex;
+
+// Pending mouse input (updated by datachannel thread, consumed by video thread)
+static std::atomic<int> pending_mouse_x(-1);
+static std::atomic<int> pending_mouse_y(-1);
+static std::atomic<bool> pending_mouse_update(false);
 
 // RGBA conversion buffer for streaming
 static std::vector<uint8_t> rgba_buffer;
@@ -335,16 +339,40 @@ static void convert_to_rgba()
 static void video_refresh_thread()
 {
 	auto last_frame_time = std::chrono::steady_clock::now();
+	auto last_stats_time = std::chrono::steady_clock::now();
 	int target_fps = 30;  // Target frame rate for streaming
+	int frames_sent = 0;
+	int mouse_updates = 0;
 
 	while (video_thread_running) {
 		auto now = std::chrono::steady_clock::now();
 		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time);
 
+		// Process pending mouse updates (from datachannel thread)
+		// Do this frequently (every iteration) for responsive input
+		if (pending_mouse_update.exchange(false)) {
+			int x = pending_mouse_x.load();
+			int y = pending_mouse_y.load();
+			if (x >= 0 && y >= 0) {
+				ADBMouseMoved(x, y);
+				mouse_updates++;
+			}
+		}
+
+		// Print stats every 3 seconds
+		auto stats_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time);
+		if (stats_elapsed.count() >= 3000) {
+			float fps = frames_sent * 1000.0f / stats_elapsed.count();
+			fprintf(stderr, "[Video] fps=%.1f frames=%d mouse=%d\n", fps, frames_sent, mouse_updates);
+			frames_sent = 0;
+			mouse_updates = 0;
+			last_stats_time = now;
+		}
+
 		// Rate limit to target FPS
 		int frame_interval = 1000 / target_fps;
 		if (elapsed.count() < frame_interval) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(frame_interval - elapsed.count()));
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));  // Short sleep, check mouse more often
 			continue;
 		}
 
@@ -356,6 +384,7 @@ static void video_refresh_thread()
 			convert_to_rgba();
 			ws_streaming_send_frame(rgba_buffer.data(), frame_width, frame_height,
 			                        frame_width * 4);
+			frames_sent++;
 		}
 #endif
 	}
@@ -533,14 +562,23 @@ static bool Headless_VideoInit(bool classic)
 	}
 
 	// Set up input callbacks from WebSocket to ADB
+	// NOTE: These callbacks run on libdatachannel's thread, so we use atomics
+	// for mouse position and let the video thread call ADBMouseMoved to avoid
+	// cross-thread interrupt issues.
 	ws_set_input_callbacks(
-		// Mouse move callback
+		// Mouse move callback - store in atomics, video thread will apply
 		[](int x, int y) {
-			ADBMouseMoved(x, y);
+			pending_mouse_x.store(x);
+			pending_mouse_y.store(y);
+			pending_mouse_update.store(true);
 		},
-		// Mouse button callback
+		// Mouse button callback - buttons go direct (they're less frequent)
 		[](int x, int y, int button, bool pressed) {
-			ADBMouseMoved(x, y);
+			// Update position atomically
+			pending_mouse_x.store(x);
+			pending_mouse_y.store(y);
+			pending_mouse_update.store(true);
+			// Buttons are infrequent, call directly
 			if (pressed) {
 				ADBMouseDown(button);
 			} else {

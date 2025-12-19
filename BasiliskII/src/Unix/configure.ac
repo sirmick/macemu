@@ -43,7 +43,7 @@ dnl JIT compiler options.
 AC_ARG_ENABLE(jit-compiler,  [  --enable-jit-compiler   enable JIT compiler [default=yes]], [WANT_JIT=$enableval], [WANT_JIT=yes])
 AC_ARG_ENABLE(jit-debug,     [  --enable-jit-debug      activate native code disassemblers [default=no]], [WANT_JIT_DEBUG=$enableval], [WANT_JIT_DEBUG=no])
 
-dnl Web streaming option (headless mode with WebRTC via GStreamer).
+dnl Web streaming options (headless mode with WebRTC via libdatachannel).
 AC_ARG_ENABLE(webstreaming,  [  --enable-webstreaming   enable headless WebRTC streaming [default=no]], [WANT_WEBSTREAMING=$enableval], [WANT_WEBSTREAMING=no])
 
 dnl FPU emulation core.
@@ -343,7 +343,6 @@ if [[ "x$WANT_SDL" = "xyes" ]]; then
 
     if [[ "x$TEMP_WANT_SDL_VERSION_MAJOR" = "x3" ]]; then
       PKG_CHECK_MODULES([sdl3], [sdl3 >= 3.0], [
-        CFLAGS="$CFLAGS $sdl3_CFLAGS"
         CXXFLAGS="$CXXFLAGS $sdl3_CFLAGS"
         LIBS="$LIBS $sdl3_LIBS"
 	AC_DEFINE([USE_SDL3], [1], [Use SDL3])
@@ -354,7 +353,6 @@ if [[ "x$WANT_SDL" = "xyes" ]]; then
     fi
     if [[ "x$TEMP_WANT_SDL_VERSION_MAJOR" = "x2" ]]; then
       PKG_CHECK_MODULES([sdl2], [sdl2 >= 2.0], [
-        CFLAGS="$CFLAGS $sdl2_CFLAGS"
         CXXFLAGS="$CXXFLAGS $sdl2_CFLAGS"
         LIBS="$LIBS $sdl2_LIBS"
 	AC_DEFINE([USE_SDL2], [1], [Use SDL2])
@@ -869,24 +867,61 @@ AS_IF([test "x$with_vdeplug" = "xyes"], [
   AC_CHECK_LIB(vdeplug, vde_close, [], [have_vdeplug=no])
 ])
 
-dnl Web streaming support using GStreamer WebRTC
+dnl Web streaming support using libdatachannel + libvpx
+dnl libdatachannel is built locally in web-streaming/libdatachannel
 if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-  PKG_CHECK_MODULES(GSTREAMER, [gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-1.0], [
-    AC_DEFINE(ENABLE_WEBSTREAMING, 1, [Define to enable streaming for browser access])
-    CPPFLAGS="$CPPFLAGS $GSTREAMER_CFLAGS -I../../../web-streaming/server"
-    LIBS="$LIBS $GSTREAMER_LIBS -lpthread"
-    WEBSTREAMING_SRCS="../../../web-streaming/server/gstreamer_webrtc.cpp"
+  WEBSTREAMING_DIR="../../../web-streaming"
+  LIBDATACHANNEL_DIR="$WEBSTREAMING_DIR/libdatachannel"
+  LIBDATACHANNEL_BUILD="$LIBDATACHANNEL_DIR/build"
+
+  dnl Check if libdatachannel was built
+  if test -f "$LIBDATACHANNEL_BUILD/libdatachannel.a"; then
+    AC_MSG_RESULT([Found local libdatachannel build])
+  else
+    AC_MSG_ERROR([libdatachannel not built. Run 'make' in web-streaming/ first])
+  fi
+
+  dnl Add libdatachannel includes and library
+  CPPFLAGS="$CPPFLAGS -I$LIBDATACHANNEL_DIR/include"
+  dnl Link order matters: our code, then datachanel static lib, then its deps
+  dnl usrsctp has symbol conflicts with slirp (ip_id, socreate, m_*, etc.)
+  dnl We use libusrsctp_fixed.a which has conflicting symbols renamed with __usrsctp_ prefix
+  dnl libsrtp2 is needed for SRTP (secure media transport)
+  LIBS="$LIBDATACHANNEL_BUILD/libdatachannel.a $LIBDATACHANNEL_BUILD/deps/libjuice/libjuice.a $LIBDATACHANNEL_BUILD/deps/libsrtp/libsrtp2.a $LIBDATACHANNEL_BUILD/deps/usrsctp/usrsctplib/libusrsctp_fixed.a $LIBS"
+
+  dnl Check for libvpx (VP8 encoder) - this one is from system
+  PKG_CHECK_MODULES(VPX, [vpx], [
+    CPPFLAGS="$CPPFLAGS $VPX_CFLAGS"
+    LIBS="$LIBS $VPX_LIBS"
   ], [
-    AC_MSG_ERROR([GStreamer WebRTC libraries not found. Install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev])
+    AC_CHECK_LIB(vpx, vpx_codec_encode, [
+      LIBS="$LIBS -lvpx"
+    ], [
+      AC_MSG_ERROR([libvpx not found. Install libvpx-dev])
+    ])
   ])
-  AC_MSG_NOTICE([NOTE: WebRTC streaming requires gst-plugins-rs (webrtcsink). Install gstreamer1.0-plugins-rs or build from source.])
+
+  dnl OpenSSL is needed by libdatachannel
+  PKG_CHECK_MODULES(OPENSSL, [openssl], [
+    CPPFLAGS="$CPPFLAGS $OPENSSL_CFLAGS"
+    LIBS="$LIBS $OPENSSL_LIBS"
+  ], [
+    AC_CHECK_LIB(ssl, SSL_new, [
+      LIBS="$LIBS -lssl -lcrypto"
+    ], [
+      AC_MSG_ERROR([OpenSSL not found. Install libssl-dev])
+    ])
+  ])
+
+  AC_DEFINE(ENABLE_WEBSTREAMING, 1, [Define to enable WebRTC streaming for browser access])
+  AC_DEFINE(USE_DATACHANNEL_WEBRTC, 1, [Define to use libdatachannel WebRTC backend])
+  CPPFLAGS="$CPPFLAGS -I$WEBSTREAMING_DIR/server"
+  LIBS="$LIBS -lpthread"
+  WEBSTREAMING_SRCS="$WEBSTREAMING_DIR/server/datachannel_webrtc.cpp"
+  WEBSTREAMING_BACKEND="libdatachannel + libvpx"
+  AC_DEFINE(ENABLE_HEADLESS, 1, [Define to enable headless mode])
 fi
 AC_SUBST(WEBSTREAMING_SRCS)
-
-dnl Webstreaming implies headless mode
-if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-  AC_DEFINE(ENABLE_HEADLESS, 1, [Define to enable headless mode (no SDL/X11)])
-fi
 
 if [[ "x$WANT_MACOSX_GUI" = "xyes" ]]; then
   CPPFLAGS="$CPPFLAGS -I../MacOSX"
@@ -1545,7 +1580,7 @@ fi
 
 dnl Enable VOSF screen updates with this feature is requested and feasible
 dnl VOSF is not needed for webstreaming mode (we stream the full buffer)
-if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" -a "x$WANT_WEBSTREAMING" != "xyes" ]]; then
+if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" -a "x$WANT_WEBSTREAMING" = "xno" ]]; then
     AC_DEFINE(ENABLE_VOSF, 1, [Define if using video enabled on SEGV signals.])
 else
     WANT_VOSF=no
@@ -2014,6 +2049,10 @@ echo Floating-Point emulation core .......... : $FPE_CORE
 echo Assembly optimizations ................. : $ASM_OPTIMIZATIONS
 echo Addressing mode ........................ : $ADDRESSING_MODE
 echo Bad memory access recovery type ........ : $sigsegv_recovery
-echo WebRTC streaming ....................... : $WANT_WEBSTREAMING
+if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
+echo WebRTC streaming ....................... : $WEBSTREAMING_BACKEND
+else
+echo WebRTC streaming ....................... : no
+fi
 echo
 echo "Configuration done. Now type \"make\" (or \"gmake\")."

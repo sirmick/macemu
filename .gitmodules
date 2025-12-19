@@ -1,0 +1,3 @@
+[submodule "web-streaming/libdatachannel"]
+	path = web-streaming/libdatachannel
+	url = https://github.com/paullouisageneau/libdatachannel.git

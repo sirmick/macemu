@@ -4,140 +4,121 @@ This document describes the WebRTC streaming feature that allows running Basilis
 
 ## Overview
 
-Basilisk II supports two streaming backends for headless operation:
+Basilisk II supports browser-based access via WebRTC streaming. The implementation uses:
 
-1. **WebRTC (Recommended)** - Uses GStreamer's webrtcsink for hardware-accelerated VP9 encoding with WebRTC delivery
-2. **WebSocket (Legacy)** - Direct raw RGBA frame streaming over WebSocket
-
-WebRTC is preferred because it provides:
-- Hardware-accelerated video encoding (VP9)
-- Adaptive bitrate control
-- Lower bandwidth usage (~1-2 Mbps vs ~300+ Mbps for raw RGBA)
-- Standard browser APIs (no custom JavaScript needed for decoding)
-- DataChannel for low-latency input
+- **libdatachannel** - Lightweight C++ WebRTC library for signaling and media transport
+- **libvpx** - VP8 video encoding (~2 Mbps vs ~300 Mbps for raw RGBA)
+- **WebRTC DataChannel** - Low-latency mouse/keyboard input
+- **Embedded HTTP server** - No external web server needed
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Basilisk II                               │
-│  ┌──────────────────┐     ┌──────────────────────────────────┐  │
-│  │ video_headless.cpp│────▶│ gstreamer_webrtc.cpp              │  │
-│  │  (frame buffer)  │     │ ┌──────────────────────────────┐ │  │
-│  └──────────────────┘     │ │ GStreamer Pipeline           │ │  │
-│                           │ │ appsrc → videoconvert →      │ │  │
-│                           │ │ vp9enc → webrtcsink          │ │  │
-│                           │ └──────────────────────────────┘ │  │
-│                           │ ┌──────────────────────────────┐ │  │
-│                           │ │ Built-in Signaling Server    │ │  │
-│                           │ │ (WebSocket on port 8090)     │ │  │
-│                           │ └──────────────────────────────┘ │  │
-│                           └──────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                                    │
++------------------------------------------------------------------+
+|                        Basilisk II                                |
+|  +------------------+     +------------------------------------+  |
+|  | video_headless   |---->| datachannel_webrtc.cpp             |  |
+|  | (frame buffer)   |     | +--------------------------------+ |  |
+|  +------------------+     | | VP8 Encoder (libvpx)           | |  |
+|                           | | - RGBA to I420 conversion      | |  |
+|                           | | - 2 Mbps realtime encoding     | |  |
+|                           | +--------------------------------+ |  |
+|                           | +--------------------------------+ |  |
+|                           | | WebRTC (libdatachannel)        | |  |
+|                           | | - RTP packetization            | |  |
+|                           | | - DTLS/SRTP encryption         | |  |
+|                           | | - ICE connectivity             | |  |
+|                           | +--------------------------------+ |  |
+|                           | +--------------------------------+ |  |
+|                           | | Signaling Server (port 8090)   | |  |
+|                           | | HTTP Server (port 8000)        | |  |
+|                           | +--------------------------------+ |  |
+|                           +------------------------------------+  |
++------------------------------------------------------------------+
+                                    |
                            WebRTC + DataChannel
-                                    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Web Browser                              │
-│  ┌──────────────────┐     ┌──────────────────────────────────┐  │
-│  │ webrtc_client.js │────▶│ <video> element                   │  │
-│  │ (signaling +     │     │ (VP9 decode + display)            │  │
-│  │  input handling) │     └──────────────────────────────────┘  │
-│  └──────────────────┘                                            │
-└─────────────────────────────────────────────────────────────────┘
+                                    v
++------------------------------------------------------------------+
+|                         Web Browser                               |
+|  +------------------------+     +------------------------------+  |
+|  | datachannel_client.js  |---->| <video> element              |  |
+|  | - WebSocket signaling  |     | - VP8 decode (browser)       |  |
+|  | - RTCPeerConnection    |     | - Hardware accelerated       |  |
+|  | - Input capture        |     +------------------------------+  |
+|  +------------------------+                                       |
++------------------------------------------------------------------+
 ```
 
-## Prerequisites
+## Quick Start
 
-### System Packages (Ubuntu/Debian)
+### 1. Install Dependencies
 
 ```bash
-# Core GStreamer packages
-sudo apt install \
-    gstreamer1.0-tools \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libgstreamer-plugins-bad1.0-dev
-
-# WebRTC sink plugin (Ubuntu 24.04+)
-sudo apt install gstreamer1.0-plugins-rs
+sudo apt install cmake pkg-config libvpx-dev libssl-dev
 ```
 
-### Building webrtcsink from Source
-
-If `gstreamer1.0-plugins-rs` is not available in your distribution:
+### 2. Build
 
 ```bash
-# Install Rust if not present
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Build web-streaming library (includes libdatachannel)
+cd web-streaming
+make
 
-# Clone and build
-git clone https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
-cd gst-plugins-rs
-cargo build --release -p gst-plugin-webrtc
-
-# Install the plugin
-sudo cp target/release/libgstrswebrtc.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/
-```
-
-### Verify Installation
-
-```bash
-# Check if webrtcsink is available
-gst-inspect-1.0 webrtcsink
-
-# Should show element details, not "No such element or plugin"
-```
-
-## Building Basilisk II with WebRTC
-
-```bash
-cd BasiliskII/src/Unix
-./autogen.sh
-./configure --enable-webrtc
+# Build Basilisk II with streaming
+cd ../BasiliskII/src/Unix
+./configure --enable-webstreaming
 make
 ```
 
-The configure script will check for:
-- GStreamer 1.0+ with app and webrtc libraries
-- Note: webrtcsink plugin availability is only checked at runtime
-
-## Running
+### 3. Run
 
 ```bash
-# Start the emulator in headless mode
-./BasiliskII --config ~/.basilisk_headless.cfg
-
-# Default streaming port is 8090
-# Override with: --webstreamingport 9000
+./BasiliskII
+# Open http://localhost:8000 in your browser
 ```
 
-### Accessing from Browser
+The emulator serves the web client automatically on port 8000.
 
-1. Serve the web client files:
-   ```bash
-   cd web-streaming/client
-   python3 -m http.server 8000
-   ```
+## Ports Used
 
-2. Open in browser: `http://localhost:8000/index_webrtc.html`
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 8000 | HTTP | Embedded web server (client files) |
+| 8090 | WebSocket | WebRTC signaling |
+| Dynamic | UDP | WebRTC media (ICE negotiated) |
 
-3. Click "Connect" to establish the WebRTC connection
+## HTTPS/WSS Support
 
-### URL Parameters
+When accessing the emulator through an HTTPS proxy, the browser requires WSS (WebSocket Secure) for the signaling connection.
 
-- `?server=ws://host:port` - Custom signaling server URL
-- `?port=8090` - Signaling server port
-- `?autoconnect` - Connect automatically on page load
+### Option 1: Use HTTP
+
+Access via plain HTTP which doesn't require WSS:
+```
+http://your-server:8000/
+```
+
+### Option 2: Enable TLS
+
+Set environment variables pointing to your TLS certificate before running:
+
+```bash
+export BASILISK_WSS_CERT=/path/to/fullchain.pem
+export BASILISK_WSS_KEY=/path/to/privkey.pem
+./BasiliskII
+```
+
+This enables WSS on port 8090 for HTTPS compatibility.
+
+### Option 3: Reverse Proxy
+
+Configure nginx/Apache to proxy WebSocket connections through HTTPS.
 
 ## Input Handling
 
-Mouse and keyboard events are sent from the browser to Basilisk II via WebRTC DataChannel:
+Mouse and keyboard events are sent via WebRTC DataChannel:
 
-- **Mouse movement** - Sent as relative coordinates scaled to video dimensions
+- **Mouse movement** - Coordinates scaled to video dimensions, throttled to ~30/sec
 - **Mouse buttons** - Left (0), Middle (1), Right (2)
 - **Keyboard** - JavaScript keyCodes mapped to Mac ADB scancodes
 
@@ -147,21 +128,8 @@ Mouse and keyboard events are sent from the browser to Basilisk II via WebRTC Da
 - Numbers 0-9
 - Arrow keys
 - Enter, Tab, Escape, Backspace, Delete, Space
-- Modifier keys (Shift, Ctrl→Command, Alt→Option, Meta→Command)
+- Modifier keys (Shift, Ctrl->Command, Alt->Option, Meta->Command)
 - Common punctuation
-
-## Hardware Acceleration
-
-The streaming backend automatically detects and uses hardware VP9 encoders:
-
-1. **VA-API (vavp9enc)** - Intel/AMD (newer API)
-2. **VAAPI (vaapivp9enc)** - Intel/AMD (older API)
-3. **Software (vp9enc)** - Fallback, works everywhere
-
-Check which encoder is being used in the console output:
-```
-GStreamer WebRTC: Using VA-API VP9 encoder (vavp9enc)
-```
 
 ## Configuration
 
@@ -173,75 +141,102 @@ webstreamingport 8090
 screen win/800/600
 ```
 
-### Adjusting Quality
+### Video Quality
 
-The default VP9 settings prioritize low latency:
+Default VP8 settings in `datachannel_webrtc.cpp`:
 - Target bitrate: 2 Mbps
-- Keyframe interval: 30 frames
-- CPU usage preset: 4 (balanced)
-
-These are configured in `gstreamer_webrtc.cpp` and can be adjusted for different network conditions.
+- Keyframe interval: 15 frames (~2 per second)
+- CPU preset: 8 (fastest/realtime)
 
 ## Troubleshooting
 
-### "webrtcsink not found"
+### Black screen / No video
 
-The GStreamer Rust plugins package is missing. Install `gstreamer1.0-plugins-rs` or build from source.
+- Check browser console (F12) for WebRTC errors
+- Verify the emulator is running and rendering frames
+- Check `[VP8]` stats in emulator console - should show fps > 0
 
-### Video stuttering
+### Connection fails
 
-- Check network bandwidth (WebRTC target is ~2 Mbps)
-- Try a wired connection instead of WiFi
-- Reduce resolution in Basilisk II preferences
+- Ensure ports 8000 and 8090 are not blocked
+- Check for WebSocket errors in browser console
+- For HTTPS, ensure WSS is configured (see above)
 
 ### Input lag
 
-- DataChannel is configured for low latency (unreliable mode)
-- Ensure you're connecting to localhost or low-latency network
+- DataChannel uses unreliable mode for low latency
+- Mouse moves are throttled to prevent congestion
+- Check `[Input]` stats in browser console
 
-### Black screen after connect
+### High CPU usage
 
-- Check console for GStreamer errors
-- Verify the emulator has started and is rendering
-- Try refreshing the browser page
-
-### Connection fails immediately
-
-- Ensure port 8090 (or custom port) is not blocked by firewall
-- Check that no other application is using the port
+- VP8 encoding is CPU-intensive at high resolutions
+- Consider reducing resolution in preferences
+- Check `[VP8] enc=` time in console (should be < 30ms)
 
 ## Development
 
-### Testing the GStreamer Pipeline
+### Directory Structure
 
-A standalone test harness is provided:
-
-```bash
-cd web-streaming
-make deps-webrtc
-make check-webrtc  # Verify dependencies
-make test_gstreamer
-./build/test_gstreamer -p 8090
+```
+web-streaming/
++-- libdatachannel/     # WebRTC library (git submodule)
++-- server/
+|   +-- datachannel_webrtc.cpp  # Main implementation
+|   +-- datachannel_webrtc.h    # C API header
++-- client/
+|   +-- index_datachannel.html  # Embedded in binary
+|   +-- datachannel_client.js   # Embedded in binary
++-- build/              # Build output
++-- Makefile
 ```
 
-This generates an animated test pattern without needing the full emulator.
+### Build Targets
 
-### Modifying the Pipeline
+| Target | Description |
+|--------|-------------|
+| `all` | Build everything |
+| `libdatachannel` | Build libdatachannel only |
+| `clean` | Remove build files |
+| `distclean` | Remove all including libdatachannel build |
+| `deps` | Install system dependencies |
+| `deps-check` | Verify dependencies |
 
-The GStreamer pipeline is constructed in `gstreamer_webrtc.cpp`:
+### API Reference
 
-```cpp
-"appsrc name=src format=time is-live=true do-timestamp=true "
-"caps=video/x-raw,format=RGBA,width=640,height=480,framerate=30/1 ! "
-"queue max-size-buffers=2 leaky=downstream ! "
-"videoconvert ! "
-"video/x-raw,format=I420 ! "
-"vp9enc deadline=1 cpu-used=4 target-bitrate=2000000 keyframe-max-dist=30 ! "
-"webrtcsink name=sink run-signalling-server=true ..."
+```c
+// Initialize (starts HTTP on 8000, signaling on port)
+bool dc_webrtc_init(int signaling_port);
+
+// Shutdown
+void dc_webrtc_exit(void);
+
+// Check if active
+bool dc_webrtc_enabled(void);
+
+// Push video frame (RGBA format)
+void dc_webrtc_push_frame(const uint8_t* rgba, int w, int h, int stride);
+
+// Get connected peer count
+int dc_webrtc_peer_count(void);
+
+// Set input callbacks
+void dc_webrtc_set_input_callbacks(
+    dc_mouse_move_cb mouse_move,
+    dc_mouse_button_cb mouse_button,
+    dc_key_cb key
+);
 ```
+
+## Dependencies
+
+- **libdatachannel** - Built locally as git submodule
+- **libvpx** - System package (`libvpx-dev`)
+- **OpenSSL** - System package (`libssl-dev`)
+- **CMake** - Build system for libdatachannel
 
 ## See Also
 
-- [GStreamer webrtcsink documentation](https://gstreamer.freedesktop.org/documentation/rswebrtc/webrtcsink.html)
-- [gst-plugins-rs repository](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs)
+- [libdatachannel](https://github.com/paullouisageneau/libdatachannel)
+- [libvpx](https://www.webmproject.org/code/)
 - [WebRTC API (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API)

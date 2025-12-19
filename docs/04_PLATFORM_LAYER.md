@@ -242,36 +242,46 @@ Visual Studio solution: `Windows/BasiliskII.sln`
 
 ### Architecture (`web-streaming/`)
 
-Enables headless operation with browser-based display:
+Enables headless operation with browser-based display via WebRTC:
 
 ```
-┌─────────────┐     WebSocket      ┌─────────────┐
-│  BasiliskII │ ◄─────────────────► │   Browser   │
-│  (headless) │     JSON/Binary    │   Client    │
-└─────────────┘                     └─────────────┘
-       │                                   │
-       ▼                                   ▼
-  video_headless.cpp              client/index.html
-  websocket_server.cpp            client/client.js
++-------------+                        +-------------+
+| BasiliskII  |     WebRTC/DTLS       |   Browser   |
+| (headless)  | <-------------------> |   Client    |
++-------------+                        +-------------+
+       |                                      |
+       v                                      v
+  video_headless.cpp                   <video> element
+  datachannel_webrtc.cpp               datachannel_client.js
+       |
+       v
+  +------------------+
+  | VP8 Encoder      | (libvpx)
+  | WebRTC Transport | (libdatachannel)
+  | HTTP Server      | (port 8000)
+  | Signaling        | (port 8090)
+  +------------------+
 ```
 
 ### Server Components (`web-streaming/server/`)
 
 ```cpp
-// WebSocket server initialization
-void websocket_server_init(int port);
+// Initialize streaming (HTTP on 8000, signaling on port)
+bool dc_webrtc_init(int signaling_port);
 
-// Frame transmission
-void websocket_send_frame(uint8 *framebuffer, int width, int height);
+// Push video frame (RGBA format, encoded to VP8)
+void dc_webrtc_push_frame(const uint8_t* rgba, int w, int h, int stride);
 
-// Input reception
-void websocket_handle_input(const char *json);
+// Set input callbacks (mouse/keyboard via DataChannel)
+void dc_webrtc_set_input_callbacks(mouse_cb, button_cb, key_cb);
 ```
 
-### Client Components (`web-streaming/client/`)
+### Client Components
 
-- `index.html` - Web interface
-- `client.js` - WebSocket client, canvas rendering, input capture
+The web client is embedded directly in the binary:
+- HTML/JS served from built-in HTTP server on port 8000
+- WebSocket signaling for WebRTC negotiation
+- DataChannel for low-latency input
 
 ## Porting to a New Platform
 

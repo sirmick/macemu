@@ -58,10 +58,10 @@ Quick lookup for the most important files when working on specific tasks.
 - `BasiliskII/src/Unix/prefs_editor_gtk.cpp` - GTK preferences UI
 
 ### "I want to work on web streaming"
-- `web-streaming/server/websocket_server.cpp` - WebSocket server
-- `web-streaming/server/basilisk_integration.cpp` - Emulator integration
-- `web-streaming/client/client.js` - Browser client
-- `BasiliskII/src/Unix/video_headless.cpp` - Headless video driver
+- `web-streaming/server/datachannel_webrtc.cpp` - WebRTC server + VP8 encoder
+- `web-streaming/server/datachannel_webrtc.h` - C API header
+- `BasiliskII/src/SDL/video_headless.cpp` - Headless video driver
+- See [WEBRTC_STREAMING.md](WEBRTC_STREAMING.md) for full documentation
 
 ## File Size Reference (Complexity Indicator)
 
