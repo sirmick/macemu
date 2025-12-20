@@ -33,7 +33,7 @@
 #include "user_strings.h"
 #include "scsi.h"
 
-#define DEBUG 1
+#define DEBUG 0
 #include "debug.h"
 
 

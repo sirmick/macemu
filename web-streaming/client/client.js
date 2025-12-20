@@ -560,70 +560,59 @@ class BasiliskWebRTC {
     setupInputHandlers() {
         if (!this.video) return;
 
-        const getCoords = (e) => {
-            const rect = this.video.getBoundingClientRect();
-            const scaleX = (this.video.videoWidth || 640) / rect.width;
-            const scaleY = (this.video.videoHeight || 480) / rect.height;
-            return {
-                x: Math.round((e.clientX - rect.left) * scaleX),
-                y: Math.round((e.clientY - rect.top) * scaleY)
-            };
-        };
-
-        this.video.addEventListener('mousemove', (e) => {
-            const coords = getCoords(e);
-            this.sendInput({ type: 'mouse_move', x: coords.x, y: coords.y });
+        // Click to capture mouse (pointer lock for relative movement)
+        this.video.addEventListener('click', () => {
+            if (!document.pointerLockElement) {
+                this.video.requestPointerLock();
+            }
         });
 
+        // Mouse move - only when pointer is locked (relative movement)
+        document.addEventListener('mousemove', (e) => {
+            if (document.pointerLockElement === this.video) {
+                this.sendRaw('M' + e.movementX + ',' + e.movementY);
+            }
+        });
+
+        // Mouse buttons
         this.video.addEventListener('mousedown', (e) => {
             e.preventDefault();
-            const coords = getCoords(e);
-            this.sendInput({ type: 'mouse_down', x: coords.x, y: coords.y, button: e.button });
+            this.sendRaw('D' + e.button);
         });
 
         this.video.addEventListener('mouseup', (e) => {
             e.preventDefault();
-            const coords = getCoords(e);
-            this.sendInput({ type: 'mouse_up', x: coords.x, y: coords.y, button: e.button });
+            this.sendRaw('U' + e.button);
         });
 
         this.video.addEventListener('contextmenu', (e) => e.preventDefault());
 
+        // Keyboard
         document.addEventListener('keydown', (e) => {
             if (!this.connected) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
             e.preventDefault();
-            this.sendInput({
-                type: 'key_down',
-                keyCode: e.keyCode,
-                code: e.code,
-                key: e.key,
-                ctrl: e.ctrlKey,
-                alt: e.altKey,
-                shift: e.shiftKey,
-                meta: e.metaKey
-            });
+            this.sendRaw('K' + e.keyCode);
         });
 
         document.addEventListener('keyup', (e) => {
             if (!this.connected) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
             e.preventDefault();
-            this.sendInput({
-                type: 'key_up',
-                keyCode: e.keyCode,
-                code: e.code,
-                key: e.key,
-                ctrl: e.ctrlKey,
-                alt: e.altKey,
-                shift: e.shiftKey,
-                meta: e.metaKey
-            });
+            this.sendRaw('k' + e.keyCode);
         });
 
-        logger.info('Input handlers registered');
+        logger.info('Input handlers registered (pointer lock mode)');
     }
 
+    // Send raw text message (simple protocol: M dx,dy | D btn | U btn | K code | k code)
+    sendRaw(msg) {
+        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+            this.dataChannel.send(msg);
+        }
+    }
+
+    // Legacy JSON method (kept for restart/shutdown commands)
     sendInput(msg) {
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
             this.dataChannel.send(JSON.stringify(msg));

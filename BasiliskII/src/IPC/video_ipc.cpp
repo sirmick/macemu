@@ -263,122 +263,122 @@ static void cleanup_audio_shm() {
  *  Control socket - handles input from WebRTC server
  */
 
-static void process_control_message(const char* json) {
-    // Simple JSON parsing for input messages
-    // Format: {"type":"mouse_move","x":100,"y":200}
-
-    const char* type_start = strstr(json, "\"type\":\"");
-    if (!type_start) return;
-    type_start += 8;
-
-    if (strncmp(type_start, "mouse_move", 10) == 0) {
-        int x = 0, y = 0;
-        const char* x_start = strstr(json, "\"x\":");
-        const char* y_start = strstr(json, "\"y\":");
-        if (x_start && y_start) {
-            x = atoi(x_start + 4);
-            y = atoi(y_start + 4);
-            pending_mouse_x.store(x);
-            pending_mouse_y.store(y);
-            pending_mouse_update.store(true);
+// Convert browser keycode to Mac ADB keycode
+static int browser_to_mac_keycode(int keycode) {
+    if (keycode >= 65 && keycode <= 90) {
+        static const int letter_map[] = {
+            0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04,
+            0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F, 0x23,
+            0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07,
+            0x10, 0x06
+        };
+        return letter_map[keycode - 65];
+    } else if (keycode >= 48 && keycode <= 57) {
+        static const int number_map[] = {
+            0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19
+        };
+        return number_map[keycode - 48];
+    } else {
+        switch (keycode) {
+            case 8: return 0x33;   // Backspace
+            case 9: return 0x30;   // Tab
+            case 13: return 0x24;  // Enter
+            case 16: return 0x38;  // Shift
+            case 17: return 0x36;  // Ctrl -> Command
+            case 18: return 0x3A;  // Alt -> Option
+            case 27: return 0x35;  // Escape
+            case 32: return 0x31;  // Space
+            case 37: return 0x3B;  // Left
+            case 38: return 0x3E;  // Up
+            case 39: return 0x3C;  // Right
+            case 40: return 0x3D;  // Down
+            case 46: return 0x75;  // Delete
+            case 91: return 0x37;  // Meta -> Command
+            case 186: return 0x29; // ;
+            case 187: return 0x18; // =
+            case 188: return 0x2B; // ,
+            case 189: return 0x1B; // -
+            case 190: return 0x2F; // .
+            case 191: return 0x2C; // /
+            case 192: return 0x32; // `
+            case 219: return 0x21; // [
+            case 220: return 0x2A; // backslash
+            case 221: return 0x1E; // ]
+            case 222: return 0x27; // '
+            default: return -1;
         }
     }
-    else if (strncmp(type_start, "mouse_button", 12) == 0) {
-        int x = 0, y = 0, button = 0;
-        bool pressed = false;
+}
 
-        const char* x_start = strstr(json, "\"x\":");
-        const char* y_start = strstr(json, "\"y\":");
-        const char* btn_start = strstr(json, "\"button\":");
-        const char* pressed_start = strstr(json, "\"pressed\":");
+// Accumulated mouse deltas (for relative mouse mode)
+static std::atomic<int> mouse_delta_x(0);
+static std::atomic<int> mouse_delta_y(0);
 
-        if (x_start) x = atoi(x_start + 4);
-        if (y_start) y = atoi(y_start + 4);
-        if (btn_start) button = atoi(btn_start + 9);
-        if (pressed_start) pressed = (strncmp(pressed_start + 10, "true", 4) == 0);
+static void process_control_message(const char* msg) {
+    // Simple text protocol: M dx,dy | D btn | U btn | K code | k code
+    // Also supports JSON for restart/shutdown commands
 
-        pending_mouse_x.store(x);
-        pending_mouse_y.store(y);
-        pending_mouse_update.store(true);
+    if (!msg || !msg[0]) return;
 
-        if (pressed) {
-            ADBMouseDown(button);
-        } else {
-            ADBMouseUp(button);
-        }
-    }
-    else if (strncmp(type_start, "key", 3) == 0) {
-        int keycode = 0;
-        bool pressed = false;
+    char cmd = msg[0];
+    const char* args = msg + 1;
 
-        const char* code_start = strstr(json, "\"code\":");
-        const char* pressed_start = strstr(json, "\"pressed\":");
-
-        if (code_start) keycode = atoi(code_start + 7);
-        if (pressed_start) pressed = (strncmp(pressed_start + 10, "true", 4) == 0);
-
-        // Convert browser keycode to Mac ADB keycode
-        int mac_code = -1;
-
-        if (keycode >= 65 && keycode <= 90) {
-            static const int letter_map[] = {
-                0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04,
-                0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F, 0x23,
-                0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07,
-                0x10, 0x06
-            };
-            mac_code = letter_map[keycode - 65];
-        } else if (keycode >= 48 && keycode <= 57) {
-            static const int number_map[] = {
-                0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19
-            };
-            mac_code = number_map[keycode - 48];
-        } else {
-            switch (keycode) {
-                case 8: mac_code = 0x33; break;   // Backspace
-                case 9: mac_code = 0x30; break;   // Tab
-                case 13: mac_code = 0x24; break;  // Enter
-                case 16: mac_code = 0x38; break;  // Shift
-                case 17: mac_code = 0x36; break;  // Ctrl -> Command
-                case 18: mac_code = 0x3A; break;  // Alt -> Option
-                case 27: mac_code = 0x35; break;  // Escape
-                case 32: mac_code = 0x31; break;  // Space
-                case 37: mac_code = 0x3B; break;  // Left
-                case 38: mac_code = 0x3E; break;  // Up
-                case 39: mac_code = 0x3C; break;  // Right
-                case 40: mac_code = 0x3D; break;  // Down
-                case 46: mac_code = 0x75; break;  // Delete
-                case 91: mac_code = 0x37; break;  // Meta -> Command
-                case 186: mac_code = 0x29; break; // ;
-                case 187: mac_code = 0x18; break; // =
-                case 188: mac_code = 0x2B; break; // ,
-                case 189: mac_code = 0x1B; break; // -
-                case 190: mac_code = 0x2F; break; // .
-                case 191: mac_code = 0x2C; break; // /
-                case 192: mac_code = 0x32; break; // `
-                case 219: mac_code = 0x21; break; // [
-                case 220: mac_code = 0x2A; break; // backslash
-                case 221: mac_code = 0x1E; break; // ]
-                case 222: mac_code = 0x27; break; // '
-                default: break;
+    switch (cmd) {
+        case 'M': {
+            // Mouse move: M dx,dy
+            int dx = 0, dy = 0;
+            if (sscanf(args, "%d,%d", &dx, &dy) == 2) {
+                mouse_delta_x.fetch_add(dx);
+                mouse_delta_y.fetch_add(dy);
+                pending_mouse_update.store(true);
             }
+            break;
         }
-
-        if (mac_code >= 0) {
-            if (pressed) {
+        case 'D': {
+            // Mouse down: D button
+            int button = atoi(args);
+            ADBMouseDown(button);
+            break;
+        }
+        case 'U': {
+            // Mouse up: U button
+            int button = atoi(args);
+            ADBMouseUp(button);
+            break;
+        }
+        case 'K': {
+            // Key down: K keycode
+            int keycode = atoi(args);
+            int mac_code = browser_to_mac_keycode(keycode);
+            if (mac_code >= 0) {
                 ADBKeyDown(mac_code);
-            } else {
+            }
+            break;
+        }
+        case 'k': {
+            // Key up: k keycode
+            int keycode = atoi(args);
+            int mac_code = browser_to_mac_keycode(keycode);
+            if (mac_code >= 0) {
                 ADBKeyUp(mac_code);
             }
+            break;
         }
-    }
-    else if (strncmp(type_start, "restart", 7) == 0) {
-        fprintf(stderr, "IPC: Restart requested via control socket\n");
-        exit(75);  // Signal restart to wrapper script
-    }
-    else if (strncmp(type_start, "shutdown", 8) == 0) {
-        fprintf(stderr, "IPC: Shutdown requested via control socket\n");
-        exit(0);
+        case '{': {
+            // JSON command (restart, shutdown)
+            const char* type_start = strstr(msg, "\"type\":\"");
+            if (type_start) {
+                type_start += 8;
+                if (strncmp(type_start, "restart", 7) == 0) {
+                    fprintf(stderr, "IPC: Restart requested via control socket\n");
+                    exit(75);
+                } else if (strncmp(type_start, "shutdown", 8) == 0) {
+                    fprintf(stderr, "IPC: Shutdown requested via control socket\n");
+                    exit(0);
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -759,16 +759,19 @@ static void video_refresh_thread()
     int frames_sent = 0;
     int mouse_updates = 0;
 
+    // Use relative mouse mode since browser uses pointer lock
+    ADBSetRelMouseMode(true);
+
     while (video_thread_running) {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time);
 
-        // Process pending mouse updates
+        // Process pending mouse delta updates (relative mode)
         if (pending_mouse_update.exchange(false)) {
-            int x = pending_mouse_x.load();
-            int y = pending_mouse_y.load();
-            if (x >= 0 && y >= 0) {
-                ADBMouseMoved(x, y);
+            int dx = mouse_delta_x.exchange(0);
+            int dy = mouse_delta_y.exchange(0);
+            if (dx != 0 || dy != 0) {
+                ADBMouseMoved(dx, dy);
                 mouse_updates++;
             }
         }

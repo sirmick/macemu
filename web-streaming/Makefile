@@ -20,23 +20,28 @@ LIBJUICE = $(LIBDATACHANNEL_BUILD)/deps/libjuice/libjuice.a
 LIBSRTP = $(LIBDATACHANNEL_BUILD)/deps/libsrtp/libsrtp2.a
 USRSCTP = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
 
-# libvpx (system package)
-VPX_CFLAGS = $(shell pkg-config --cflags vpx 2>/dev/null)
-VPX_LIBS = $(shell pkg-config --libs vpx 2>/dev/null || echo "-lvpx")
+# OpenH264 (system package - replaces libvpx)
+H264_CFLAGS = $(shell pkg-config --cflags openh264 2>/dev/null)
+H264_LIBS = $(shell pkg-config --libs openh264 2>/dev/null || echo "-lopenh264")
+
+# libyuv (system package - for fast color conversion)
+# Note: libyuv doesn't always have pkg-config, so we check for the header directly
+YUV_CFLAGS = $(shell pkg-config --cflags libyuv 2>/dev/null)
+YUV_LIBS = $(shell pkg-config --libs libyuv 2>/dev/null || echo "-lyuv")
 
 # OpenSSL (system package)
 OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS = $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
 
 # Combined flags
-SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(VPX_CFLAGS) $(OPENSSL_CFLAGS)
-SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(VPX_LIBS) $(OPENSSL_LIBS) -lpthread -lrt
+SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(H264_CFLAGS) $(YUV_CFLAGS) $(OPENSSL_CFLAGS)
+SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(H264_LIBS) $(YUV_LIBS) $(OPENSSL_LIBS) -lpthread -lrt
 
 # Source files
-SERVER_SRCS = $(SERVER_DIR)/standalone_server.cpp
+SERVER_SRCS = $(SERVER_DIR)/server.cpp
 
 # Object files
-SERVER_OBJS = $(BUILD_DIR)/standalone_server.o
+SERVER_OBJS = $(BUILD_DIR)/server.o
 
 # Target
 SERVER = $(BUILD_DIR)/macemu-webrtc
@@ -78,7 +83,7 @@ $(LIBDATACHANNEL_LIB):
 	@echo "libdatachannel built successfully"
 
 # Compile server
-$(BUILD_DIR)/standalone_server.o: $(SERVER_DIR)/standalone_server.cpp $(SERVER_DIR)/ipc_protocol.h $(LIBDATACHANNEL_LIB)
+$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/ipc_protocol.h $(LIBDATACHANNEL_LIB)
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Link server
@@ -102,13 +107,14 @@ deps-check:
 	@echo "Checking dependencies..."
 	@which cmake >/dev/null 2>&1 || (echo "ERROR: cmake not found. Install with: sudo apt install cmake" && exit 1)
 	@which pkg-config >/dev/null 2>&1 || (echo "ERROR: pkg-config not found. Install with: sudo apt install pkg-config" && exit 1)
-	@pkg-config --exists vpx 2>/dev/null || (echo "ERROR: libvpx not found. Install with: sudo apt install libvpx-dev" && exit 1)
+	@pkg-config --exists openh264 2>/dev/null || (echo "ERROR: libopenh264 not found. Install with: sudo apt install libopenh264-dev" && exit 1)
+	@(pkg-config --exists libyuv 2>/dev/null || test -f /usr/include/libyuv.h) || (echo "ERROR: libyuv not found. Install with: sudo apt install libyuv-dev" && exit 1)
 	@pkg-config --exists openssl 2>/dev/null || (echo "ERROR: openssl not found. Install with: sudo apt install libssl-dev" && exit 1)
 	@echo "All dependencies found!"
 
 # Install dependencies (Ubuntu/Debian)
 deps:
-	sudo apt-get install -y cmake pkg-config libvpx-dev libssl-dev
+	sudo apt-get install -y cmake pkg-config libopenh264-dev libyuv-dev libssl-dev
 
 # Install server
 install: $(SERVER)

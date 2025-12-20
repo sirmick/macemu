@@ -9,9 +9,11 @@
 #include "ipc_protocol.h"
 
 #include <rtc/rtc.hpp>
+#include <rtc/h264rtppacketizer.hpp>
+#include <rtc/rtppacketizationconfig.hpp>
 
-#include <vpx/vpx_encoder.h>
-#include <vpx/vp8cx.h>
+#include <wels/codec_api.h>
+#include <libyuv.h>
 
 #include <string>
 #include <memory>
@@ -75,6 +77,14 @@ static MacEmuAudioBuffer* g_audio_shm = nullptr;
 static int g_video_shm_fd = -1;
 static int g_audio_shm_fd = -1;
 static int g_control_socket = -1;
+
+// Input event counters (for stats)
+static std::atomic<uint64_t> g_mouse_move_count(0);
+static std::atomic<uint64_t> g_mouse_click_count(0);
+static std::atomic<uint64_t> g_key_count(0);
+
+// Global flag to request keyframe (set when new peer connects)
+static std::atomic<bool> g_request_keyframe(false);
 
 // Signal handler
 static void signal_handler(int sig) {
@@ -487,97 +497,161 @@ static int check_emulator_status() {
 
 
 /*
- * VP8 Encoder
+ * H.264 Encoder using OpenH264 with screen content optimization
  */
 
-class VP8Encoder {
+class H264Encoder {
 public:
-    VP8Encoder() = default;
-    ~VP8Encoder() { cleanup(); }
+    H264Encoder() = default;
+    ~H264Encoder() { cleanup(); }
 
     bool init(int width, int height, int fps = 30, int bitrate_kbps = 2000) {
         cleanup();
 
-        vpx_codec_enc_cfg_t cfg;
-        if (vpx_codec_enc_config_default(vpx_codec_vp8_cx(), &cfg, 0) != VPX_CODEC_OK) {
-            fprintf(stderr, "VP8: Failed to get default config\n");
+        if (WelsCreateSVCEncoder(&encoder_) != 0 || !encoder_) {
+            fprintf(stderr, "H264: Failed to create encoder\n");
             return false;
         }
 
-        cfg.g_w = width;
-        cfg.g_h = height;
-        cfg.g_timebase.num = 1;
-        cfg.g_timebase.den = fps;
-        cfg.rc_target_bitrate = bitrate_kbps;
-        cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT | VPX_ERROR_RESILIENT_PARTITIONS;
-        cfg.g_lag_in_frames = 0;
-        cfg.rc_end_usage = VPX_CBR;
-        cfg.kf_mode = VPX_KF_AUTO;
-        cfg.kf_max_dist = 15;
-        cfg.g_threads = 1;
+        // Use extended parameters for proper configuration
+        SEncParamExt param;
+        encoder_->GetDefaultParams(&param);
 
-        codec_ = new vpx_codec_ctx_t;
-        if (vpx_codec_enc_init(codec_, vpx_codec_vp8_cx(), &cfg, 0) != VPX_CODEC_OK) {
-            fprintf(stderr, "VP8: Failed to init encoder: %s\n", vpx_codec_error(codec_));
-            delete codec_;
-            codec_ = nullptr;
-            return false;
-        }
+        param.iUsageType = SCREEN_CONTENT_REAL_TIME;  // Optimized for desktop/text
+        param.fMaxFrameRate = static_cast<float>(fps);
+        param.iPicWidth = width;
+        param.iPicHeight = height;
+        param.iTargetBitrate = bitrate_kbps * 1000;
+        param.iRCMode = RC_BITRATE_MODE;
+        param.bEnableFrameSkip = false;  // Don't skip frames
+        param.bEnableDenoise = false;
+        param.iSpatialLayerNum = 1;
+        param.iTemporalLayerNum = 1;
+        param.iMultipleThreadIdc = 0;  // Auto-detect threads
+        param.uiIntraPeriod = fps * 2;  // Keyframe every 2 seconds
+        param.eSpsPpsIdStrategy = SPS_LISTING;  // Include SPS/PPS with each IDR
 
-        vpx_codec_control(codec_, VP8E_SET_CPUUSED, 8);
-        vpx_codec_control(codec_, VP8E_SET_NOISE_SENSITIVITY, 0);
-        vpx_codec_control(codec_, VP8E_SET_TOKEN_PARTITIONS, 0);
+        // Configure the single spatial layer
+        param.sSpatialLayers[0].iVideoWidth = width;
+        param.sSpatialLayers[0].iVideoHeight = height;
+        param.sSpatialLayers[0].fFrameRate = static_cast<float>(fps);
+        param.sSpatialLayers[0].iSpatialBitrate = bitrate_kbps * 1000;
+        param.sSpatialLayers[0].iMaxSpatialBitrate = bitrate_kbps * 1500;
+        param.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
 
-        width_ = width;
-        height_ = height;
-        fps_ = fps;
-        frame_count_ = 0;
-
-        if (!vpx_img_alloc(&img_, VPX_IMG_FMT_I420, width, height, 16)) {
-            fprintf(stderr, "VP8: Failed to allocate image\n");
+        if (encoder_->InitializeExt(&param) != 0) {
+            fprintf(stderr, "H264: Failed to initialize encoder\n");
             cleanup();
             return false;
         }
 
-        fprintf(stderr, "VP8: Encoder initialized %dx%d @ %d kbps\n", width, height, bitrate_kbps);
+        // Set video format (required after InitializeExt)
+        int videoFormat = videoFormatI420;
+        encoder_->SetOption(ENCODER_OPTION_DATAFORMAT, &videoFormat);
+
+        // Allocate YUV buffer for libyuv conversion
+        yuv_size_ = width * height * 3 / 2;
+        yuv_buffer_ = new uint8_t[yuv_size_];
+
+        width_ = width;
+        height_ = height;
+        fps_ = fps;
+
+        fprintf(stderr, "H264: Encoder initialized %dx%d @ %d kbps (screen content mode)\n",
+                width, height, bitrate_kbps);
         return true;
     }
 
     void cleanup() {
-        if (codec_) {
-            vpx_codec_destroy(codec_);
-            delete codec_;
-            codec_ = nullptr;
+        if (encoder_) {
+            encoder_->Uninitialize();
+            WelsDestroySVCEncoder(encoder_);
+            encoder_ = nullptr;
         }
-        if (img_.planes[0]) {
-            vpx_img_free(&img_);
-            memset(&img_, 0, sizeof(img_));
-        }
+        delete[] yuv_buffer_;
+        yuv_buffer_ = nullptr;
     }
 
     std::vector<uint8_t> encode(const uint8_t* rgba, int width, int height, int stride) {
         std::vector<uint8_t> result;
 
-        if (!codec_ || width != width_ || height != height_) {
+        if (!encoder_ || width != width_ || height != height_) {
             if (!init(width, height)) {
                 return result;
             }
+            force_keyframe_ = true;  // Force IDR on first frame after init
         }
 
-        rgba_to_i420(rgba, stride);
+        // Force keyframe if requested
+        if (force_keyframe_) {
+            fprintf(stderr, "H264: Forcing IDR frame\n");
+            int ret = encoder_->ForceIntraFrame(true);
+            fprintf(stderr, "H264: ForceIntraFrame returned %d\n", ret);
+            force_keyframe_ = false;
+        }
 
-        vpx_codec_pts_t pts = frame_count_++;
-        if (vpx_codec_encode(codec_, &img_, pts, 1, 0, VPX_DL_REALTIME) != VPX_CODEC_OK) {
-            fprintf(stderr, "VP8: Encode failed: %s\n", vpx_codec_error(codec_));
+        // Use libyuv for fast RGBA to I420 conversion
+        uint8_t* y = yuv_buffer_;
+        uint8_t* u = yuv_buffer_ + width_ * height_;
+        uint8_t* v = yuv_buffer_ + width_ * height_ * 5 / 4;
+        int y_stride = width_;
+        int uv_stride = width_ / 2;
+
+        // libyuv uses ARGB (which is actually BGRA in memory on little-endian)
+        // Our input is RGBA, so we use ABGRToI420
+        libyuv::ABGRToI420(
+            rgba, stride,
+            y, y_stride,
+            u, uv_stride,
+            v, uv_stride,
+            width_, height_
+        );
+
+        SSourcePicture pic = {};
+        pic.iPicWidth = width_;
+        pic.iPicHeight = height_;
+        pic.iColorFormat = videoFormatI420;
+        pic.iStride[0] = y_stride;
+        pic.iStride[1] = uv_stride;
+        pic.iStride[2] = uv_stride;
+        pic.pData[0] = y;
+        pic.pData[1] = u;
+        pic.pData[2] = v;
+
+        SFrameBSInfo info = {};
+        int rv = encoder_->EncodeFrame(&pic, &info);
+        if (rv != 0) {
+            fprintf(stderr, "H264: EncodeFrame returned %d\n", rv);
             return result;
         }
 
-        vpx_codec_iter_t iter = nullptr;
-        const vpx_codec_cx_pkt_t* pkt;
-        while ((pkt = vpx_codec_get_cx_data(codec_, &iter)) != nullptr) {
-            if (pkt->kind == VPX_CODEC_CX_FRAME_PKT) {
-                const uint8_t* data = static_cast<const uint8_t*>(pkt->data.frame.buf);
-                result.insert(result.end(), data, data + pkt->data.frame.sz);
+        // Debug: log frame type and layer info
+        static int debug_count = 0;
+        bool is_idr = (info.eFrameType == videoFrameTypeIDR);
+        if (debug_count++ < 10 || debug_count % 100 == 0 || is_idr) {
+            fprintf(stderr, "H264: eFrameType=%d iLayerNum=%d%s\n",
+                    info.eFrameType, info.iLayerNum, is_idr ? " [IDR KEYFRAME]" : "");
+        }
+
+        if (info.eFrameType == videoFrameTypeSkip) {
+            return result;
+        }
+
+        // Collect all NAL units with start codes
+        for (int layer = 0; layer < info.iLayerNum; layer++) {
+            const SLayerBSInfo& layerInfo = info.sLayerInfo[layer];
+            uint8_t* data = layerInfo.pBsBuf;
+            if (debug_count < 10) {
+                fprintf(stderr, "H264: Layer %d: iNalCount=%d pBsBuf=%p\n",
+                        layer, layerInfo.iNalCount, (void*)data);
+            }
+            for (int nal = 0; nal < layerInfo.iNalCount; nal++) {
+                int nalSize = layerInfo.pNalLengthInByte[nal];
+                if (debug_count < 10) {
+                    fprintf(stderr, "H264: NAL %d size=%d\n", nal, nalSize);
+                }
+                result.insert(result.end(), data, data + nalSize);
+                data += nalSize;
             }
         }
 
@@ -585,64 +659,29 @@ public:
     }
 
     bool is_keyframe(const std::vector<uint8_t>& data) {
-        if (data.empty()) return false;
-        return (data[0] & 0x01) == 0;
+        // Look for IDR NAL unit (type 5) after start code
+        for (size_t i = 0; i + 4 < data.size(); i++) {
+            if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
+                uint8_t nal_type = data[i+4] & 0x1F;
+                if (nal_type == 5) return true;  // IDR frame
+            }
+        }
+        return false;
+    }
+
+    // Request a keyframe on next encode (call when new peer connects)
+    void request_keyframe() {
+        force_keyframe_ = true;
     }
 
 private:
-    void rgba_to_i420(const uint8_t* rgba, int stride) {
-        uint8_t* y = img_.planes[VPX_PLANE_Y];
-        uint8_t* u = img_.planes[VPX_PLANE_U];
-        uint8_t* v = img_.planes[VPX_PLANE_V];
-
-        int y_stride = img_.stride[VPX_PLANE_Y];
-        int u_stride = img_.stride[VPX_PLANE_U];
-        int v_stride = img_.stride[VPX_PLANE_V];
-
-        for (int row = 0; row < height_; row++) {
-            const uint8_t* src = rgba + row * stride;
-            uint8_t* dst_y = y + row * y_stride;
-
-            for (int col = 0; col < width_; col++) {
-                int r = src[0];
-                int g = src[1];
-                int b = src[2];
-                dst_y[col] = static_cast<uint8_t>((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                src += 4;
-            }
-        }
-
-        for (int row = 0; row < height_ / 2; row++) {
-            uint8_t* dst_u = u + row * u_stride;
-            uint8_t* dst_v = v + row * v_stride;
-
-            for (int col = 0; col < width_ / 2; col++) {
-                int r = 0, g = 0, b = 0;
-                for (int dy = 0; dy < 2; dy++) {
-                    const uint8_t* src = rgba + (row * 2 + dy) * stride + col * 2 * 4;
-                    for (int dx = 0; dx < 2; dx++) {
-                        r += src[0];
-                        g += src[1];
-                        b += src[2];
-                        src += 4;
-                    }
-                }
-                r /= 4;
-                g /= 4;
-                b /= 4;
-
-                dst_u[col] = static_cast<uint8_t>((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                dst_v[col] = static_cast<uint8_t>((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-            }
-        }
-    }
-
-    vpx_codec_ctx_t* codec_ = nullptr;
-    vpx_image_t img_ = {};
+    ISVCEncoder* encoder_ = nullptr;
+    uint8_t* yuv_buffer_ = nullptr;
+    size_t yuv_size_ = 0;
     int width_ = 0;
     int height_ = 0;
     int fps_ = 30;
-    int64_t frame_count_ = 0;
+    bool force_keyframe_ = true;  // Start true to force first frame as IDR
 };
 
 
@@ -1045,15 +1084,6 @@ static std::string read_config_json() {
 
 
 /*
- * Embedded client files
- */
-
-extern const char* embedded_html;
-extern const char* embedded_js;
-extern const char* embedded_css;
-
-
-/*
  * HTTP Server
  */
 
@@ -1249,42 +1279,35 @@ private:
             return;
         }
 
-        // Static files - try disk first, then embedded content
+        // Static files
         std::string content_type = "text/html";
-        std::string file_content;
-        const char* embedded_content = nullptr;
+        std::string disk_path;
 
         // Map paths to files and content types
-        std::string disk_path;
-        if (path == "/" || path == "/index.html" || path == "/index_datachannel.html") {
-            disk_path = client_dir_ + "/index_datachannel.html";
-            embedded_content = embedded_html;
+        if (path == "/" || path == "/index.html") {
+            disk_path = client_dir_ + "/index.html";
             content_type = "text/html";
-        } else if (path == "/datachannel_client.js") {
-            disk_path = client_dir_ + "/datachannel_client.js";
-            embedded_content = embedded_js;
+        } else if (path == "/client.js") {
+            disk_path = client_dir_ + "/client.js";
             content_type = "application/javascript";
         } else if (path == "/styles.css") {
             disk_path = client_dir_ + "/styles.css";
-            embedded_content = embedded_css;
             content_type = "text/css";
         }
 
-        // Try to read from disk first
-        bool use_disk = false;
+        // Read file from disk
+        std::string file_content;
         if (!disk_path.empty()) {
             std::ifstream file(disk_path);
             if (file.is_open()) {
                 std::stringstream buffer;
                 buffer << file.rdbuf();
                 file_content = buffer.str();
-                use_disk = true;
             }
         }
 
-        if (use_disk || embedded_content) {
-            const char* content_ptr = use_disk ? file_content.c_str() : embedded_content;
-            size_t content_len = use_disk ? file_content.size() : strlen(embedded_content);
+        if (!file_content.empty()) {
+            size_t content_len = file_content.size();
 
             std::string response = "HTTP/1.1 200 OK\r\n";
             response += "Content-Type: " + content_type + "\r\n";
@@ -1292,7 +1315,7 @@ private:
             response += "Connection: close\r\n";
             response += "\r\n";
             send(fd, response.c_str(), response.size(), 0);
-            send(fd, content_ptr, content_len, 0);
+            send(fd, file_content.c_str(), content_len, 0);
         } else {
             std::string response = "HTTP/1.1 404 Not Found\r\n";
             response += "Content-Type: text/plain\r\n";
@@ -1403,25 +1426,21 @@ public:
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
-        // Build RTP packets
-        auto packets = build_rtp_packets(data, is_keyframe);
-
         static int frame_count = 0;
         static int sent_count = 0;
         frame_count++;
 
         for (auto& [id, peer] : peers_) {
             if (peer->ready && peer->video_track && peer->video_track->isOpen()) {
-                for (const auto& pkt : packets) {
-                    try {
-                        peer->video_track->send(
-                            reinterpret_cast<const std::byte*>(pkt.data()),
-                            pkt.size());
-                    } catch (const std::exception& e) {
-                        fprintf(stderr, "[WebRTC] Send error: %s\n", e.what());
-                    }
+                try {
+                    // H264RtpPacketizer handles NAL unit fragmentation automatically
+                    peer->video_track->send(
+                        reinterpret_cast<const std::byte*>(data.data()),
+                        data.size());
+                    sent_count++;
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[WebRTC] Send error: %s\n", e.what());
                 }
-                sent_count++;
             } else if (frame_count % 30 == 0) {
                 // Log why we're not sending
                 fprintf(stderr, "[WebRTC] Not sending to %s: ready=%d track=%p isOpen=%d\n",
@@ -1433,8 +1452,8 @@ public:
 
         // Log first few frames and then periodically
         if (frame_count <= 5 || frame_count % 100 == 0) {
-            fprintf(stderr, "[WebRTC] Frame %d: %zu bytes, %zu packets, keyframe=%d, sent_to=%d peers\n",
-                    frame_count, data.size(), packets.size(), is_keyframe, sent_count);
+            fprintf(stderr, "[WebRTC] Frame %d: %zu bytes, keyframe=%d, sent_to=%d peers\n",
+                    frame_count, data.size(), is_keyframe, sent_count);
             sent_count = 0;
         }
     }
@@ -1478,15 +1497,27 @@ private:
                 }
             });
 
-            // Add video track
+            // Add video track with H.264 codec
             rtc::Description::Video media("video-stream", rtc::Description::Direction::SendOnly);
-            media.addVP8Codec(96);
+            media.addH264Codec(96);
             media.addSSRC(ssrc_, "video-stream", "stream1", "video-stream");
             peer->video_track = peer->pc->addTrack(media);
+
+            // Set up H.264 RTP packetizer (handles NAL unit fragmentation)
+            auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+                ssrc_, "video-stream", 96, rtc::H264RtpPacketizer::ClockRate
+            );
+            auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+                rtc::H264RtpPacketizer::Separator::LongStartSequence,
+                rtpConfig
+            );
+            peer->video_track->setMediaHandler(packetizer);
 
             peer->video_track->onOpen([peer]() {
                 fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
                 peer->ready = true;
+                // Request keyframe so new peer gets a complete picture
+                g_request_keyframe.store(true);
             });
 
             peer->video_track->onClosed([peer]() {
@@ -1527,10 +1558,35 @@ private:
 
             // Add data channel for input
             peer->data_channel = peer->pc->createDataChannel("input");
+            peer->data_channel->onOpen([peer_id = peer->id]() {
+                fprintf(stderr, "[WebRTC] DataChannel OPEN for %s\n", peer_id.c_str());
+            });
             peer->data_channel->onMessage([this](auto data) {
                 if (std::holds_alternative<std::string>(data)) {
-                    handle_input(std::get<std::string>(data));
+                    const std::string& msg = std::get<std::string>(data);
+                    static int msg_count = 0;
+                    if (msg_count++ < 5) {
+                        fprintf(stderr, "[WebRTC] DataChannel message: '%s'\n", msg.c_str());
+                    }
+                    handle_input(msg);
+                } else {
+                    fprintf(stderr, "[WebRTC] DataChannel received binary data\n");
                 }
+            });
+
+            // Also handle incoming data channels from browser
+            peer->pc->onDataChannel([this, peer_id = peer->id](std::shared_ptr<rtc::DataChannel> dc) {
+                fprintf(stderr, "[WebRTC] Incoming DataChannel '%s' from %s\n",
+                        dc->label().c_str(), peer_id.c_str());
+                dc->onOpen([label = dc->label(), peer_id]() {
+                    fprintf(stderr, "[WebRTC] Incoming DataChannel '%s' OPEN for %s\n",
+                            label.c_str(), peer_id.c_str());
+                });
+                dc->onMessage([this](auto data) {
+                    if (std::holds_alternative<std::string>(data)) {
+                        handle_input(std::get<std::string>(data));
+                    }
+                });
             });
 
             peer->pc->setLocalDescription();
@@ -1608,58 +1664,22 @@ private:
     }
 
     void handle_input(const std::string& msg) {
+        // Simple text protocol: M dx,dy | D btn | U btn | K code | k code
+        if (msg.empty()) return;
+
+        char cmd = msg[0];
+        switch (cmd) {
+            case 'M': g_mouse_move_count++; break;
+            case 'D':
+            case 'U': g_mouse_click_count++; break;
+            case 'K':
+            case 'k': g_key_count++; break;
+        }
+
         // Forward input to emulator via control socket
         if (g_control_socket >= 0) {
             send_to_emulator(msg);
         }
-    }
-
-    std::vector<std::vector<uint8_t>> build_rtp_packets(const std::vector<uint8_t>& frame, bool keyframe) {
-        std::vector<std::vector<uint8_t>> packets;
-        const size_t MTU = 1200;
-
-        size_t offset = 0;
-        bool first = true;
-        uint32_t ts = timestamp_;
-        timestamp_ += 3000;  // 90kHz / 30fps
-
-        while (offset < frame.size()) {
-            size_t payload_size = std::min(MTU - 12 - 1, frame.size() - offset);
-            bool last = (offset + payload_size >= frame.size());
-
-            std::vector<uint8_t> pkt;
-            pkt.reserve(12 + 1 + payload_size);
-
-            // RTP header
-            pkt.push_back(0x80);
-            pkt.push_back(last ? (0x80 | 96) : 96);
-            pkt.push_back((seq_num_ >> 8) & 0xFF);
-            pkt.push_back(seq_num_ & 0xFF);
-            pkt.push_back((ts >> 24) & 0xFF);
-            pkt.push_back((ts >> 16) & 0xFF);
-            pkt.push_back((ts >> 8) & 0xFF);
-            pkt.push_back(ts & 0xFF);
-            pkt.push_back((ssrc_ >> 24) & 0xFF);
-            pkt.push_back((ssrc_ >> 16) & 0xFF);
-            pkt.push_back((ssrc_ >> 8) & 0xFF);
-            pkt.push_back(ssrc_ & 0xFF);
-
-            // VP8 payload descriptor
-            uint8_t vp8_header = 0;
-            if (first) vp8_header |= 0x10;  // S bit
-            pkt.push_back(vp8_header);
-
-            // Payload
-            pkt.insert(pkt.end(), frame.begin() + offset, frame.begin() + offset + payload_size);
-
-            packets.push_back(std::move(pkt));
-
-            offset += payload_size;
-            first = false;
-            seq_num_++;
-        }
-
-        return packets;
     }
 
     std::atomic<bool> initialized_{false};
@@ -1673,8 +1693,6 @@ private:
     std::map<rtc::WebSocket*, std::string> ws_to_peer_id_;
 
     uint32_t ssrc_ = 1;
-    uint16_t seq_num_ = 0;
-    uint32_t timestamp_ = 0;
 };
 
 
@@ -1682,11 +1700,16 @@ private:
  * Main video processing loop
  */
 
-static void video_loop(WebRTCServer& webrtc, VP8Encoder& encoder) {
+static void video_loop(WebRTCServer& webrtc, H264Encoder& encoder) {
     uint64_t last_frame_count = 0;
     auto last_stats_time = std::chrono::steady_clock::now();
     auto last_emu_check = std::chrono::steady_clock::now();
     int frames_encoded = 0;
+
+    // Track input counts between stats intervals
+    uint64_t last_mouse_move = 0;
+    uint64_t last_mouse_click = 0;
+    uint64_t last_key = 0;
 
     fprintf(stderr, "Video: Starting frame processing loop\n");
 
@@ -1760,6 +1783,11 @@ static void video_loop(WebRTCServer& webrtc, VP8Encoder& encoder) {
 
         const uint8_t* frame_data = g_video_shm->frames[idx];
 
+        // Check if keyframe requested (new peer connected)
+        if (g_request_keyframe.exchange(false)) {
+            encoder.request_keyframe();
+        }
+
         // Encode frame
         auto encoded = encoder.encode(frame_data, width, height, stride);
         if (!encoded.empty()) {
@@ -1772,9 +1800,26 @@ static void video_loop(WebRTCServer& webrtc, VP8Encoder& encoder) {
         auto stats_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time);
         if (stats_elapsed.count() >= 3000) {
             float fps = frames_encoded * 1000.0f / stats_elapsed.count();
-            fprintf(stderr, "[Server] fps=%.1f peers=%d emu=%s\n",
+
+            // Calculate input rates
+            uint64_t cur_mouse_move = g_mouse_move_count.load();
+            uint64_t cur_mouse_click = g_mouse_click_count.load();
+            uint64_t cur_key = g_key_count.load();
+
+            uint64_t mouse_moves = cur_mouse_move - last_mouse_move;
+            uint64_t mouse_clicks = cur_mouse_click - last_mouse_click;
+            uint64_t keys = cur_key - last_key;
+
+            float mouse_rate = mouse_moves * 1000.0f / stats_elapsed.count();
+
+            fprintf(stderr, "[Server] fps=%.1f peers=%d emu=%s | input: mouse=%.0f/s clicks=%lu keys=%lu\n",
                     fps, webrtc.peer_count(),
-                    g_emulator_pid > 0 ? "running" : "stopped");
+                    g_emulator_pid > 0 ? "running" : "stopped",
+                    mouse_rate, mouse_clicks, keys);
+
+            last_mouse_move = cur_mouse_move;
+            last_mouse_click = cur_mouse_click;
+            last_key = cur_key;
             frames_encoded = 0;
             last_stats_time = now;
         }
@@ -1946,7 +1991,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Main video processing loop
-    VP8Encoder encoder;
+    H264Encoder encoder;
     video_loop(webrtc, encoder);
 
     // Stop emulator if we started it
@@ -1961,573 +2006,3 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "Server: Shutdown complete\n");
     return 0;
 }
-
-
-/*
- * Embedded client files - placeholder
- * In production, these would be the same as datachannel_webrtc.cpp
- * For now, include minimal content
- */
-
-const char* embedded_html = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>macemu WebRTC</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: #1a1a1a; color: #fff; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        h1 { font-size: 1.2em; color: #888; margin-bottom: 15px; text-align: center; }
-        #video-container { background: #000; border-radius: 8px; overflow: hidden; margin-bottom: 15px; position: relative; }
-        #video { width: 100%; display: block; cursor: none; }
-        #controls { display: flex; gap: 10px; justify-content: center; margin-bottom: 15px; flex-wrap: wrap; }
-        button { background: #333; color: #fff; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 14px; transition: background 0.2s; }
-        button:hover { background: #444; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        button.danger { background: #633; }
-        button.danger:hover { background: #844; }
-        button.success { background: #363; }
-        button.success:hover { background: #484; }
-        button.primary { background: #346; }
-        button.primary:hover { background: #458; }
-        #status { text-align: center; padding: 10px; background: #333; border-radius: 20px; font-size: 0.85em; color: #aaa; margin-bottom: 15px; }
-        #status.connected { background: #234; color: #4a9; }
-        #status.error { background: #433; color: #a99; }
-        .emu-status { display: flex; gap: 15px; justify-content: center; font-size: 0.8em; color: #666; margin-bottom: 15px; }
-        .emu-status span { display: flex; align-items: center; gap: 5px; }
-        .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
-        .dot.green { background: #4a4; }
-        .dot.red { background: #a44; }
-
-        /* Modal overlay */
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; overflow-y: auto; }
-        .modal-overlay.open { display: flex; justify-content: center; align-items: flex-start; padding: 40px 20px; }
-        .modal { background: #252525; border-radius: 12px; max-width: 600px; width: 100%; max-height: calc(100vh - 80px); overflow-y: auto; }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 20px; border-bottom: 1px solid #333; position: sticky; top: 0; background: #252525; z-index: 1; }
-        .modal-header h2 { font-size: 1.2em; color: #fff; }
-        .modal-close { background: none; border: none; color: #888; font-size: 24px; cursor: pointer; padding: 0; width: 32px; height: 32px; }
-        .modal-close:hover { color: #fff; background: none; }
-        .modal-body { padding: 20px; }
-        .modal-footer { padding: 20px; border-top: 1px solid #333; display: flex; justify-content: flex-end; gap: 10px; position: sticky; bottom: 0; background: #252525; }
-
-        /* Form elements */
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 8px; color: #aaa; font-size: 0.9em; }
-        .form-group select, .form-group input[type="number"] { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #444; border-radius: 5px; color: #fff; font-size: 14px; }
-        .form-group select:focus, .form-group input:focus { outline: none; border-color: #567; }
-
-        /* ROM list with recommendations */
-        .rom-option { display: flex; align-items: center; gap: 10px; padding: 10px; background: #1a1a1a; border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s; }
-        .rom-option:hover { border-color: #567; }
-        .rom-option.selected { border-color: #4a9; background: #1a2a2a; }
-        .rom-option input[type="radio"] { display: none; }
-        .rom-radio { width: 18px; height: 18px; border: 2px solid #555; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-        .rom-option.selected .rom-radio { border-color: #4a9; }
-        .rom-option.selected .rom-radio::after { content: ''; width: 10px; height: 10px; background: #4a9; border-radius: 50%; }
-        .rom-info { flex: 1; }
-        .rom-name { color: #fff; font-size: 0.95em; }
-        .rom-details { color: #666; font-size: 0.8em; margin-top: 2px; }
-        .rom-recommended { color: #fa0; font-size: 0.75em; margin-left: 8px; }
-        .rom-star { color: #fa0; }
-
-        /* Disk list with checkboxes */
-        .disk-option { display: flex; align-items: center; gap: 10px; padding: 10px; background: #1a1a1a; border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s; }
-        .disk-option:hover { border-color: #567; }
-        .disk-option.selected { border-color: #4a9; background: #1a2a2a; }
-        .disk-checkbox { width: 18px; height: 18px; border: 2px solid #555; border-radius: 4px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-        .disk-option.selected .disk-checkbox { border-color: #4a9; background: #4a9; }
-        .disk-option.selected .disk-checkbox::after { content: '\2713'; color: #fff; font-size: 12px; }
-        .disk-info { flex: 1; }
-        .disk-name { color: #fff; font-size: 0.95em; }
-        .disk-size { color: #666; font-size: 0.8em; }
-
-        /* Advanced settings */
-        .advanced-toggle { display: flex; align-items: center; gap: 8px; padding: 12px; background: #1a1a1a; border-radius: 5px; cursor: pointer; margin-bottom: 15px; }
-        .advanced-toggle:hover { background: #222; }
-        .advanced-toggle .arrow { transition: transform 0.2s; }
-        .advanced-toggle.open .arrow { transform: rotate(90deg); }
-        .advanced-content { display: none; padding: 15px; background: #1a1a1a; border-radius: 5px; }
-        .advanced-content.open { display: block; }
-        .form-row { display: flex; gap: 15px; }
-        .form-row .form-group { flex: 1; }
-        .checkbox-group { display: flex; align-items: center; gap: 8px; }
-        .checkbox-group input[type="checkbox"] { width: 18px; height: 18px; }
-
-        /* Empty state */
-        .empty-state { text-align: center; padding: 30px; color: #666; }
-
-        /* Note banner */
-        .note-banner { background: #2a2a1a; border: 1px solid #554; border-radius: 5px; padding: 12px; margin-top: 15px; font-size: 0.85em; color: #aa8; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Basilisk II Web Streaming</h1>
-        <div id="status">Initializing...</div>
-        <div id="video-container">
-            <video id="video" autoplay muted playsinline></video>
-        </div>
-        <div id="controls">
-            <button id="btn-config" class="primary" onclick="openConfig()">Settings</button>
-            <button id="btn-start" class="success" onclick="startEmulator()">Start</button>
-            <button id="btn-stop" class="danger" onclick="stopEmulator()">Stop</button>
-            <button id="btn-restart" onclick="restartEmulator()">Restart</button>
-        </div>
-        <div class="emu-status">
-            <span><span class="dot" id="dot-running"></span> Process</span>
-            <span><span class="dot" id="dot-connected"></span> Connected</span>
-            <span id="emu-pid">PID: -</span>
-        </div>
-    </div>
-
-    <!-- Configuration Modal -->
-    <div class="modal-overlay" id="config-modal">
-        <div class="modal">
-            <div class="modal-header">
-                <h2>Emulator Settings</h2>
-                <button class="modal-close" onclick="closeConfig()">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="form-group">
-                    <label>ROM File</label>
-                    <div id="rom-list"><div class="empty-state">Loading...</div></div>
-                </div>
-
-                <div class="form-group">
-                    <label>Disk Images</label>
-                    <div id="disk-list"><div class="empty-state">Loading...</div></div>
-                </div>
-
-                <div class="form-group">
-                    <label>RAM Size</label>
-                    <select id="cfg-ram">
-                        <option value="8">8 MB</option>
-                        <option value="16">16 MB</option>
-                        <option value="32" selected>32 MB</option>
-                        <option value="64">64 MB</option>
-                        <option value="128">128 MB</option>
-                        <option value="256">256 MB</option>
-                        <option value="512">512 MB</option>
-                    </select>
-                </div>
-
-                <div class="form-group">
-                    <label>Screen Resolution</label>
-                    <select id="cfg-screen">
-                        <option value="640x480">640 x 480</option>
-                        <option value="800x600" selected>800 x 600</option>
-                        <option value="1024x768">1024 x 768</option>
-                        <option value="1280x1024">1280 x 1024</option>
-                    </select>
-                </div>
-
-                <div class="advanced-toggle" onclick="toggleAdvanced()">
-                    <span class="arrow">&#9654;</span>
-                    <span>Advanced Settings</span>
-                </div>
-                <div class="advanced-content" id="advanced-settings">
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label>CPU Type</label>
-                            <select id="cfg-cpu">
-                                <option value="2">68020</option>
-                                <option value="3">68030</option>
-                                <option value="4" selected>68040</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Mac Model</label>
-                            <select id="cfg-model">
-                                <option value="5">Mac II</option>
-                                <option value="6">Mac IIx</option>
-                                <option value="7">Mac IIcx</option>
-                                <option value="11">Mac IIci</option>
-                                <option value="13">Mac IIfx</option>
-                                <option value="14" selected>Quadra 900</option>
-                                <option value="18">Quadra 700</option>
-                                <option value="35">Quadra 800</option>
-                                <option value="36">Quadra 650</option>
-                                <option value="52">Quadra 610</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <div class="checkbox-group">
-                                <input type="checkbox" id="cfg-fpu" checked>
-                                <label for="cfg-fpu">Enable FPU (68881)</label>
-                            </div>
-                        </div>
-                        <div class="form-group">
-                            <div class="checkbox-group">
-                                <input type="checkbox" id="cfg-jit" checked>
-                                <label for="cfg-jit">Enable JIT Compiler</label>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <div class="checkbox-group">
-                            <input type="checkbox" id="cfg-sound" checked>
-                            <label for="cfg-sound">Enable Sound</label>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="note-banner">
-                    Changes require emulator restart to take effect.
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button onclick="closeConfig()">Cancel</button>
-                <button class="success" onclick="saveConfig()">Save &amp; Restart</button>
-            </div>
-        </div>
-    </div>
-
-    <script src="datachannel_client.js"></script>
-</body>
-</html>
-)HTML";
-
-const char* embedded_js = R"JS(
-const video = document.getElementById('video');
-const statusEl = document.getElementById('status');
-const dotRunning = document.getElementById('dot-running');
-const dotConnected = document.getElementById('dot-connected');
-const emuPid = document.getElementById('emu-pid');
-
-// Known ROM database with checksums and recommendations
-const ROM_DATABASE = {
-    // Mac II family
-    '97851db6': { name: 'Mac II', model: 5, recommended: false },
-    'b2e362a8': { name: 'Mac IIx', model: 6, recommended: false },
-    '4147dd77': { name: 'Mac IIcx', model: 7, recommended: false },
-    '368cadfe': { name: 'Mac IIci', model: 11, recommended: false },
-
-    // Mac IIfx
-    '4df6d054': { name: 'Mac IIfx', model: 13, recommended: false },
-
-    // Quadra family (recommended for best compatibility)
-    '420dbff3': { name: 'Quadra 700', model: 18, recommended: true },
-    '3dc27823': { name: 'Quadra 900', model: 14, recommended: true },
-
-    // LC/Performa family
-    '350eacf0': { name: 'LC III / Performa 450', model: 27, recommended: false },
-    'ecbbc41c': { name: 'LC 475 / Performa 475', model: 44, recommended: false },
-
-    // PowerBook
-    '96645f9c': { name: 'PowerBook 140/145/170', model: 25, recommended: false },
-
-    // Classic II
-    '3193670e': { name: 'Classic II', model: 23, recommended: false },
-
-    // Common alternate checksums
-    '9779d2c4': { name: 'Mac IIci (alternate)', model: 11, recommended: false },
-    'e33b2724': { name: 'Quadra 610', model: 52, recommended: false },
-    'f1a6f343': { name: 'Quadra 650', model: 36, recommended: false },
-    'f1acad13': { name: 'Quadra 800', model: 35, recommended: false },
-};
-
-// State
-let selectedRom = null;
-let selectedDisks = [];
-let storageData = null;
-
-// WebRTC connection
-const ws = new WebSocket('ws://' + location.hostname + ':8090');
-let pc = null;
-let dc = null;
-
-ws.onopen = () => {
-    setStatus('Connected to signaling server', false);
-    ws.send(JSON.stringify({type: 'connect'}));
-};
-
-ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === 'offer') {
-        pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
-        pc.ontrack = (e) => { video.srcObject = e.streams[0]; };
-        pc.ondatachannel = (e) => { dc = e.channel; window.dc = dc; };
-        await pc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({type: 'answer', sdp: answer.sdp}));
-        setStatus('WebRTC connected', true);
-    }
-};
-
-ws.onerror = () => setStatus('Connection error', false, true);
-ws.onclose = () => setStatus('Disconnected', false);
-
-function setStatus(text, connected, error) {
-    statusEl.textContent = text;
-    statusEl.className = error ? 'error' : (connected ? 'connected' : '');
-}
-
-// Modal functions
-function openConfig() {
-    document.getElementById('config-modal').classList.add('open');
-    loadStorage();
-}
-
-function closeConfig() {
-    document.getElementById('config-modal').classList.remove('open');
-}
-
-function toggleAdvanced() {
-    const toggle = document.querySelector('.advanced-toggle');
-    const content = document.getElementById('advanced-settings');
-    toggle.classList.toggle('open');
-    content.classList.toggle('open');
-}
-
-// Close modal on overlay click
-document.getElementById('config-modal').addEventListener('click', (e) => {
-    if (e.target.classList.contains('modal-overlay')) closeConfig();
-});
-
-// Close modal on Escape key
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && document.getElementById('config-modal').classList.contains('open')) {
-        closeConfig();
-        e.preventDefault();
-    }
-});
-
-async function loadStorage() {
-    try {
-        // Load current config first
-        const configRes = await fetch('api/config');
-        const config = await configRes.json();
-        if (!config.error) {
-            selectedRom = config.rom || null;
-            selectedDisks = config.disks || [];
-            // Set form values
-            if (config.ramsize) document.getElementById('cfg-ram').value = config.ramsize;
-            if (config.screen) document.getElementById('cfg-screen').value = config.screen;
-            if (config.cpu) document.getElementById('cfg-cpu').value = config.cpu;
-            if (config.modelid) document.getElementById('cfg-model').value = config.modelid;
-            document.getElementById('cfg-fpu').checked = config.fpu !== false;
-            document.getElementById('cfg-jit').checked = config.jit !== false;
-            document.getElementById('cfg-sound').checked = config.sound !== false;
-        }
-
-        // Then load storage files
-        const res = await fetch('api/storage');
-        storageData = await res.json();
-        renderRomList(storageData.roms);
-        renderDiskList(storageData.disks);
-    } catch (e) {
-        document.getElementById('rom-list').innerHTML = '<div class="empty-state">Error loading ROM files</div>';
-        document.getElementById('disk-list').innerHTML = '<div class="empty-state">Error loading disk images</div>';
-    }
-}
-
-function renderRomList(roms) {
-    const el = document.getElementById('rom-list');
-    if (!roms || roms.length === 0) {
-        el.innerHTML = '<div class="empty-state">No ROM files found in storage/roms/</div>';
-        return;
-    }
-
-    // Sort: recommended first, then alphabetically
-    const sortedRoms = roms.slice().sort((a, b) => {
-        const infoA = ROM_DATABASE[a.checksum] || {};
-        const infoB = ROM_DATABASE[b.checksum] || {};
-        if (infoA.recommended && !infoB.recommended) return -1;
-        if (!infoA.recommended && infoB.recommended) return 1;
-        return a.name.localeCompare(b.name);
-    });
-
-    el.innerHTML = sortedRoms.map(rom => {
-        const info = ROM_DATABASE[rom.checksum] || null;
-        const size = rom.size > 1048576 ? (rom.size/1048576).toFixed(1) + ' MB' : (rom.size/1024).toFixed(0) + ' KB';
-        const isSelected = selectedRom === rom.name;
-        const displayName = info ? info.name : rom.name;
-        const details = info ? size : size + ' [' + rom.checksum + ']';
-        const recommended = info && info.recommended;
-
-        return '<label class="rom-option' + (isSelected ? ' selected' : '') + '" onclick="selectRom(\'' + rom.name.replace(/'/g, "\\'") + '\')">' +
-            '<div class="rom-radio"></div>' +
-            '<div class="rom-info">' +
-                '<div class="rom-name">' + displayName + (recommended ? ' <span class="rom-star">★</span><span class="rom-recommended">Recommended</span>' : '') + '</div>' +
-                '<div class="rom-details">' + rom.name + ' - ' + details + '</div>' +
-            '</div>' +
-        '</label>';
-    }).join('');
-
-    // Auto-select first recommended ROM if none selected
-    if (!selectedRom) {
-        const recommended = sortedRoms.find(r => ROM_DATABASE[r.checksum]?.recommended);
-        if (recommended) selectRom(recommended.name);
-        else if (sortedRoms.length > 0) selectRom(sortedRoms[0].name);
-    }
-}
-
-function selectRom(name) {
-    selectedRom = name;
-    document.querySelectorAll('.rom-option').forEach(el => {
-        el.classList.toggle('selected', el.textContent.includes(name));
-    });
-    // Re-render to update visual state properly
-    if (storageData) renderRomList(storageData.roms);
-
-    // Auto-set model ID based on ROM
-    const rom = storageData?.roms?.find(r => r.name === name);
-    if (rom) {
-        const info = ROM_DATABASE[rom.checksum];
-        if (info && info.model) {
-            const modelSelect = document.getElementById('cfg-model');
-            const option = modelSelect.querySelector('option[value="' + info.model + '"]');
-            if (option) modelSelect.value = info.model;
-        }
-    }
-}
-
-function renderDiskList(disks) {
-    const el = document.getElementById('disk-list');
-    if (!disks || disks.length === 0) {
-        el.innerHTML = '<div class="empty-state">No disk images found in storage/images/</div>';
-        return;
-    }
-
-    el.innerHTML = disks.map(disk => {
-        const size = disk.size > 1048576 ? (disk.size/1048576).toFixed(1) + ' MB' : (disk.size/1024).toFixed(0) + ' KB';
-        const isSelected = selectedDisks.includes(disk.name);
-
-        return '<label class="disk-option' + (isSelected ? ' selected' : '') + '" onclick="toggleDisk(\'' + disk.name.replace(/'/g, "\\'") + '\')">' +
-            '<div class="disk-checkbox"></div>' +
-            '<div class="disk-info">' +
-                '<div class="disk-name">' + disk.name + '</div>' +
-                '<div class="disk-size">' + size + '</div>' +
-            '</div>' +
-        '</label>';
-    }).join('');
-}
-
-function toggleDisk(name) {
-    const idx = selectedDisks.indexOf(name);
-    if (idx >= 0) {
-        selectedDisks.splice(idx, 1);
-    } else {
-        selectedDisks.push(name);
-    }
-    if (storageData) renderDiskList(storageData.disks);
-}
-
-async function saveConfig() {
-    if (!selectedRom) {
-        alert('Please select a ROM file');
-        return;
-    }
-
-    const config = {
-        rom: selectedRom,
-        disks: selectedDisks,
-        ramsize: parseInt(document.getElementById('cfg-ram').value),
-        screen: document.getElementById('cfg-screen').value,
-        cpu: parseInt(document.getElementById('cfg-cpu').value),
-        modelid: parseInt(document.getElementById('cfg-model').value),
-        fpu: document.getElementById('cfg-fpu').checked,
-        jit: document.getElementById('cfg-jit').checked,
-        sound: document.getElementById('cfg-sound').checked
-    };
-
-    try {
-        const res = await fetch('api/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(config)
-        });
-        const data = await res.json();
-        if (data.success) {
-            closeConfig();
-            // Restart emulator to apply changes
-            await restartEmulator();
-        } else {
-            alert('Failed to save config: ' + (data.error || 'Unknown error'));
-        }
-    } catch (e) {
-        alert('Failed to save config: ' + e.message);
-    }
-}
-
-// Emulator control
-async function startEmulator() {
-    try {
-        const res = await fetch('api/emulator/start', {method: 'POST'});
-        const data = await res.json();
-        console.log('Start:', data.message);
-    } catch (e) { console.error('Start failed:', e); }
-}
-
-async function stopEmulator() {
-    try {
-        const res = await fetch('api/emulator/stop', {method: 'POST'});
-        const data = await res.json();
-        console.log('Stop:', data.message);
-    } catch (e) { console.error('Stop failed:', e); }
-}
-
-async function restartEmulator() {
-    try {
-        const res = await fetch('api/emulator/restart', {method: 'POST'});
-        const data = await res.json();
-        console.log('Restart:', data.message);
-    } catch (e) { console.error('Restart failed:', e); }
-}
-
-// Status polling
-async function pollStatus() {
-    try {
-        const res = await fetch('api/status');
-        const data = await res.json();
-        dotRunning.className = 'dot ' + (data.emulator_running ? 'green' : 'red');
-        dotConnected.className = 'dot ' + (data.emulator_connected ? 'green' : 'red');
-        emuPid.textContent = 'PID: ' + (data.emulator_pid > 0 ? data.emulator_pid : '-');
-    } catch (e) {}
-}
-setInterval(pollStatus, 2000);
-pollStatus();
-
-// Input handling
-video.addEventListener('click', () => video.requestPointerLock());
-document.addEventListener('keydown', (e) => {
-    // Don't capture input when modal is open
-    if (document.getElementById('config-modal').classList.contains('open')) return;
-    if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({type:'keydown', keyCode: e.keyCode, key: e.key}));
-        e.preventDefault();
-    }
-});
-document.addEventListener('keyup', (e) => {
-    if (document.getElementById('config-modal').classList.contains('open')) return;
-    if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({type:'keyup', keyCode: e.keyCode, key: e.key}));
-        e.preventDefault();
-    }
-});
-document.addEventListener('mousemove', (e) => {
-    if (document.pointerLockElement === video && dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({type:'mousemove', dx: e.movementX, dy: e.movementY}));
-    }
-});
-document.addEventListener('mousedown', (e) => {
-    if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({type:'mousedown', button: e.button}));
-    }
-});
-document.addEventListener('mouseup', (e) => {
-    if (dc && dc.readyState === 'open') {
-        dc.send(JSON.stringify({type:'mouseup', button: e.button}));
-    }
-});
-)JS";
-
-const char* embedded_css = R"CSS(
-/* Minimal fallback CSS - load styles.css from client/ for full version */
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #1a1a1a; color: #fff; font-family: -apple-system, sans-serif; }
-)CSS";
