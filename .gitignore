@@ -37,3 +37,16 @@ project.xcworkspace/
 # JetBrains IDE settings
 #
 *.idea
+
+#
+# Emulator runtime files
+#
+.basilisk_ii_xpram
+*.xpram
+
+#
+# Web streaming runtime
+#
+web-streaming/storage/
+web-streaming/basilisk_ii.prefs
+web-streaming/BasiliskII
