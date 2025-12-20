@@ -43,8 +43,9 @@ dnl JIT compiler options.
 AC_ARG_ENABLE(jit-compiler,  [  --enable-jit-compiler   enable JIT compiler [default=yes]], [WANT_JIT=$enableval], [WANT_JIT=yes])
 AC_ARG_ENABLE(jit-debug,     [  --enable-jit-debug      activate native code disassemblers [default=no]], [WANT_JIT_DEBUG=$enableval], [WANT_JIT_DEBUG=no])
 
-dnl Web streaming options (headless mode with WebRTC via libdatachannel).
-AC_ARG_ENABLE(webstreaming,  [  --enable-webstreaming   enable headless WebRTC streaming [default=no]], [WANT_WEBSTREAMING=$enableval], [WANT_WEBSTREAMING=no])
+dnl IPC options (for headless mode with standalone WebRTC server).
+AC_ARG_ENABLE(ipc-video,     [  --enable-ipc-video      use IPC for video graphics [default=no]], [WANT_IPC_VIDEO=$enableval], [WANT_IPC_VIDEO=no])
+AC_ARG_ENABLE(ipc-audio,     [  --enable-ipc-audio      use IPC for audio [default=no]], [WANT_IPC_AUDIO=$enableval], [WANT_IPC_AUDIO=no])
 
 dnl FPU emulation core.
 AC_ARG_ENABLE(fpe,
@@ -288,9 +289,16 @@ LIBS="$saved_LIBS"; CPPFLAGS="$saved_CPPFLAGS"; $4]
   AS_VAR_POPDEF([ac_Framework])
 ])
 
-dnl Webstreaming mode is mutually exclusive with SDL (headless only)
-if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
+dnl IPC video mode is mutually exclusive with all other video drivers (headless)
+if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
   WANT_SDL_VIDEO=no
+  WANT_XF86_DGA=no
+  WANT_XF86_VIDMODE=no
+  WANT_FBDEV_DGA=no
+fi
+
+dnl IPC audio mode is mutually exclusive with SDL audio
+if [[ "x$WANT_IPC_AUDIO" = "xyes" ]]; then
   WANT_SDL_AUDIO=no
 fi
 
@@ -378,8 +386,8 @@ else
   SDL_SUPPORT="none"
 fi
 
-dnl We need X11, if not using SDL, Mac GUI, or webstreaming mode.
-if [[ "x$WANT_SDL_VIDEO" = "xno" -a "x$WANT_MACOSX_GUI" = "xno" -a "x$WANT_WEBSTREAMING" = "xno" ]]; then
+dnl We need X11, if not using SDL, Mac GUI, or IPC video mode.
+if [[ "x$WANT_SDL_VIDEO" = "xno" -a "x$WANT_MACOSX_GUI" = "xno" -a "x$WANT_IPC_VIDEO" = "xno" ]]; then
   AC_PATH_XTRA
   if [[ "x$no_x" = "xyes" ]]; then
     AC_MSG_ERROR([You need X11 to run Basilisk II.])
@@ -867,61 +875,38 @@ AS_IF([test "x$with_vdeplug" = "xyes"], [
   AC_CHECK_LIB(vdeplug, vde_close, [], [have_vdeplug=no])
 ])
 
-dnl Web streaming support using libdatachannel + libvpx
-dnl libdatachannel is built locally in web-streaming/libdatachannel
-if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-  WEBSTREAMING_DIR="../../../web-streaming"
-  LIBDATACHANNEL_DIR="$WEBSTREAMING_DIR/libdatachannel"
-  LIBDATACHANNEL_BUILD="$LIBDATACHANNEL_DIR/build"
+dnl IPC video support (shared memory for standalone WebRTC server)
+if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
+  IPC_PROTO_DIR="../../../web-streaming/server"
 
-  dnl Check if libdatachannel was built
-  if test -f "$LIBDATACHANNEL_BUILD/libdatachannel.a"; then
-    AC_MSG_RESULT([Found local libdatachannel build])
-  else
-    AC_MSG_ERROR([libdatachannel not built. Run 'make' in web-streaming/ first])
-  fi
+  dnl IPC needs -lrt for shm_open
+  LIBS="$LIBS -lrt -lpthread"
 
-  dnl Add libdatachannel includes and library
-  CPPFLAGS="$CPPFLAGS -I$LIBDATACHANNEL_DIR/include"
-  dnl Link order matters: our code, then datachanel static lib, then its deps
-  dnl usrsctp has symbol conflicts with slirp (ip_id, socreate, m_*, etc.)
-  dnl We use libusrsctp_fixed.a which has conflicting symbols renamed with __usrsctp_ prefix
-  dnl libsrtp2 is needed for SRTP (secure media transport)
-  LIBS="$LIBDATACHANNEL_BUILD/libdatachannel.a $LIBDATACHANNEL_BUILD/deps/libjuice/libjuice.a $LIBDATACHANNEL_BUILD/deps/libsrtp/libsrtp2.a $LIBDATACHANNEL_BUILD/deps/usrsctp/usrsctplib/libusrsctp_fixed.a $LIBS"
+  dnl Add IPC protocol header include path and IPC source folder
+  CPPFLAGS="$CPPFLAGS -I$IPC_PROTO_DIR -I../IPC"
 
-  dnl Check for libvpx (VP8 encoder) - this one is from system
-  PKG_CHECK_MODULES(VPX, [vpx], [
-    CPPFLAGS="$CPPFLAGS $VPX_CFLAGS"
-    LIBS="$LIBS $VPX_LIBS"
-  ], [
-    AC_CHECK_LIB(vpx, vpx_codec_encode, [
-      LIBS="$LIBS -lvpx"
-    ], [
-      AC_MSG_ERROR([libvpx not found. Install libvpx-dev])
-    ])
-  ])
-
-  dnl OpenSSL is needed by libdatachannel
-  PKG_CHECK_MODULES(OPENSSL, [openssl], [
-    CPPFLAGS="$CPPFLAGS $OPENSSL_CFLAGS"
-    LIBS="$LIBS $OPENSSL_LIBS"
-  ], [
-    AC_CHECK_LIB(ssl, SSL_new, [
-      LIBS="$LIBS -lssl -lcrypto"
-    ], [
-      AC_MSG_ERROR([OpenSSL not found. Install libssl-dev])
-    ])
-  ])
-
-  AC_DEFINE(ENABLE_WEBSTREAMING, 1, [Define to enable WebRTC streaming for browser access])
-  AC_DEFINE(USE_DATACHANNEL_WEBRTC, 1, [Define to use libdatachannel WebRTC backend])
-  CPPFLAGS="$CPPFLAGS -I$WEBSTREAMING_DIR/server"
-  LIBS="$LIBS -lpthread"
-  WEBSTREAMING_SRCS="$WEBSTREAMING_DIR/server/datachannel_webrtc.cpp"
-  WEBSTREAMING_BACKEND="libdatachannel + libvpx"
+  AC_DEFINE(ENABLE_IPC_VIDEO, 1, [Define to enable IPC-based video])
   AC_DEFINE(ENABLE_HEADLESS, 1, [Define to enable headless mode])
 fi
-AC_SUBST(WEBSTREAMING_SRCS)
+
+dnl IPC audio support (shared memory for standalone WebRTC server)
+if [[ "x$WANT_IPC_AUDIO" = "xyes" ]]; then
+  IPC_PROTO_DIR="../../../web-streaming/server"
+
+  dnl IPC needs -lrt for shm_open (may already be added by video)
+  case "$LIBS" in
+    *-lrt*) ;;
+    *) LIBS="$LIBS -lrt" ;;
+  esac
+
+  dnl Add IPC protocol header include path (may already be added by video)
+  case "$CPPFLAGS" in
+    *web-streaming/server*) ;;
+    *) CPPFLAGS="$CPPFLAGS -I$IPC_DIR/server" ;;
+  esac
+
+  AC_DEFINE(ENABLE_IPC_AUDIO, 1, [Define to enable IPC-based audio])
+fi
 
 if [[ "x$WANT_MACOSX_GUI" = "xyes" ]]; then
   CPPFLAGS="$CPPFLAGS -I../MacOSX"
@@ -954,10 +939,10 @@ if [[ "x$WANT_SDL" = "xyes" ]]; then
     EXTRASYSSRCS="$EXTRASYSSRCS ../SDL/SDLMain.m"
   fi
 fi
-dnl Video source selection - webstreaming is mutually exclusive with SDL/X11
-if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-  dnl Webstreaming mode - no local display, WebRTC streaming only
-  VIDEOSRCS="../SDL/video_headless.cpp"
+dnl Video source selection - IPC video is mutually exclusive with SDL/X11
+if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
+  dnl IPC video mode - shared memory video for standalone WebRTC server
+  VIDEOSRCS="../IPC/video_ipc.cpp"
   KEYCODES="../SDL/keycodes"
   EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"
 elif [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
@@ -1026,7 +1011,7 @@ if [[ "x$HAVE_PTHREADS" = "xno" ]]; then
   ETHERSRC=../dummy/ether_dummy.cpp
   AUDIOSRC=../dummy/audio_dummy.cpp
 fi
-SYSSRCS="$VIDEOSRCS $EXTFSSRC $SERIALSRC $ETHERSRC $SCSISRC $AUDIOSRC $SEMSRC $UISRCS $MONSRCS $WEBSTREAMING_SRCS $EXTRASYSSRCS"
+SYSSRCS="$VIDEOSRCS $EXTFSSRC $SERIALSRC $ETHERSRC $SCSISRC $AUDIOSRC $SEMSRC $UISRCS $MONSRCS $EXTRASYSSRCS"
 
 dnl Define a macro that translates a yesno-variable into a C macro definition
 dnl to be put into the config.h file
@@ -1579,8 +1564,8 @@ if [[ "x$OS_TYPE" = "xdarwin" ]]; then
 fi
 
 dnl Enable VOSF screen updates with this feature is requested and feasible
-dnl VOSF is not needed for webstreaming mode (we stream the full buffer)
-if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" -a "x$WANT_WEBSTREAMING" = "xno" ]]; then
+dnl VOSF is not needed for IPC video mode (we stream the full buffer)
+if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" -a "x$WANT_IPC_VIDEO" = "xno" ]]; then
     AC_DEFINE(ENABLE_VOSF, 1, [Define if using video enabled on SEGV signals.])
 else
     WANT_VOSF=no
@@ -2049,10 +2034,7 @@ echo Floating-Point emulation core .......... : $FPE_CORE
 echo Assembly optimizations ................. : $ASM_OPTIMIZATIONS
 echo Addressing mode ........................ : $ADDRESSING_MODE
 echo Bad memory access recovery type ........ : $sigsegv_recovery
-if [[ "x$WANT_WEBSTREAMING" = "xyes" ]]; then
-echo WebRTC streaming ....................... : $WEBSTREAMING_BACKEND
-else
-echo WebRTC streaming ....................... : no
-fi
+echo IPC video .............................. : $WANT_IPC_VIDEO
+echo IPC audio .............................. : $WANT_IPC_AUDIO
 echo
 echo "Configuration done. Now type \"make\" (or \"gmake\")."
