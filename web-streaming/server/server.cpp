@@ -683,15 +683,76 @@ private:
 
 
 /*
+ * Video Codec Abstraction
+ *
+ * Allows switching between different encoding strategies:
+ * - H.264 via OpenH264 (WebRTC video track)
+ * - PNG for dithered content (DataChannel binary)
+ * - Raw RGBA (DataChannel binary, highest bandwidth)
+ */
+
+enum class CodecType {
+    H264,       // WebRTC video track with H.264
+    PNG,        // PNG over DataChannel (good for dithered)
+    RAW         // Raw RGBA over DataChannel (lowest latency)
+};
+
+struct EncodedFrame {
+    std::vector<uint8_t> data;
+    bool is_keyframe;
+    CodecType codec;
+    int width;
+    int height;
+};
+
+class VideoCodec {
+public:
+    virtual ~VideoCodec() = default;
+
+    // Get codec type
+    virtual CodecType type() const = 0;
+
+    // Get codec name for display/logging
+    virtual const char* name() const = 0;
+
+    // Initialize with resolution and parameters
+    virtual bool init(int width, int height, int fps = 30) = 0;
+
+    // Cleanup resources
+    virtual void cleanup() = 0;
+
+    // Encode a frame from I420 data (from SHM)
+    virtual EncodedFrame encode_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                                     int width, int height, int y_stride, int uv_stride) = 0;
+
+    // Encode from BGRA (for codecs that prefer RGB input)
+    virtual EncodedFrame encode_bgra(const uint8_t* bgra, int width, int height, int stride) {
+        (void)bgra; (void)width; (void)height; (void)stride;
+        return EncodedFrame{};  // Default: not supported
+    }
+
+    // Request keyframe on next encode
+    virtual void request_keyframe() = 0;
+};
+
+
+/*
  * H.264 Encoder using OpenH264 - reads I420 directly from SHM
  */
 
-class H264Encoder {
+class H264Encoder : public VideoCodec {
 public:
     H264Encoder() = default;
-    ~H264Encoder() { cleanup(); }
+    ~H264Encoder() override { cleanup(); }
 
-    bool init(int width, int height, int fps = 30, int bitrate_kbps = 2000) {
+    CodecType type() const override { return CodecType::H264; }
+    const char* name() const override { return "H.264"; }
+
+    bool init(int width, int height, int fps = 30) override {
+        return init_internal(width, height, fps, 2000);
+    }
+
+    bool init_internal(int width, int height, int fps, int bitrate_kbps) {
         cleanup();
 
         if (WelsCreateSVCEncoder(&encoder_) != 0 || !encoder_) {
@@ -761,7 +822,7 @@ public:
         return true;
     }
 
-    void cleanup() {
+    void cleanup() override {
         if (encoder_) {
             encoder_->Uninitialize();
             WelsDestroySVCEncoder(encoder_);
@@ -770,9 +831,13 @@ public:
     }
 
     // Encode I420 frame directly from SHM (zero-copy read)
-    std::vector<uint8_t> encode_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v,
-                                      int width, int height, int y_stride, int uv_stride) {
-        std::vector<uint8_t> result;
+    EncodedFrame encode_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                             int width, int height, int y_stride, int uv_stride) override {
+        EncodedFrame result;
+        result.codec = CodecType::H264;
+        result.width = width;
+        result.height = height;
+        result.is_keyframe = false;
 
         if (!encoder_ || width != width_ || height != height_) {
             if (!init(width, height)) {
@@ -847,21 +912,24 @@ public:
             return result;
         }
 
+        // Set keyframe flag
+        result.is_keyframe = is_idr;
+
         // Collect all NAL units with start codes
         for (int layer = 0; layer < info.iLayerNum; layer++) {
             const SLayerBSInfo& layerInfo = info.sLayerInfo[layer];
-            uint8_t* data = layerInfo.pBsBuf;
+            uint8_t* buf = layerInfo.pBsBuf;
             for (int nal = 0; nal < layerInfo.iNalCount; nal++) {
                 int nalSize = layerInfo.pNalLengthInByte[nal];
-
-                result.insert(result.end(), data, data + nalSize);
-                data += nalSize;
+                result.data.insert(result.data.end(), buf, buf + nalSize);
+                buf += nalSize;
             }
         }
 
         return result;
     }
 
+    // Helper to check if raw H.264 data is a keyframe (for external use)
     bool is_keyframe(const std::vector<uint8_t>& data) {
         // Look for IDR NAL unit (type 5) after start code
         for (size_t i = 0; i + 4 < data.size(); i++) {
@@ -874,7 +942,7 @@ public:
     }
 
     // Request a keyframe on next encode (call when new peer connects)
-    void request_keyframe() {
+    void request_keyframe() override {
         force_keyframe_ = true;
     }
 
@@ -1365,6 +1433,7 @@ struct PeerConnection {
     std::shared_ptr<rtc::Track> video_track;
     std::shared_ptr<rtc::DataChannel> data_channel;
     std::string id;
+    CodecType codec = CodecType::H264;  // Codec type for this peer
     bool ready = false;
     bool has_remote_description = false;
     std::vector<std::pair<std::string, std::string>> pending_candidates;  // candidate, mid
@@ -1483,6 +1552,19 @@ private:
             std::string peer_id = "peer_" + std::to_string(rand());
             auto peer = std::make_shared<PeerConnection>();
             peer->id = peer_id;
+
+            // Parse codec preference from client
+            std::string codec_str = json_get_string(msg, "codec");
+            if (codec_str == "png") {
+                peer->codec = CodecType::PNG;
+                fprintf(stderr, "[WebRTC] Peer %s using PNG codec\n", peer_id.c_str());
+            } else if (codec_str == "raw") {
+                peer->codec = CodecType::RAW;
+                fprintf(stderr, "[WebRTC] Peer %s using RAW codec\n", peer_id.c_str());
+            } else {
+                peer->codec = CodecType::H264;
+                fprintf(stderr, "[WebRTC] Peer %s using H.264 codec\n", peer_id.c_str());
+            }
 
             rtc::Configuration config;
             config.iceServers.emplace_back("stun:stun.l.google.com:19302");
@@ -1789,14 +1871,13 @@ static void test_pattern_loop(WebRTCServer& webrtc, H264Encoder& encoder) {
         }
 
         // Encode
-        auto encoded = encoder.encode_i420(
+        auto frame = encoder.encode_i420(
             pattern.y_plane(), pattern.u_plane(), pattern.v_plane(),
             pattern.width(), pattern.height(),
             pattern.y_stride(), pattern.uv_stride());
 
-        if (!encoded.empty()) {
-            bool is_keyframe = encoder.is_keyframe(encoded);
-            webrtc.send_frame(encoded, is_keyframe);
+        if (!frame.data.empty()) {
+            webrtc.send_frame(frame.data, frame.is_keyframe);
             frames_encoded++;
         }
 
@@ -1939,10 +2020,9 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& encoder) {
         }
 
         // Encode I420 directly
-        auto encoded = encoder.encode_i420(y, u, v, width, height, y_stride, uv_stride);
-        if (!encoded.empty()) {
-            bool is_keyframe = encoder.is_keyframe(encoded);
-            webrtc.send_frame(encoded, is_keyframe);
+        auto frame = encoder.encode_i420(y, u, v, width, height, y_stride, uv_stride);
+        if (!frame.data.empty()) {
+            webrtc.send_frame(frame.data, frame.is_keyframe);
             frames_encoded++;
         }
 

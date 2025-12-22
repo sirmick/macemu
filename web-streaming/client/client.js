@@ -143,10 +143,244 @@ class ConnectionSteps {
 
 const connectionSteps = new ConnectionSteps();
 
+
+/*
+ * Video Decoder Abstraction
+ *
+ * Allows switching between different decoding strategies:
+ * - H.264 via WebRTC video track (native browser decoding)
+ * - PNG via DataChannel (good for dithered 1-bit content)
+ * - Raw RGBA via DataChannel (lowest latency, highest bandwidth)
+ */
+
+const CodecType = {
+    H264: 'h264',   // WebRTC video track with H.264
+    PNG: 'png',     // PNG over DataChannel
+    RAW: 'raw'      // Raw RGBA over DataChannel
+};
+
+// Base class for video decoders
+class VideoDecoder {
+    constructor(displayElement) {
+        this.display = displayElement;
+        this.onFrame = null;  // Callback when frame is decoded
+        this.frameCount = 0;
+        this.lastFrameTime = 0;
+    }
+
+    // Get codec type
+    get type() { throw new Error('Not implemented'); }
+
+    // Get codec name for display
+    get name() { throw new Error('Not implemented'); }
+
+    // Initialize the decoder
+    init() { throw new Error('Not implemented'); }
+
+    // Cleanup resources
+    cleanup() { throw new Error('Not implemented'); }
+
+    // Handle incoming data (from track or datachannel)
+    handleData(data) { throw new Error('Not implemented'); }
+
+    // Get stats
+    getStats() {
+        return {
+            frameCount: this.frameCount,
+            fps: this.calculateFps()
+        };
+    }
+
+    calculateFps() {
+        const now = performance.now();
+        if (this.lastFrameTime === 0) {
+            this.lastFrameTime = now;
+            return 0;
+        }
+        const elapsed = now - this.lastFrameTime;
+        return elapsed > 0 ? Math.round(1000 / elapsed) : 0;
+    }
+}
+
+// H.264 decoder using native WebRTC video track
+class H264Decoder extends VideoDecoder {
+    constructor(videoElement) {
+        super(videoElement);
+        this.videoElement = videoElement;
+    }
+
+    get type() { return CodecType.H264; }
+    get name() { return 'H.264 (WebRTC)'; }
+
+    init() {
+        logger.info('H264Decoder initialized');
+        return true;
+    }
+
+    cleanup() {
+        if (this.videoElement) {
+            this.videoElement.srcObject = null;
+        }
+    }
+
+    // H.264 frames come through the WebRTC video track, not this method
+    // The track is set up by the WebRTC connection directly
+    attachTrack(stream) {
+        this.videoElement.srcObject = stream;
+        this.videoElement.play().catch(e => {
+            logger.warn('Video play() failed', { error: e.message });
+        });
+    }
+
+    handleData(data) {
+        // H.264 data is handled by the browser's native WebRTC stack
+        // This method is not used for H.264
+        logger.warn('H264Decoder.handleData called - this should not happen');
+    }
+}
+
+// PNG decoder using canvas rendering
+class PNGDecoder extends VideoDecoder {
+    constructor(canvasElement) {
+        super(canvasElement);
+        this.canvas = canvasElement;
+        this.ctx = null;
+        this.pendingBlob = null;
+    }
+
+    get type() { return CodecType.PNG; }
+    get name() { return 'PNG (DataChannel)'; }
+
+    init() {
+        this.ctx = this.canvas.getContext('2d');
+        if (!this.ctx) {
+            logger.error('Failed to get canvas 2D context');
+            return false;
+        }
+        logger.info('PNGDecoder initialized');
+        return true;
+    }
+
+    cleanup() {
+        this.ctx = null;
+    }
+
+    // Handle PNG data from DataChannel
+    handleData(data) {
+        if (!this.ctx) return;
+
+        // data should be an ArrayBuffer or Blob containing PNG
+        const blob = data instanceof Blob ? data : new Blob([data], { type: 'image/png' });
+
+        createImageBitmap(blob).then(bitmap => {
+            // Resize canvas if needed
+            if (this.canvas.width !== bitmap.width || this.canvas.height !== bitmap.height) {
+                this.canvas.width = bitmap.width;
+                this.canvas.height = bitmap.height;
+                logger.info('Canvas resized', { width: bitmap.width, height: bitmap.height });
+            }
+
+            this.ctx.drawImage(bitmap, 0, 0);
+            this.frameCount++;
+            this.lastFrameTime = performance.now();
+
+            if (this.onFrame) {
+                this.onFrame(this.frameCount);
+            }
+        }).catch(e => {
+            logger.error('Failed to decode PNG', { error: e.message });
+        });
+    }
+}
+
+// Raw RGBA decoder using canvas rendering
+class RawDecoder extends VideoDecoder {
+    constructor(canvasElement) {
+        super(canvasElement);
+        this.canvas = canvasElement;
+        this.ctx = null;
+        this.imageData = null;
+        this.expectedWidth = 0;
+        this.expectedHeight = 0;
+    }
+
+    get type() { return CodecType.RAW; }
+    get name() { return 'Raw RGBA (DataChannel)'; }
+
+    init() {
+        this.ctx = this.canvas.getContext('2d');
+        if (!this.ctx) {
+            logger.error('Failed to get canvas 2D context');
+            return false;
+        }
+        logger.info('RawDecoder initialized');
+        return true;
+    }
+
+    cleanup() {
+        this.ctx = null;
+        this.imageData = null;
+    }
+
+    // Set expected dimensions (from signaling)
+    setDimensions(width, height) {
+        this.expectedWidth = width;
+        this.expectedHeight = height;
+        this.canvas.width = width;
+        this.canvas.height = height;
+        this.imageData = this.ctx.createImageData(width, height);
+        logger.info('RawDecoder dimensions set', { width, height });
+    }
+
+    // Handle raw RGBA data from DataChannel
+    handleData(data) {
+        if (!this.ctx || !this.imageData) return;
+
+        // data should be an ArrayBuffer containing RGBA pixels
+        const pixels = new Uint8ClampedArray(data);
+
+        // Verify size matches
+        const expectedSize = this.expectedWidth * this.expectedHeight * 4;
+        if (pixels.length !== expectedSize) {
+            logger.warn('Raw frame size mismatch', {
+                received: pixels.length,
+                expected: expectedSize
+            });
+            return;
+        }
+
+        this.imageData.data.set(pixels);
+        this.ctx.putImageData(this.imageData, 0, 0);
+        this.frameCount++;
+        this.lastFrameTime = performance.now();
+
+        if (this.onFrame) {
+            this.onFrame(this.frameCount);
+        }
+    }
+}
+
+// Factory to create the right decoder based on codec type
+function createDecoder(codecType, element) {
+    switch (codecType) {
+        case CodecType.H264:
+            return new H264Decoder(element);
+        case CodecType.PNG:
+            return new PNGDecoder(element);
+        case CodecType.RAW:
+            return new RawDecoder(element);
+        default:
+            logger.error('Unknown codec type', { codecType });
+            return null;
+    }
+}
+
+
 // Main WebRTC Client
 class BasiliskWebRTC {
-    constructor(videoElement) {
+    constructor(videoElement, canvasElement = null) {
         this.video = videoElement;
+        this.canvas = canvasElement;
         this.ws = null;
         this.pc = null;
         this.dataChannel = null;
@@ -154,13 +388,18 @@ class BasiliskWebRTC {
         this.connected = false;
         this.wsUrl = null;
 
+        // Codec/decoder management
+        this.codecType = CodecType.H264;  // Default to H.264
+        this.decoder = null;
+
         // Stats tracking
         this.stats = {
             fps: 0,
             bitrate: 0,
             framesDecoded: 0,
             packetsLost: 0,
-            jitter: 0
+            jitter: 0,
+            codec: 'h264'
         };
         this.lastStatsTime = performance.now();
         this.lastBytesReceived = 0;
@@ -174,6 +413,42 @@ class BasiliskWebRTC {
         // Frame detection for black screen debugging
         this.firstFrameReceived = false;
         this.frameCheckInterval = null;
+    }
+
+    // Set codec type before connecting
+    setCodec(codecType) {
+        if (this.connected) {
+            logger.warn('Cannot change codec while connected');
+            return false;
+        }
+        this.codecType = codecType;
+        this.stats.codec = codecType;
+        logger.info('Codec set', { codec: codecType });
+        return true;
+    }
+
+    // Initialize decoder based on codec type
+    initDecoder() {
+        if (this.decoder) {
+            this.decoder.cleanup();
+        }
+
+        const element = this.codecType === CodecType.H264 ? this.video : this.canvas;
+        if (!element) {
+            logger.error('No display element for codec', { codec: this.codecType });
+            return false;
+        }
+
+        this.decoder = createDecoder(this.codecType, element);
+        if (!this.decoder) {
+            return false;
+        }
+
+        // Show/hide appropriate element
+        if (this.video) this.video.style.display = this.codecType === CodecType.H264 ? 'block' : 'none';
+        if (this.canvas) this.canvas.style.display = this.codecType !== CodecType.H264 ? 'block' : 'none';
+
+        return this.decoder.init();
     }
 
     connect(wsUrl) {
@@ -191,7 +466,14 @@ class BasiliskWebRTC {
         this.cleanup();
         connectionSteps.reset();
 
-        logger.info('Connecting to signaling server', { url: this.wsUrl });
+        // Initialize decoder for selected codec
+        if (!this.initDecoder()) {
+            logger.error('Failed to initialize decoder');
+            this.updateStatus('Decoder init failed', 'error');
+            return;
+        }
+
+        logger.info('Connecting to signaling server', { url: this.wsUrl, codec: this.codecType });
         this.updateStatus('Connecting...', 'connecting');
         connectionSteps.setActive('ws');
 
@@ -217,9 +499,12 @@ class BasiliskWebRTC {
         this.updateStatus('Signaling connected', 'connecting');
         this.updateWebRTCState('ws', 'Open');
 
-        // Request connection
-        logger.debug('Sending connect request');
-        this.ws.send(JSON.stringify({ type: 'connect' }));
+        // Request connection with codec preference
+        logger.debug('Sending connect request', { codec: this.codecType });
+        this.ws.send(JSON.stringify({
+            type: 'connect',
+            codec: this.codecType
+        }));
     }
 
     onWsMessage(event) {
@@ -606,6 +891,9 @@ class BasiliskWebRTC {
     setupDataChannel() {
         if (!this.dataChannel) return;
 
+        // Set binary type for receiving PNG/RAW frames
+        this.dataChannel.binaryType = 'arraybuffer';
+
         this.dataChannel.onopen = () => {
             logger.info('Data channel open');
             this.updateWebRTCState('dc', 'Open');
@@ -621,37 +909,59 @@ class BasiliskWebRTC {
             logger.error('Data channel error');
             this.updateWebRTCState('dc', 'Error');
         };
+
+        // Handle incoming messages (frames for PNG/RAW, or other messages)
+        this.dataChannel.onmessage = (event) => {
+            if (event.data instanceof ArrayBuffer) {
+                // Binary data - this is a video frame for PNG/RAW codec
+                if (this.decoder && this.codecType !== CodecType.H264) {
+                    this.decoder.handleData(event.data);
+
+                    // Update first frame received flag
+                    if (!this.firstFrameReceived) {
+                        this.firstFrameReceived = true;
+                        connectionSteps.setDone('frames');
+                        logger.info('First frame received via DataChannel');
+                    }
+                }
+            } else {
+                // Text data - might be control messages
+                logger.debug('DataChannel text message', { data: event.data });
+            }
+        };
     }
 
     setupInputHandlers() {
-        if (!this.video) return;
+        // Use the appropriate display element (video for H.264, canvas for PNG/RAW)
+        const displayElement = this.codecType === CodecType.H264 ? this.video : this.canvas;
+        if (!displayElement) return;
 
         // Click to capture mouse (pointer lock for relative movement)
-        this.video.addEventListener('click', () => {
+        displayElement.addEventListener('click', () => {
             if (!document.pointerLockElement) {
-                this.video.requestPointerLock();
+                displayElement.requestPointerLock();
             }
         });
 
         // Mouse move - only when pointer is locked (relative movement)
         document.addEventListener('mousemove', (e) => {
-            if (document.pointerLockElement === this.video) {
+            if (document.pointerLockElement === displayElement) {
                 this.sendRaw('M' + e.movementX + ',' + e.movementY);
             }
         });
 
         // Mouse buttons
-        this.video.addEventListener('mousedown', (e) => {
+        displayElement.addEventListener('mousedown', (e) => {
             e.preventDefault();
             this.sendRaw('D' + e.button);
         });
 
-        this.video.addEventListener('mouseup', (e) => {
+        displayElement.addEventListener('mouseup', (e) => {
             e.preventDefault();
             this.sendRaw('U' + e.button);
         });
 
-        this.video.addEventListener('contextmenu', (e) => e.preventDefault());
+        displayElement.addEventListener('contextmenu', (e) => e.preventDefault());
 
         // Keyboard
         document.addEventListener('keydown', (e) => {
@@ -668,7 +978,7 @@ class BasiliskWebRTC {
             this.sendRaw('k' + e.keyCode);
         });
 
-        logger.info('Input handlers registered (pointer lock mode)');
+        logger.info('Input handlers registered (pointer lock mode)', { element: displayElement.tagName });
     }
 
     // Send raw text message (simple protocol: M dx,dy | D btn | U btn | K code | k code)
@@ -716,6 +1026,10 @@ class BasiliskWebRTC {
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
+        }
+        if (this.decoder) {
+            this.decoder.cleanup();
+            this.decoder = null;
         }
         if (this.dataChannel) {
             this.dataChannel.close();
@@ -1068,12 +1382,21 @@ function initClient() {
     logBrowserCapabilities().catch(e => logger.warn('Capability check failed', { error: e.message }));
 
     const video = document.getElementById('display');
+    const canvas = document.getElementById('display-canvas');
     if (!video) {
         logger.error('No video element found');
         return;
     }
 
-    client = new BasiliskWebRTC(video);
+    client = new BasiliskWebRTC(video, canvas);
+
+    // Check for codec preference in URL params (e.g., ?codec=png)
+    const urlParams = new URLSearchParams(window.location.search);
+    const codecParam = urlParams.get('codec');
+    if (codecParam && CodecType[codecParam.toUpperCase()]) {
+        client.setCodec(CodecType[codecParam.toUpperCase()]);
+        logger.info('Codec set from URL param', { codec: codecParam });
+    }
 
     // Start stats collection
     statsInterval = setInterval(() => {
@@ -1082,7 +1405,7 @@ function initClient() {
 
     // Auto-connect
     const wsUrl = getWebSocketUrl();
-    logger.info('Auto-connecting', { url: wsUrl });
+    logger.info('Auto-connecting', { url: wsUrl, codec: client.codecType });
     client.connect(wsUrl);
 }
 
