@@ -4,11 +4,12 @@
  * Full-featured client with debugging, stats tracking, and connection monitoring.
  */
 
-// Debug logging system
+// Debug logging system - sends to server and local debug panel
 class DebugLogger {
     constructor() {
         this.logElement = null;
         this.maxEntries = 500;
+        this.sendToServer = true;  // Send important logs to server
     }
 
     init() {
@@ -38,6 +39,27 @@ class DebugLogger {
 
             // Auto-scroll
             this.logElement.scrollTop = this.logElement.scrollHeight;
+        }
+
+        // Send to server (errors, warnings, and key info messages)
+        if (this.sendToServer && (level === 'error' || level === 'warn' || level === 'info')) {
+            this.sendToServerAsync(level, message, data);
+        }
+    }
+
+    async sendToServerAsync(level, message, data) {
+        try {
+            await fetch('/api/log', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    level,
+                    message,
+                    data: data ? JSON.stringify(data) : ''
+                })
+            });
+        } catch (e) {
+            // Silently ignore - don't create infinite loops
         }
     }
 
@@ -387,8 +409,23 @@ class BasiliskWebRTC {
             this.updateWebRTCState('track-muted', event.track.muted ? 'Yes' : 'No');
 
             if (event.streams && event.streams[0]) {
-                logger.info('Attaching stream to video element');
+                logger.info('Attaching stream to video element', {
+                    streamId: event.streams[0].id,
+                    trackCount: event.streams[0].getTracks().length
+                });
                 this.video.srcObject = event.streams[0];
+
+                // Log all video element events for debugging
+                this.video.onloadstart = () => logger.debug('Video: loadstart');
+                this.video.onprogress = () => logger.debug('Video: progress');
+                this.video.onsuspend = () => logger.debug('Video: suspend');
+                this.video.onemptied = () => logger.debug('Video: emptied');
+                this.video.oncanplay = () => logger.info('Video: canplay');
+                this.video.oncanplaythrough = () => logger.info('Video: canplaythrough');
+                this.video.onerror = (e) => logger.error('Video element error', {
+                    code: this.video.error?.code,
+                    message: this.video.error?.message
+                });
 
                 this.video.onloadedmetadata = () => {
                     logger.info('Video metadata loaded', {
@@ -396,6 +433,14 @@ class BasiliskWebRTC {
                         height: this.video.videoHeight
                     });
                     this.updateWebRTCState('video-size', `${this.video.videoWidth} x ${this.video.videoHeight}`);
+                };
+
+                this.video.onloadeddata = () => {
+                    logger.info('Video: loadeddata (first frame decoded)', {
+                        width: this.video.videoWidth,
+                        height: this.video.videoHeight,
+                        readyState: this.video.readyState
+                    });
                 };
 
                 this.video.onplaying = () => {
@@ -415,8 +460,29 @@ class BasiliskWebRTC {
                     logger.warn('Video play() failed', { error: e.message });
                 });
 
+                // Log video element state periodically
+                setTimeout(() => {
+                    logger.debug('Video element state after 2s', {
+                        readyState: this.video.readyState,
+                        networkState: this.video.networkState,
+                        paused: this.video.paused,
+                        ended: this.video.ended,
+                        videoWidth: this.video.videoWidth,
+                        videoHeight: this.video.videoHeight,
+                        currentTime: this.video.currentTime,
+                        srcObject: this.video.srcObject ? 'set' : 'null'
+                    });
+                }, 2000);
+
                 // Start frame detection
                 this.startFrameDetection();
+            } else {
+                logger.warn('No stream in track event, creating MediaStream manually');
+                const stream = new MediaStream([event.track]);
+                this.video.srcObject = stream;
+                this.video.play().catch(e => {
+                    logger.warn('Video play() failed', { error: e.message });
+                });
             }
         }
     }
@@ -1006,11 +1072,187 @@ document.addEventListener('fullscreenchange', () => {
 });
 
 // ============================================================================
+// Prefs File Handling
+// ============================================================================
+
+// Default prefs template - JS handles all config complexity
+const PREFS_TEMPLATE = `# Basilisk II preferences - generated by web UI
+
+# ROM file (required)
+rom {{ROM_PATH}}
+
+# Disk images
+{{DISK_LINES}}
+
+# Hardware settings
+ramsize {{RAM_BYTES}}
+screen ipc/{{SCREEN_W}}/{{SCREEN_H}}
+cpu {{CPU}}
+modelid {{MODEL}}
+fpu {{FPU}}
+jit {{JIT}}
+nosound {{NOSOUND}}
+
+# JIT settings
+jitfpu true
+jitcachesize 8192
+jitlazyflush true
+jitinline true
+jitdebug false
+
+# Display settings
+displaycolordepth 0
+frameskip 0
+scale_nearest false
+scale_integer false
+
+# Input settings
+keyboardtype 5
+keycodes false
+mousewheelmode 1
+mousewheellines 3
+swap_opt_cmd true
+hotkey 0
+
+# Serial/Network
+seriala /dev/null
+serialb /dev/null
+udptunnel false
+udpport 6066
+etherpermanentaddress true
+ethermulticastmode 0
+routerenabled false
+ftp_port_list 21
+
+# Boot settings
+bootdrive 0
+bootdriver 0
+nocdrom false
+
+# System settings
+ignoresegv true
+idlewait true
+noclipconversion false
+nogui true
+sound_buffer 0
+name_encoding 0
+delay 0
+init_grab false
+yearofs 0
+dayofs 0
+reservewindowskey false
+
+# SDL settings
+sdlrender software
+sdl_vsync true
+
+# ExtFS settings
+enableextfs false
+debugextfs false
+extfs
+extdrives CDEFGHIJKLMNOPQRSTUVWXYZ
+pollmedia true
+`;
+
+// Parse prefs file content into config object
+function parsePrefsFile(content) {
+    const config = {
+        rom: '',
+        disks: [],
+        ram: 32,
+        screen: '800x600',
+        cpu: 4,
+        model: 14,
+        fpu: true,
+        jit: true,
+        sound: true
+    };
+
+    if (!content) return config;
+
+    const lines = content.split('\n');
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+
+        const spaceIdx = trimmed.indexOf(' ');
+        if (spaceIdx === -1) continue;
+
+        const key = trimmed.substring(0, spaceIdx);
+        const value = trimmed.substring(spaceIdx + 1).trim();
+
+        switch (key) {
+            case 'rom':
+                // Extract just filename from path
+                config.rom = value.split('/').pop();
+                break;
+            case 'disk':
+                config.disks.push(value.split('/').pop());
+                break;
+            case 'ramsize':
+                config.ram = Math.round(parseInt(value) / (1024 * 1024));
+                break;
+            case 'screen':
+                // Parse "ipc/800/600" format
+                const parts = value.split('/');
+                if (parts.length >= 3) {
+                    config.screen = `${parts[1]}x${parts[2]}`;
+                }
+                break;
+            case 'cpu':
+                config.cpu = parseInt(value);
+                break;
+            case 'modelid':
+                config.model = parseInt(value);
+                break;
+            case 'fpu':
+                config.fpu = value === 'true';
+                break;
+            case 'jit':
+                config.jit = value === 'true';
+                break;
+            case 'nosound':
+                config.sound = value !== 'true';
+                break;
+        }
+    }
+
+    return config;
+}
+
+// Generate prefs file content from config object
+function generatePrefsFile(config, romsPath, imagesPath) {
+    // Get absolute paths (server provides base paths)
+    const romPath = config.rom ? `${romsPath}/${config.rom}` : '';
+    const diskLines = config.disks.map(d => `disk ${imagesPath}/${d}`).join('\n');
+
+    // Parse screen resolution
+    const screenMatch = config.screen.match(/(\d+)x(\d+)/);
+    const screenW = screenMatch ? screenMatch[1] : '800';
+    const screenH = screenMatch ? screenMatch[2] : '600';
+
+    // Apply template
+    let prefs = PREFS_TEMPLATE
+        .replace('{{ROM_PATH}}', romPath)
+        .replace('{{DISK_LINES}}', diskLines || '# No disk images configured')
+        .replace('{{RAM_BYTES}}', (config.ram * 1024 * 1024).toString())
+        .replace('{{SCREEN_W}}', screenW)
+        .replace('{{SCREEN_H}}', screenH)
+        .replace('{{CPU}}', config.cpu.toString())
+        .replace('{{MODEL}}', config.model.toString())
+        .replace('{{FPU}}', config.fpu ? 'true' : 'false')
+        .replace('{{JIT}}', config.jit ? 'true' : 'false')
+        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true');
+
+    return prefs;
+}
+
+// ============================================================================
 // Configuration Modal
 // ============================================================================
 
 let currentConfig = {
-    rom: null,
+    rom: '',
     disks: [],
     ram: 32,
     screen: '800x600',
@@ -1019,6 +1261,12 @@ let currentConfig = {
     fpu: true,
     jit: true,
     sound: true
+};
+
+// Paths from server (for generating absolute paths in prefs)
+let serverPaths = {
+    romsPath: 'storage/roms',
+    imagesPath: 'storage/images'
 };
 
 // Cache for storage data (roms + disks from single API call)
@@ -1169,12 +1417,19 @@ function onRomChange() {
 
 async function loadCurrentConfig() {
     try {
-        const res = await fetch(getApiUrl('config'));
+        const res = await fetch(getApiUrl('prefs'));
         const data = await res.json();
-        if (data.config) {
-            currentConfig = { ...currentConfig, ...data.config };
-            updateConfigUI();
+
+        // Store server paths for later use
+        if (data.romsPath) serverPaths.romsPath = data.romsPath;
+        if (data.imagesPath) serverPaths.imagesPath = data.imagesPath;
+
+        // Parse prefs file content
+        if (data.content) {
+            currentConfig = parsePrefsFile(data.content);
+            logger.info('Loaded config from prefs file', currentConfig);
         }
+        updateConfigUI();
     } catch (e) {
         logger.warn('Failed to load current config', { error: e.message });
     }
@@ -1217,11 +1472,15 @@ async function saveConfig() {
     currentConfig.sound = document.getElementById('cfg-sound')?.checked ?? true;
     // disks already updated via updateDiskSelection()
 
+    // Generate prefs file content
+    const prefsContent = generatePrefsFile(currentConfig, serverPaths.romsPath, serverPaths.imagesPath);
+    logger.debug('Generated prefs file', { length: prefsContent.length });
+
     try {
-        const res = await fetch(getApiUrl('config'), {
+        const res = await fetch(getApiUrl('prefs'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentConfig)
+            body: JSON.stringify({ content: prefsContent })
         });
         const data = await res.json();
 
@@ -1231,7 +1490,7 @@ async function saveConfig() {
             // Restart emulator with new config
             restartEmulator();
         } else {
-            logger.error('Failed to save config', { message: data.message });
+            logger.error('Failed to save config', { message: data.error });
         }
     } catch (e) {
         logger.error('Failed to save config', { error: e.message });
