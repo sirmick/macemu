@@ -405,6 +405,16 @@ class BasiliskWebRTC {
         this.lastBytesReceived = 0;
         this.lastFramesDecoded = 0;
 
+        // PNG/DataChannel stats
+        this.pngStats = {
+            framesReceived: 0,
+            bytesReceived: 0,
+            lastFrameTime: 0,
+            avgFrameSize: 0
+        };
+        this.lastPngFrameCount = 0;
+        this.lastPngBytesReceived = 0;
+
         // Reconnection
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 10;
@@ -499,11 +509,10 @@ class BasiliskWebRTC {
         this.updateStatus('Signaling connected', 'connecting');
         this.updateWebRTCState('ws', 'Open');
 
-        // Request connection with codec preference
-        logger.debug('Sending connect request', { codec: this.codecType });
+        // Request connection (server will tell us which codec to use)
+        logger.debug('Sending connect request');
         this.ws.send(JSON.stringify({
-            type: 'connect',
-            codec: this.codecType
+            type: 'connect'
         }));
     }
 
@@ -538,6 +547,23 @@ class BasiliskWebRTC {
         switch (msg.type) {
             case 'welcome':
                 logger.info('Server acknowledged connection');
+                this.updateOverlayStatus('Waiting for video offer...');
+                break;
+
+            case 'connected':
+                // Server tells us which codec to use
+                if (msg.codec) {
+                    const serverCodec = msg.codec === 'h264' ? CodecType.H264 :
+                                       msg.codec === 'png' ? CodecType.PNG :
+                                       msg.codec === 'raw' ? CodecType.RAW : CodecType.PNG;
+                    if (serverCodec !== this.codecType) {
+                        logger.info('Server codec', { codec: msg.codec });
+                        this.codecType = serverCodec;
+                        // Reinitialize decoder for new codec
+                        this.initDecoder();
+                    }
+                }
+                logger.info('Server acknowledged connection', { codec: msg.codec, peer_id: msg.peer_id });
                 this.updateOverlayStatus('Waiting for video offer...');
                 break;
 
@@ -917,11 +943,23 @@ class BasiliskWebRTC {
                 if (this.decoder && this.codecType !== CodecType.H264) {
                     this.decoder.handleData(event.data);
 
+                    // Track PNG/RAW frame stats
+                    this.pngStats.framesReceived++;
+                    this.pngStats.bytesReceived += event.data.byteLength;
+                    this.pngStats.lastFrameTime = performance.now();
+                    this.pngStats.avgFrameSize = this.pngStats.bytesReceived / this.pngStats.framesReceived;
+
                     // Update first frame received flag
                     if (!this.firstFrameReceived) {
                         this.firstFrameReceived = true;
                         connectionSteps.setDone('frames');
                         logger.info('First frame received via DataChannel');
+
+                        // For PNG/RAW codecs, mark as connected and hide overlay
+                        this.connected = true;
+                        this.updateStatus('Connected', 'connected');
+                        this.hideOverlay();
+                        this.updateConnectionUI(true);
                     }
                 }
             } else {
@@ -1059,12 +1097,50 @@ class BasiliskWebRTC {
 
     // Stats collection
     async updateStats() {
-        if (!this.pc || !this.connected) return;
+        if (!this.connected) return;
+
+        const now = performance.now();
+        const elapsed = (now - this.lastStatsTime) / 1000;
+
+        // For PNG/RAW codecs, calculate stats from our own tracking
+        if (this.codecType !== CodecType.H264) {
+            if (elapsed > 0) {
+                const framesDelta = this.pngStats.framesReceived - this.lastPngFrameCount;
+                const bytesDelta = this.pngStats.bytesReceived - this.lastPngBytesReceived;
+
+                this.stats.fps = Math.round(framesDelta / elapsed);
+                this.stats.bitrate = Math.round((bytesDelta * 8 / elapsed) / 1000);
+                this.stats.framesDecoded = this.pngStats.framesReceived;
+                this.stats.packetsLost = 0;  // DataChannel is reliable
+                this.stats.jitter = 0;
+                this.stats.codec = this.codecType;
+
+                // Log detailed stats every 3 seconds
+                if (!this.lastDetailedStatsTime || (now - this.lastDetailedStatsTime) > 3000) {
+                    logger.info('PNG stats', {
+                        framesRecv: this.pngStats.framesReceived,
+                        bytesRecv: this.pngStats.bytesReceived,
+                        avgFrameSize: Math.round(this.pngStats.avgFrameSize / 1024) + ' KB',
+                        fps: this.stats.fps,
+                        bitrate: this.stats.bitrate + ' kbps'
+                    });
+                    this.lastDetailedStatsTime = now;
+                }
+
+                this.lastPngFrameCount = this.pngStats.framesReceived;
+                this.lastPngBytesReceived = this.pngStats.bytesReceived;
+            }
+
+            this.lastStatsTime = now;
+            this.updateStatsDisplay();
+            return;
+        }
+
+        // For H.264, use WebRTC stats
+        if (!this.pc) return;
 
         try {
             const stats = await this.pc.getStats();
-            const now = performance.now();
-            const elapsed = (now - this.lastStatsTime) / 1000;
 
             stats.forEach(report => {
                 if (report.type === 'inbound-rtp' && report.kind === 'video') {
@@ -1127,10 +1203,22 @@ class BasiliskWebRTC {
         if (fpsEl) fpsEl.textContent = `FPS: ${this.stats.fps}`;
         if (bitrateEl) bitrateEl.textContent = `${this.stats.bitrate} kbps`;
 
+        // Get resolution from appropriate element
+        let width = 0, height = 0;
+        if (this.codecType === CodecType.H264 && this.video) {
+            width = this.video.videoWidth;
+            height = this.video.videoHeight;
+        } else if (this.canvas) {
+            width = this.canvas.width;
+            height = this.canvas.height;
+        }
+
         // Footer resolution
         const resEl = document.getElementById('resolution');
-        if (resEl && this.video.videoWidth) {
-            resEl.textContent = `${this.video.videoWidth} x ${this.video.videoHeight}`;
+        if (resEl && width) {
+            const codecLabel = this.codecType === CodecType.H264 ? 'H.264' :
+                              this.codecType === CodecType.PNG ? 'PNG' : 'RAW';
+            resEl.textContent = `${width} x ${height} (${codecLabel})`;
         }
 
         // Debug panel stats
@@ -1146,8 +1234,8 @@ class BasiliskWebRTC {
             statFps.className = 'value ' + (this.stats.fps >= 25 ? 'good' : this.stats.fps >= 15 ? 'warn' : 'bad');
         }
         if (statBitrate) statBitrate.textContent = `${this.stats.bitrate} kbps`;
-        if (statRes && this.video.videoWidth) {
-            statRes.textContent = `${this.video.videoWidth} x ${this.video.videoHeight}`;
+        if (statRes && width) {
+            statRes.textContent = `${width} x ${height}`;
         }
         if (statFrames) statFrames.textContent = this.stats.framesDecoded.toLocaleString();
         if (statLost) {
@@ -1390,13 +1478,8 @@ function initClient() {
 
     client = new BasiliskWebRTC(video, canvas);
 
-    // Check for codec preference in URL params (e.g., ?codec=png)
-    const urlParams = new URLSearchParams(window.location.search);
-    const codecParam = urlParams.get('codec');
-    if (codecParam && CodecType[codecParam.toUpperCase()]) {
-        client.setCodec(CodecType[codecParam.toUpperCase()]);
-        logger.info('Codec set from URL param', { codec: codecParam });
-    }
+    // Codec is now determined by server (from prefs file webcodec setting)
+    // Client will receive codec in "connected" message and switch if needed
 
     // Start stats collection
     statsInterval = setInterval(() => {
@@ -1525,6 +1608,9 @@ fpu {{FPU}}
 jit {{JIT}}
 nosound {{NOSOUND}}
 
+# Video codec for web streaming (png or h264)
+webcodec {{WEBCODEC}}
+
 # JIT settings
 jitfpu true
 jitcachesize 8192
@@ -1574,14 +1660,10 @@ yearofs 0
 dayofs 0
 reservewindowskey false
 
-# SDL settings
-sdlrender software
-sdl_vsync true
-
 # ExtFS settings
 enableextfs false
 debugextfs false
-extfs
+extfs ./storage
 extdrives CDEFGHIJKLMNOPQRSTUVWXYZ
 pollmedia true
 `;
@@ -1593,6 +1675,7 @@ function parsePrefsFile(content) {
         disks: [],
         ram: 32,
         screen: '800x600',
+        webcodec: 'png',
         cpu: 4,
         model: 14,
         fpu: true,
@@ -1615,11 +1698,14 @@ function parsePrefsFile(content) {
 
         switch (key) {
             case 'rom':
-                // Extract just filename from path
-                config.rom = value.split('/').pop();
+                // Store path relative to romsPath (strip the base path prefix if present)
+                // e.g., "storage/roms/1MB ROMs/foo.ROM" -> "1MB ROMs/foo.ROM"
+                // or just "1MB ROMs/foo.ROM" if already relative
+                config.rom = value.replace(/^storage\/roms\//, '');
                 break;
             case 'disk':
-                config.disks.push(value.split('/').pop());
+                // Store path relative to imagesPath
+                config.disks.push(value.replace(/^storage\/images\//, ''));
                 break;
             case 'ramsize':
                 config.ram = Math.round(parseInt(value) / (1024 * 1024));
@@ -1645,6 +1731,9 @@ function parsePrefsFile(content) {
                 break;
             case 'nosound':
                 config.sound = value !== 'true';
+                break;
+            case 'webcodec':
+                config.webcodec = value === 'h264' ? 'h264' : 'png';
                 break;
         }
     }
@@ -1674,7 +1763,8 @@ function generatePrefsFile(config, romsPath, imagesPath) {
         .replace('{{MODEL}}', config.model.toString())
         .replace('{{FPU}}', config.fpu ? 'true' : 'false')
         .replace('{{JIT}}', config.jit ? 'true' : 'false')
-        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true');
+        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true')
+        .replace('{{WEBCODEC}}', config.webcodec || 'png');
 
     return prefs;
 }
@@ -1688,6 +1778,7 @@ let currentConfig = {
     disks: [],
     ram: 32,
     screen: '800x600',
+    webcodec: 'png',
     cpu: 4,
     model: 14,
     fpu: true,
@@ -1716,14 +1807,16 @@ async function loadStorage() {
     }
 }
 
-function openConfig() {
+async function openConfig() {
     const modal = document.getElementById('config-modal');
     if (modal) {
         modal.classList.add('open');
         storageCache = null; // Clear cache to refresh
+        // Load current config first so ROM/disk selections are correct
+        await loadCurrentConfig();
+        // Then load the ROM and disk lists (can run in parallel)
         loadRomList();
         loadDiskList();
-        loadCurrentConfig();
     }
 }
 
@@ -1871,6 +1964,7 @@ function updateConfigUI() {
     const romEl = document.getElementById('cfg-rom');
     const ramEl = document.getElementById('cfg-ram');
     const screenEl = document.getElementById('cfg-screen');
+    const webcodecEl = document.getElementById('cfg-webcodec');
     const cpuEl = document.getElementById('cfg-cpu');
     const modelEl = document.getElementById('cfg-model');
     const fpuEl = document.getElementById('cfg-fpu');
@@ -1880,6 +1974,7 @@ function updateConfigUI() {
     if (romEl) romEl.value = currentConfig.rom;
     if (ramEl) ramEl.value = currentConfig.ram;
     if (screenEl) screenEl.value = currentConfig.screen;
+    if (webcodecEl) webcodecEl.value = currentConfig.webcodec || 'png';
     if (cpuEl) cpuEl.value = currentConfig.cpu;
     if (modelEl) modelEl.value = currentConfig.model;
     if (fpuEl) fpuEl.checked = currentConfig.fpu;
@@ -1897,6 +1992,7 @@ async function saveConfig() {
     currentConfig.rom = document.getElementById('cfg-rom')?.value || '';
     currentConfig.ram = parseInt(document.getElementById('cfg-ram')?.value || 32);
     currentConfig.screen = document.getElementById('cfg-screen')?.value || '800x600';
+    currentConfig.webcodec = document.getElementById('cfg-webcodec')?.value || 'png';
     currentConfig.cpu = parseInt(document.getElementById('cfg-cpu')?.value || 4);
     currentConfig.model = parseInt(document.getElementById('cfg-model')?.value || 14);
     currentConfig.fpu = document.getElementById('cfg-fpu')?.checked ?? true;

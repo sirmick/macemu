@@ -33,15 +33,19 @@ YUV_LIBS = $(shell pkg-config --libs libyuv 2>/dev/null || echo "-lyuv")
 OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS = $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
 
+# fpng (included - fast PNG encoder, no external dependency)
+# fpng benefits from SSE4.1 and pclmul for fast CRC32
+FPNG_CFLAGS = -msse4.1 -mpclmul
+
 # Combined flags
-SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(H264_CFLAGS) $(YUV_CFLAGS) $(OPENSSL_CFLAGS)
+SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(H264_CFLAGS) $(YUV_CFLAGS) $(OPENSSL_CFLAGS) $(FPNG_CFLAGS)
 SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(H264_LIBS) $(YUV_LIBS) $(OPENSSL_LIBS) -lpthread -lrt
 
 # Source files
-SERVER_SRCS = $(SERVER_DIR)/server.cpp $(SERVER_DIR)/h264_encoder.cpp
+SERVER_SRCS = $(SERVER_DIR)/server.cpp $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/fpng.cpp
 
 # Object files
-SERVER_OBJS = $(BUILD_DIR)/server.o $(BUILD_DIR)/h264_encoder.o
+SERVER_OBJS = $(BUILD_DIR)/server.o $(BUILD_DIR)/h264_encoder.o $(BUILD_DIR)/png_encoder.o $(BUILD_DIR)/fpng.o
 
 # Target
 SERVER = $(BUILD_DIR)/macemu-webrtc
@@ -89,6 +93,14 @@ $(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/ipc_protocol.h $(S
 # Compile H.264 encoder
 $(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/h264_encoder.h $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile PNG encoder
+$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/png_encoder.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/fpng.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile fpng (fast PNG library)
+$(BUILD_DIR)/fpng.o: $(SERVER_DIR)/fpng.cpp $(SERVER_DIR)/fpng.h
+	$(CXX) $(CXXFLAGS) $(FPNG_CFLAGS) -c $< -o $@
 
 # Link server
 $(SERVER): $(SERVER_OBJS)
