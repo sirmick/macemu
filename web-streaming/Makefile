@@ -1,8 +1,20 @@
 # macemu WebRTC Streaming Server Makefile
 
-CXX = g++
+CXX = clang++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fPIC
 LDFLAGS = -lpthread
+
+# Platform detection
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+ifeq ($(UNAME_S),Darwin)
+    NPROC := $(shell sysctl -n hw.ncpu)
+    RT_LIBS :=
+else
+    NPROC := $(shell nproc)
+    RT_LIBS := -lrt
+endif
 
 # Directories
 SERVER_DIR = server
@@ -20,26 +32,33 @@ LIBJUICE = $(LIBDATACHANNEL_BUILD)/deps/libjuice/libjuice.a
 LIBSRTP = $(LIBDATACHANNEL_BUILD)/deps/libsrtp/libsrtp2.a
 USRSCTP = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
 
+# libyuv (built from source)
+LIBYUV_DIR = libyuv
+LIBYUV_BUILD = $(LIBYUV_DIR)/build
+LIBYUV_LIB = $(LIBYUV_BUILD)/libyuv.a
+LIBYUV_INCLUDES = -I$(LIBYUV_DIR)/include
+
 # OpenH264 (system package - replaces libvpx)
 H264_CFLAGS = $(shell pkg-config --cflags openh264 2>/dev/null)
 H264_LIBS = $(shell pkg-config --libs openh264 2>/dev/null || echo "-lopenh264")
-
-# libyuv (system package - for fast color conversion)
-# Note: libyuv doesn't always have pkg-config, so we check for the header directly
-YUV_CFLAGS = $(shell pkg-config --cflags libyuv 2>/dev/null)
-YUV_LIBS = $(shell pkg-config --libs libyuv 2>/dev/null || echo "-lyuv")
 
 # OpenSSL (system package)
 OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS = $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
 
 # fpng (included - fast PNG encoder, no external dependency)
-# fpng benefits from SSE4.1 and pclmul for fast CRC32
-FPNG_CFLAGS = -msse4.1 -mpclmul
+# fpng uses CRC32 intrinsics - ARM uses __crc32, x86 uses SSE4.1/pclmul
+ifeq ($(UNAME_M),arm64)
+    FPNG_CFLAGS = -mcrc
+else ifeq ($(UNAME_M),aarch64)
+    FPNG_CFLAGS = -mcrc
+else
+    FPNG_CFLAGS = -msse4.1 -mpclmul
+endif
 
 # Combined flags
-SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(H264_CFLAGS) $(YUV_CFLAGS) $(OPENSSL_CFLAGS) $(FPNG_CFLAGS)
-SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(H264_LIBS) $(YUV_LIBS) $(OPENSSL_LIBS) -lpthread -lrt
+SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(LIBYUV_INCLUDES) $(H264_CFLAGS) $(OPENSSL_CFLAGS) $(FPNG_CFLAGS)
+SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(LIBYUV_LIB) $(H264_LIBS) $(OPENSSL_LIBS) -lpthread $(RT_LIBS)
 
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/fpng.cpp
@@ -51,7 +70,7 @@ SERVER_OBJS = $(BUILD_DIR)/server.o $(BUILD_DIR)/h264_encoder.o $(BUILD_DIR)/png
 SERVER = $(BUILD_DIR)/macemu-webrtc
 
 # Default target
-all: deps-check libdatachannel dirs $(SERVER)
+all: deps-check libdatachannel libyuv dirs $(SERVER)
 	@echo ""
 	@echo "Build complete!"
 	@echo "Server: $(SERVER)"
@@ -59,13 +78,28 @@ all: deps-check libdatachannel dirs $(SERVER)
 	@echo "Usage:"
 	@echo "  1. Start the server: ./$(SERVER)"
 	@echo "     (note the PID-based socket path it prints)"
-	@echo "  2. Build Basilisk II with: ./configure --enable-ipc-video && make"
-	@echo "  3. Run emulator: MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
+	@echo "  2. Build SheepShaver with: ./configure --enable-ipc-video && make"
+	@echo "  3. Run emulator: ./SheepShaver"
 	@echo "  4. Open http://localhost:8000 in your browser"
 
 # Create build directory
 dirs:
 	@mkdir -p $(BUILD_DIR)
+
+# Build libyuv from source
+libyuv: $(LIBYUV_LIB)
+
+$(LIBYUV_LIB):
+	@echo "Building libyuv..."
+	@if [ ! -d "$(LIBYUV_DIR)" ]; then \
+		git clone --depth 1 https://chromium.googlesource.com/libyuv/libyuv $(LIBYUV_DIR); \
+	fi
+	@mkdir -p $(LIBYUV_BUILD)
+	cd $(LIBYUV_BUILD) && cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DBUILD_SHARED_LIBS=OFF
+	$(MAKE) -C $(LIBYUV_BUILD) -j$(NPROC)
+	@echo "libyuv built successfully"
 
 # Build libdatachannel
 libdatachannel: $(LIBDATACHANNEL_LIB)
@@ -83,19 +117,19 @@ $(LIBDATACHANNEL_LIB):
 		-DUSE_MBEDTLS=OFF \
 		-DUSE_NICE=OFF \
 		-DBUILD_SHARED_LIBS=OFF
-	$(MAKE) -C $(LIBDATACHANNEL_BUILD) -j$$(nproc)
+	$(MAKE) -C $(LIBDATACHANNEL_BUILD) -j$(NPROC)
 	@echo "libdatachannel built successfully"
 
 # Compile server
-$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/ipc_protocol.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/h264_encoder.h $(LIBDATACHANNEL_LIB)
+$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/ipc_protocol.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/h264_encoder.h $(LIBDATACHANNEL_LIB) $(LIBYUV_LIB)
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile H.264 encoder
-$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/h264_encoder.h $(SERVER_DIR)/codec.h
+$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/h264_encoder.h $(SERVER_DIR)/codec.h $(LIBYUV_LIB)
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile PNG encoder
-$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/png_encoder.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/fpng.h
+$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/png_encoder.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/fpng.h $(LIBYUV_LIB)
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile fpng (fast PNG library)
@@ -114,23 +148,28 @@ run: $(SERVER)
 clean:
 	rm -rf $(BUILD_DIR)
 
-# Clean everything including libdatachannel
+# Clean everything including libdatachannel and libyuv
 distclean: clean
 	rm -rf $(LIBDATACHANNEL_BUILD)
+	rm -rf $(LIBYUV_DIR)
 
 # Check dependencies
 deps-check:
 	@echo "Checking dependencies..."
-	@which cmake >/dev/null 2>&1 || (echo "ERROR: cmake not found. Install with: sudo apt install cmake" && exit 1)
-	@which pkg-config >/dev/null 2>&1 || (echo "ERROR: pkg-config not found. Install with: sudo apt install pkg-config" && exit 1)
-	@pkg-config --exists openh264 2>/dev/null || (echo "ERROR: libopenh264 not found. Install with: sudo apt install libopenh264-dev" && exit 1)
-	@(pkg-config --exists libyuv 2>/dev/null || test -f /usr/include/libyuv.h) || (echo "ERROR: libyuv not found. Install with: sudo apt install libyuv-dev" && exit 1)
-	@pkg-config --exists openssl 2>/dev/null || (echo "ERROR: openssl not found. Install with: sudo apt install libssl-dev" && exit 1)
-	@echo "All dependencies found!"
+	@which cmake >/dev/null 2>&1 || (echo "ERROR: cmake not found" && exit 1)
+	@which pkg-config >/dev/null 2>&1 || (echo "ERROR: pkg-config not found" && exit 1)
+	@pkg-config --exists openh264 2>/dev/null || (echo "ERROR: openh264 not found" && exit 1)
+	@pkg-config --exists openssl 2>/dev/null || (echo "ERROR: openssl not found" && exit 1)
+	@echo "All dependencies found! (libyuv will be built from source)"
 
-# Install dependencies (Ubuntu/Debian)
+# Install dependencies (platform-specific)
+ifeq ($(UNAME_S),Darwin)
 deps:
-	sudo apt-get install -y cmake pkg-config libopenh264-dev libyuv-dev libssl-dev
+	brew install cmake pkg-config openh264 openssl
+else
+deps:
+	sudo apt-get install -y cmake pkg-config libopenh264-dev libssl-dev
+endif
 
 # Install server
 install: $(SERVER)
@@ -165,4 +204,4 @@ help:
 	@echo "     MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
 	@echo "  6. Open http://localhost:8000 in browser"
 
-.PHONY: all dirs run clean distclean deps deps-check help libdatachannel install
+.PHONY: all dirs run clean distclean deps deps-check help libdatachannel libyuv install

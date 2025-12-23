@@ -54,8 +54,35 @@
 #include <unistd.h>
 #include <errno.h>
 
-// libyuv for format conversion
+// Byte shuffle for ARGB↔BGRA conversion
+// libyuv is optional - we provide a fallback implementation
+#ifdef HAVE_LIBYUV
 #include <libyuv.h>
+#else
+// Fallback: byte shuffle equivalent to libyuv::ARGBToBGRA
+// Mac 32-bit: memory bytes are A,R,G,B → we want B,G,R,A
+// This reverses the byte order of each 4-byte pixel
+namespace libyuv {
+static inline int ARGBToBGRA(
+    const uint8_t* src, int src_stride,
+    uint8_t* dst, int dst_stride,
+    int width, int height)
+{
+    for (int y = 0; y < height; y++) {
+        const uint8_t* s = src + y * src_stride;
+        uint8_t* d = dst + y * dst_stride;
+        for (int x = 0; x < width; x++) {
+            // Reverse byte order: A,R,G,B → B,G,R,A
+            d[x*4 + 0] = s[x*4 + 3];  // B ← byte 3
+            d[x*4 + 1] = s[x*4 + 2];  // G ← byte 2
+            d[x*4 + 2] = s[x*4 + 1];  // R ← byte 1
+            d[x*4 + 3] = s[x*4 + 0];  // A ← byte 0
+        }
+    }
+    return 0;
+}
+} // namespace libyuv
+#endif
 
 #include "cpu_emulation.h"
 #include "main.h"

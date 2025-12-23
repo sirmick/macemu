@@ -50,8 +50,15 @@
 #include <getopt.h>
 #include <libgen.h>
 
+// Platform-specific event notification
+#ifdef __linux__
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#define HAVE_EPOLL 1
+#else
+// macOS and others: use poll() fallback
+#define HAVE_EPOLL 0
+#endif
 
 // Configuration
 static int g_http_port = 8000;
@@ -437,12 +444,16 @@ static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr);
 
 
 /*
- * Scan for running emulators (look for SHM files)
+ * Scan for running emulators
+ * Linux: look for SHM files in /dev/shm
+ * macOS: look for socket files in /tmp
  */
 
 static std::vector<pid_t> scan_for_emulators() {
     std::vector<pid_t> pids;
 
+#ifdef __linux__
+    // Linux: scan /dev/shm for SHM files
     DIR* dir = opendir("/dev/shm");
     if (!dir) return pids;
 
@@ -462,6 +473,40 @@ static std::vector<pid_t> scan_for_emulators() {
         }
     }
     closedir(dir);
+#else
+    // macOS: scan /tmp for socket files
+    DIR* dir = opendir("/tmp");
+    if (!dir) return pids;
+
+    struct dirent* entry;
+    const char* prefix = "macemu-";
+    const char* suffix = ".sock";
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+
+    while ((entry = readdir(dir)) != nullptr) {
+        size_t name_len = strlen(entry->d_name);
+        if (name_len > prefix_len + suffix_len &&
+            strncmp(entry->d_name, prefix, prefix_len) == 0 &&
+            strcmp(entry->d_name + name_len - suffix_len, suffix) == 0) {
+            // Extract PID from filename (macemu-PID.sock)
+            char pid_str[32];
+            size_t pid_len = name_len - prefix_len - suffix_len;
+            if (pid_len < sizeof(pid_str)) {
+                strncpy(pid_str, entry->d_name + prefix_len, pid_len);
+                pid_str[pid_len] = '\0';
+                pid_t pid = atoi(pid_str);
+                if (pid > 0) {
+                    // Check if process still exists
+                    if (kill(pid, 0) == 0) {
+                        pids.push_back(pid);
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
+#endif
 
     return pids;
 }
@@ -2047,7 +2092,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
     // Track input counts between stats intervals
     uint64_t last_mouse_move = 0;
 
-    // Create epoll instance for low-latency event notification (REQUIRED)
+    // Create event notification (platform-specific)
+#if HAVE_EPOLL
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         fprintf(stderr, "Video: FATAL: Failed to create epoll: %s\n", strerror(errno));
@@ -2055,7 +2101,13 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         return;
     }
     int current_eventfd = -1;  // Track which eventfd is registered
+#else
+    // macOS: use polling fallback
+    int epoll_fd = -1;  // Not used on macOS
+    (void)epoll_fd;
+#endif
     pid_t current_emulator_pid = -1;  // Track which emulator we're connected to
+    uint64_t last_frame_count = 0;  // For polling fallback
 
     fprintf(stderr, "Video: Starting frame processing loop\n");
 
@@ -2135,6 +2187,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             continue;
         }
 
+#if HAVE_EPOLL
         // Register eventfd with epoll when emulator PID changes (new connection or restart)
         // Kernel may reuse same fd number, so we check PID to detect new emulator
         if (g_emulator_connected && current_emulator_pid != g_emulator_pid) {
@@ -2186,6 +2239,23 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             // Timeout or error - continue loop
             continue;
         }
+#else
+        // macOS: use polling fallback - check frame_count for new frames
+        if (g_emulator_connected && current_emulator_pid != g_emulator_pid) {
+            current_emulator_pid = g_emulator_pid;
+            last_frame_count = 0;  // Reset on new connection
+            fprintf(stderr, "Video: Connected to emulator PID %d (polling mode)\n", current_emulator_pid);
+        }
+
+        // Poll for new frames by checking frame_count
+        uint64_t current_frame_count = ATOMIC_LOAD(g_video_shm->frame_count);
+        if (current_frame_count == last_frame_count) {
+            // No new frame, wait briefly and continue
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        last_frame_count = current_frame_count;
+#endif
 
         // Latency measurement: time from emulator frame completion to now
         // Plain read - synchronized by eventfd read above
@@ -2373,9 +2443,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
     }
 
     // Clean up epoll
+#if HAVE_EPOLL
     if (epoll_fd >= 0) {
         close(epoll_fd);
     }
+#endif
 
     fprintf(stderr, "Video: Exiting frame processing loop\n");
 }
