@@ -1,0 +1,141 @@
+# macemu WebRTC Streaming Server Makefile
+# Generated from Makefile.in by configure
+
+CXX = @CXX@
+CXXFLAGS = @CXXFLAGS@
+INSTALL = @INSTALL@
+
+# Directories
+SERVER_DIR = server
+CLIENT_DIR = client
+BUILD_DIR = build
+
+# libdatachannel paths
+LIBDATACHANNEL_DIR = @LIBDATACHANNEL_DIR@
+LIBDATACHANNEL_BUILD = @LIBDATACHANNEL_BUILD@
+LIBDATACHANNEL_LIB = @LIBDATACHANNEL_LIB@
+HAVE_LIBDATACHANNEL = @HAVE_LIBDATACHANNEL@
+CMAKE = @CMAKE@
+
+# Compiler and linker flags from configure
+SERVER_CFLAGS = -I../BasiliskII/src/IPC @SERVER_CFLAGS@
+SERVER_LIBS = @SERVER_LIBS@
+FPNG_CFLAGS = @FPNG_CFLAGS@
+
+# Source files
+SERVER_SRCS = $(SERVER_DIR)/server.cpp \
+              $(SERVER_DIR)/h264_encoder.cpp \
+              $(SERVER_DIR)/png_encoder.cpp \
+              $(SERVER_DIR)/fpng.cpp
+
+# Object files
+SERVER_OBJS = $(BUILD_DIR)/server.o \
+              $(BUILD_DIR)/h264_encoder.o \
+              $(BUILD_DIR)/png_encoder.o \
+              $(BUILD_DIR)/fpng.o
+
+# Target
+SERVER = $(BUILD_DIR)/macemu-webrtc
+
+# Default target
+all: libdatachannel dirs $(SERVER)
+	@echo ""
+	@echo "Build complete!"
+	@echo "Server: $(SERVER)"
+	@echo ""
+	@echo "Usage:"
+	@echo "  1. Start the server: ./$(SERVER)"
+	@echo "     (note the PID-based socket path it prints)"
+	@echo "  2. Build Basilisk II with: ./configure --enable-ipc-video && make"
+	@echo "  3. Run emulator: MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
+	@echo "  4. Open http://localhost:8000 in your browser"
+
+# Create build directory
+dirs:
+	@mkdir -p $(BUILD_DIR)
+
+# libdatachannel must be built before running configure
+# This is just a placeholder target
+libdatachannel:
+	@echo "libdatachannel is already built (checked by configure)"
+
+$(LIBDATACHANNEL_LIB):
+	@echo "ERROR: libdatachannel not found."
+	@echo "This should have been caught by configure. Please re-run ./configure"
+	@exit 1
+
+# Compile server
+$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp \
+                       ../BasiliskII/src/IPC/ipc_protocol.h \
+                       $(SERVER_DIR)/codec.h \
+                       $(SERVER_DIR)/h264_encoder.h \
+                       $(LIBDATACHANNEL_LIB)
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile H.264 encoder
+$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp \
+                              $(SERVER_DIR)/h264_encoder.h \
+                              $(SERVER_DIR)/codec.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile PNG encoder
+$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp \
+                             $(SERVER_DIR)/png_encoder.h \
+                             $(SERVER_DIR)/codec.h \
+                             $(SERVER_DIR)/fpng.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile fpng (fast PNG library)
+$(BUILD_DIR)/fpng.o: $(SERVER_DIR)/fpng.cpp $(SERVER_DIR)/fpng.h
+	$(CXX) $(CXXFLAGS) $(FPNG_CFLAGS) -c $< -o $@
+
+# Link server
+$(SERVER): $(SERVER_OBJS)
+	$(CXX) -o $@ $(SERVER_OBJS) $(SERVER_LIBS)
+
+# Run server
+run: $(SERVER)
+	./$(SERVER)
+
+# Clean build files
+clean:
+	rm -rf $(BUILD_DIR)
+	rm -f config.h config.log config.status
+
+# Clean everything including libdatachannel and configure artifacts
+distclean: clean
+	rm -rf $(LIBDATACHANNEL_BUILD)
+	rm -f Makefile
+
+# Install server
+install: $(SERVER)
+	$(INSTALL) -d $(DESTDIR)/usr/local/bin
+	$(INSTALL) -m 755 $(SERVER) $(DESTDIR)/usr/local/bin/
+
+# Help
+help:
+	@echo "macemu WebRTC Streaming Server"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all          - Build the server (default)"
+	@echo "  libdatachannel - Build libdatachannel library only"
+	@echo "  run          - Build and run the server"
+	@echo "  clean        - Remove build files"
+	@echo "  distclean    - Remove all build files including libdatachannel"
+	@echo "  install      - Install server to /usr/local/bin"
+	@echo "  help         - Show this help"
+	@echo ""
+	@echo "Quick Start:"
+	@echo "  1. Configure: ./configure"
+	@echo "  2. Build: make"
+	@echo "  3. Run server: ./build/macemu-webrtc"
+	@echo "     Server prints: 'Control socket: /tmp/macemu-<PID>.sock'"
+	@echo "  4. Build Basilisk II:"
+	@echo "     cd ../BasiliskII/src/Unix"
+	@echo "     ./configure --enable-ipc-video"
+	@echo "     make"
+	@echo "  5. Run emulator with socket path:"
+	@echo "     MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
+	@echo "  6. Open http://localhost:8000 in browser"
+
+.PHONY: all dirs run clean distclean help libdatachannel install
