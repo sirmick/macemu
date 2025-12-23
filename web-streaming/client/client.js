@@ -414,7 +414,7 @@ class PNGDecoder extends VideoDecoder {
             if (pingSeq > 0) {
                 // Only process if this is a NEW ping (not a duplicate from multi-frame echo)
                 if (pingSeq !== this.lastReceivedPingSeq) {
-                    log(`[Ping] New echo #${pingSeq} (browser_send=${ping_browser_send_ms.toFixed(1)}ms)`);
+                    logger.info(`[Ping] New echo #${pingSeq} (browser_send=${ping_browser_send_ms.toFixed(1)}ms)`);
                     this.lastReceivedPingSeq = pingSeq;
 
                     // Process ping echo
@@ -521,7 +521,7 @@ class PNGDecoder extends VideoDecoder {
             this.rttSamples++;
         } else if (total_rtt_ms >= 30000) {
             // Log unusually high RTT but don't include in average
-            log(`[Ping] Unusually high RTT: ${total_rtt_ms.toFixed(1)}ms (not included in average)`, 'warn');
+            logger.warn(`[Ping] Unusually high RTT: ${total_rtt_ms.toFixed(1)}ms (not included in average)`);
         }
 
         // Store latest ping breakdown for stats panel
