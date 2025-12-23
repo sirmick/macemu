@@ -31,8 +31,8 @@ public:
     // Encode from ARGB (bytes A,R,G,B - libyuv "BGRA", Mac native 32-bit)
     EncodedFrame encode_argb(const uint8_t* argb, int width, int height, int stride);
 
-    // Encode dirty rectangle from BGRA frame
-    EncodedFrame encode_bgra_rect(const uint8_t* bgra, int width, int height, int stride,
+    // Encode a sub-rectangle from BGRA frame (for dirty rect optimization)
+    EncodedFrame encode_bgra_rect(const uint8_t* bgra, int frame_width, int frame_height, int stride,
                                   int rect_x, int rect_y, int rect_width, int rect_height);
 
     void request_keyframe() override {

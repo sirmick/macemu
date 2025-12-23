@@ -3,6 +3,7 @@
 CXX = clang++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fPIC
 LDFLAGS = -lpthread
+INSTALL = /usr/bin/install -c
 
 # Platform detection
 UNAME_S := $(shell uname -s)
@@ -23,22 +24,16 @@ BUILD_DIR = build
 
 # libdatachannel paths
 LIBDATACHANNEL_DIR = libdatachannel
-LIBDATACHANNEL_BUILD = $(LIBDATACHANNEL_DIR)/build
-LIBDATACHANNEL_LIB = $(LIBDATACHANNEL_BUILD)/libdatachannel.a
-LIBDATACHANNEL_INCLUDES = -I$(LIBDATACHANNEL_DIR)/include
+LIBDATACHANNEL_BUILD = libdatachannel/build
+LIBDATACHANNEL_LIB = libdatachannel/build/libdatachannel.a
+LIBDATACHANNEL_INCLUDES = -Ilibdatachannel/include
 
 # libdatachannel dependencies (built alongside libdatachannel)
 LIBJUICE = $(LIBDATACHANNEL_BUILD)/deps/libjuice/libjuice.a
 LIBSRTP = $(LIBDATACHANNEL_BUILD)/deps/libsrtp/libsrtp2.a
 USRSCTP = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
 
-# libyuv (built from source)
-LIBYUV_DIR = libyuv
-LIBYUV_BUILD = $(LIBYUV_DIR)/build
-LIBYUV_LIB = $(LIBYUV_BUILD)/libyuv.a
-LIBYUV_INCLUDES = -I$(LIBYUV_DIR)/include
-
-# OpenH264 (system package - replaces libvpx)
+# OpenH264 (system package)
 H264_CFLAGS = $(shell pkg-config --cflags openh264 2>/dev/null)
 H264_LIBS = $(shell pkg-config --libs openh264 2>/dev/null || echo "-lopenh264")
 
@@ -56,21 +51,27 @@ else
     FPNG_CFLAGS = -msse4.1 -mpclmul
 endif
 
-# Combined flags
-SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(LIBYUV_INCLUDES) $(H264_CFLAGS) $(OPENSSL_CFLAGS) $(FPNG_CFLAGS)
-SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(LIBYUV_LIB) $(H264_LIBS) $(OPENSSL_LIBS) -lpthread $(RT_LIBS)
+# Combined flags (no libyuv dependency - using manual conversion)
+SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(H264_CFLAGS) $(OPENSSL_CFLAGS) $(FPNG_CFLAGS)
+SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(H264_LIBS) $(OPENSSL_LIBS) -lpthread $(RT_LIBS)
 
 # Source files
-SERVER_SRCS = $(SERVER_DIR)/server.cpp $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/fpng.cpp
+SERVER_SRCS = $(SERVER_DIR)/server.cpp \
+              $(SERVER_DIR)/h264_encoder.cpp \
+              $(SERVER_DIR)/png_encoder.cpp \
+              $(SERVER_DIR)/fpng.cpp
 
 # Object files
-SERVER_OBJS = $(BUILD_DIR)/server.o $(BUILD_DIR)/h264_encoder.o $(BUILD_DIR)/png_encoder.o $(BUILD_DIR)/fpng.o
+SERVER_OBJS = $(BUILD_DIR)/server.o \
+              $(BUILD_DIR)/h264_encoder.o \
+              $(BUILD_DIR)/png_encoder.o \
+              $(BUILD_DIR)/fpng.o
 
 # Target
 SERVER = $(BUILD_DIR)/macemu-webrtc
 
 # Default target
-all: deps-check libdatachannel libyuv dirs $(SERVER)
+all: deps-check libdatachannel dirs $(SERVER)
 	@echo ""
 	@echo "Build complete!"
 	@echo "Server: $(SERVER)"
@@ -85,21 +86,6 @@ all: deps-check libdatachannel libyuv dirs $(SERVER)
 # Create build directory
 dirs:
 	@mkdir -p $(BUILD_DIR)
-
-# Build libyuv from source
-libyuv: $(LIBYUV_LIB)
-
-$(LIBYUV_LIB):
-	@echo "Building libyuv..."
-	@if [ ! -d "$(LIBYUV_DIR)" ]; then \
-		git clone --depth 1 https://chromium.googlesource.com/libyuv/libyuv $(LIBYUV_DIR); \
-	fi
-	@mkdir -p $(LIBYUV_BUILD)
-	cd $(LIBYUV_BUILD) && cmake .. \
-		-DCMAKE_BUILD_TYPE=Release \
-		-DBUILD_SHARED_LIBS=OFF
-	$(MAKE) -C $(LIBYUV_BUILD) -j$(NPROC)
-	@echo "libyuv built successfully"
 
 # Build libdatachannel
 libdatachannel: $(LIBDATACHANNEL_LIB)
@@ -121,15 +107,15 @@ $(LIBDATACHANNEL_LIB):
 	@echo "libdatachannel built successfully"
 
 # Compile server
-$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/ipc_protocol.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/h264_encoder.h $(LIBDATACHANNEL_LIB) $(LIBYUV_LIB)
+$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/codec.h $(SERVER_DIR)/h264_encoder.h $(LIBDATACHANNEL_LIB)
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile H.264 encoder
-$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/h264_encoder.h $(SERVER_DIR)/codec.h $(LIBYUV_LIB)
+$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/h264_encoder.h $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile PNG encoder
-$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/png_encoder.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/fpng.h $(LIBYUV_LIB)
+$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/png_encoder.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/fpng.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile fpng (fast PNG library)
@@ -147,11 +133,11 @@ run: $(SERVER)
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -f config.h config.log config.status
 
-# Clean everything including libdatachannel and libyuv
+# Clean everything including libdatachannel
 distclean: clean
 	rm -rf $(LIBDATACHANNEL_BUILD)
-	rm -rf $(LIBYUV_DIR)
 
 # Check dependencies
 deps-check:
@@ -160,7 +146,7 @@ deps-check:
 	@which pkg-config >/dev/null 2>&1 || (echo "ERROR: pkg-config not found" && exit 1)
 	@pkg-config --exists openh264 2>/dev/null || (echo "ERROR: openh264 not found" && exit 1)
 	@pkg-config --exists openssl 2>/dev/null || (echo "ERROR: openssl not found" && exit 1)
-	@echo "All dependencies found! (libyuv will be built from source)"
+	@echo "All dependencies found!"
 
 # Install dependencies (platform-specific)
 ifeq ($(UNAME_S),Darwin)
@@ -173,8 +159,8 @@ endif
 
 # Install server
 install: $(SERVER)
-	@mkdir -p /usr/local/bin
-	cp $(SERVER) /usr/local/bin/
+	$(INSTALL) -d $(DESTDIR)/usr/local/bin
+	$(INSTALL) -m 755 $(SERVER) $(DESTDIR)/usr/local/bin/
 
 # Help
 help:
@@ -186,14 +172,12 @@ help:
 	@echo "  run          - Build and run the server"
 	@echo "  clean        - Remove build files"
 	@echo "  distclean    - Remove all build files including libdatachannel"
-	@echo "  deps         - Install system dependencies"
-	@echo "  deps-check   - Check if dependencies are installed"
 	@echo "  install      - Install server to /usr/local/bin"
 	@echo "  help         - Show this help"
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  1. Install deps: make deps"
-	@echo "  2. Build server: make"
+	@echo "  1. Configure: ./configure"
+	@echo "  2. Build: make"
 	@echo "  3. Run server: ./build/macemu-webrtc"
 	@echo "     Server prints: 'Control socket: /tmp/macemu-<PID>.sock'"
 	@echo "  4. Build Basilisk II:"
@@ -204,4 +188,4 @@ help:
 	@echo "     MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
 	@echo "  6. Open http://localhost:8000 in browser"
 
-.PHONY: all dirs run clean distclean deps deps-check help libdatachannel libyuv install
+.PHONY: all dirs run clean distclean deps deps-check help libdatachannel install

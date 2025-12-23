@@ -12,10 +12,12 @@
 #include "ipc_protocol.h"
 #include "codec.h"
 #include "h264_encoder.h"
+#include "av1_encoder.h"
 #include "png_encoder.h"
 
 #include <rtc/rtc.hpp>
 #include <rtc/h264rtppacketizer.hpp>
+#include <rtc/av1rtppacketizer.hpp>
 #include <rtc/rtppacketizationconfig.hpp>
 #include <rtc/frameinfo.hpp>
 
@@ -70,6 +72,8 @@ static std::string g_emulator_path;    // Path to BasiliskII/SheepShaver executa
 static bool g_auto_start_emulator = true;
 static pid_t g_target_emulator_pid = 0;  // If specified, connect to this PID
 static CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG)
+static bool g_enable_stun = false;  // STUN disabled by default (for localhost/LAN)
+static std::string g_stun_server = "stun:stun.l.google.com:19302";  // Default STUN server
 
 // Debug/verbosity flags (extern in encoders for cross-module access)
 static bool g_debug_connection = false;  // WebRTC, ICE, signaling logs
@@ -297,7 +301,18 @@ static bool connect_to_control_socket(pid_t pid) {
 
     // Set non-blocking
     int flags = fcntl(g_control_socket, F_GETFL, 0);
-    fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        fprintf(stderr, "IPC: Failed to get socket flags: %s\n", strerror(errno));
+        close(g_control_socket);
+        g_control_socket = -1;
+        return false;
+    }
+    if (fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "IPC: Failed to set non-blocking mode: %s\n", strerror(errno));
+        close(g_control_socket);
+        g_control_socket = -1;
+        return false;
+    }
 
     g_connected_socket_path = socket_path;
     g_emulator_connected = true;
@@ -317,9 +332,13 @@ static bool connect_to_control_socket(pid_t pid) {
     msg.msg_controllen = sizeof(buf);
 
     // Try to receive the eventfd (with short timeout since it's sent immediately)
-    fcntl(g_control_socket, F_SETFL, flags & ~O_NONBLOCK);  // Temporarily blocking
+    if (fcntl(g_control_socket, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+        fprintf(stderr, "IPC: Warning: Failed to set blocking mode: %s\n", strerror(errno));
+    }
     struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-    setsockopt(g_control_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(g_control_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        fprintf(stderr, "IPC: Warning: Failed to set socket timeout: %s\n", strerror(errno));
+    }
 
     ssize_t n = recvmsg(g_control_socket, &msg, 0);
     if (n > 0 && data == 'E') {
@@ -333,7 +352,9 @@ static bool connect_to_control_socket(pid_t pid) {
     }
 
     // Restore non-blocking mode
-    fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK);
+    if (fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "IPC: Warning: Failed to restore non-blocking mode: %s\n", strerror(errno));
+    }
 
     return true;
 }
@@ -972,6 +993,9 @@ static void read_webcodec_pref() {
             if (value == "h264" || value == "H264") {
                 g_server_codec = CodecType::H264;
                 fprintf(stderr, "Config: webcodec = h264\n");
+            } else if (value == "av1" || value == "AV1") {
+                g_server_codec = CodecType::AV1;
+                fprintf(stderr, "Config: webcodec = av1\n");
             } else if (value == "png" || value == "PNG") {
                 g_server_codec = CodecType::PNG;
                 fprintf(stderr, "Config: webcodec = png\n");
@@ -1005,10 +1029,23 @@ public:
         }
 
         int opt = 1;
-        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEADDR: %s\n", strerror(errno));
+        }
 
         int flags = fcntl(server_fd_, F_GETFL, 0);
-        fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK);
+        if (flags < 0) {
+            fprintf(stderr, "HTTP: Failed to get socket flags: %s\n", strerror(errno));
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
+        if (fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+            fprintf(stderr, "HTTP: Failed to set non-blocking mode: %s\n", strerror(errno));
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
 
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
@@ -1131,7 +1168,13 @@ private:
 
         if (path == "/api/prefs" && method == "POST") {
             // Write raw prefs file content from JSON body
+            fprintf(stderr, "Config: Received prefs POST (body length=%zu)\n", body.size());
             std::string content = json_get_string(body, "content");
+            fprintf(stderr, "Config: Extracted content length=%zu\n", content.size());
+            if (content.empty()) {
+                fprintf(stderr, "Config: WARNING - extracted content is empty! Body: %s\n",
+                        body.substr(0, 200).c_str());
+            }
             if (write_prefs_file(content)) {
                 send_json_response(fd, "{\"success\": true}");
             } else {
@@ -1361,6 +1404,7 @@ struct PeerConnection {
     std::string id;
     CodecType codec = CodecType::H264;  // Codec type for this peer
     bool ready = false;
+    bool needs_first_frame = true;  // PNG/RAW peers need full first frame
     bool has_remote_description = false;
     std::vector<std::pair<std::string, std::string>> pending_candidates;  // candidate, mid
 };
@@ -1462,6 +1506,35 @@ public:
                         frameInfo);
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] Send error to %s: %s\n", id.c_str(), e.what());
+                }
+            }
+        }
+    }
+
+    // Send AV1 frame via RTP video track
+    void send_av1_frame(const std::vector<uint8_t>& data, bool is_keyframe) {
+        if (data.empty() || peer_count_ == 0) return;
+
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - start_time_);
+        rtc::FrameInfo frameInfo(elapsed);
+
+        if (is_keyframe) {
+            fprintf(stderr, "[WebRTC] Sending AV1 keyframe: %zu bytes\n", data.size());
+        }
+
+        for (auto& [id, peer] : peers_) {
+            if (peer->codec != CodecType::AV1) continue;
+            if (peer->ready && peer->video_track && peer->video_track->isOpen()) {
+                try {
+                    peer->video_track->sendFrame(
+                        reinterpret_cast<const std::byte*>(data.data()),
+                        data.size(),
+                        frameInfo);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[WebRTC] AV1 send error to %s: %s\n", id.c_str(), e.what());
                 }
             }
         }
@@ -1613,9 +1686,22 @@ public:
         return false;
     }
 
+    // Check if any PNG peer needs their first frame, and clear the flag if so
+    bool png_peer_needs_first_frame() {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        for (auto& [id, peer] : peers_) {
+            if (peer->codec == CodecType::PNG && peer->ready && peer->needs_first_frame) {
+                peer->needs_first_frame = false;  // Clear flag so next frame uses dirty rect
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Get codec peer counts in one lock (more efficient for frame loop)
     struct CodecPeerCounts {
         int h264 = 0;
+        int av1 = 0;
         int png = 0;
         int raw = 0;
     };
@@ -1627,6 +1713,7 @@ public:
             if (!peer->ready) continue;
             switch (peer->codec) {
                 case CodecType::H264: counts.h264++; break;
+                case CodecType::AV1: counts.av1++; break;
                 case CodecType::PNG: counts.png++; break;
                 case CodecType::RAW: counts.raw++; break;
             }
@@ -1662,6 +1749,82 @@ public:
     }
 
 private:
+    // Helper: Check if codec needs RTP video track (vs DataChannel)
+    bool needs_video_track(CodecType codec) {
+        return codec == CodecType::H264 || codec == CodecType::AV1;
+    }
+
+    // Helper: Setup AV1 video track with RTP packetizer
+    void setup_av1_track(std::shared_ptr<PeerConnection> peer) {
+        rtc::Description::Video media("video-stream", rtc::Description::Direction::SendOnly);
+        media.addAV1Codec(96);  // AV1 uses payload type 96
+        media.addSSRC(ssrc_, "video-stream", "stream1", "video-stream");
+        peer->video_track = peer->pc->addTrack(media);
+
+        // Set up AV1 RTP packetizer (handles OBU fragmentation)
+        auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc_, "video-stream", 96, rtc::AV1RtpPacketizer::ClockRate
+        );
+        auto packetizer = std::make_shared<rtc::AV1RtpPacketizer>(
+            rtc::AV1RtpPacketizer::Packetization::TemporalUnit,
+            rtpConfig
+        );
+        peer->video_track->setMediaHandler(packetizer);
+
+        peer->video_track->onOpen([peer]() {
+            if (g_debug_connection) {
+                fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
+            }
+            peer->ready = true;
+            g_request_keyframe.store(true);
+        });
+
+        peer->video_track->onClosed([peer]() {
+            fprintf(stderr, "[WebRTC] Video track CLOSED for %s\n", peer->id.c_str());
+            peer->ready = false;
+        });
+
+        peer->video_track->onError([peer](std::string error) {
+            fprintf(stderr, "[WebRTC] Video track ERROR for %s: %s\n", peer->id.c_str(), error.c_str());
+        });
+    }
+
+    // Helper: Setup H.264 video track with RTP packetizer
+    void setup_h264_track(std::shared_ptr<PeerConnection> peer) {
+        rtc::Description::Video media("video-stream", rtc::Description::Direction::SendOnly);
+        media.addH264Codec(96, "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1");
+        media.addSSRC(ssrc_, "video-stream", "stream1", "video-stream");
+        peer->video_track = peer->pc->addTrack(media);
+
+        // Set up H.264 RTP packetizer (handles NAL unit fragmentation)
+        auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc_, "video-stream", 96, rtc::H264RtpPacketizer::ClockRate
+        );
+        auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+            rtc::H264RtpPacketizer::Separator::LongStartSequence,
+            rtpConfig
+        );
+        peer->video_track->setMediaHandler(packetizer);
+
+        peer->video_track->onOpen([peer]() {
+            if (g_debug_connection) {
+                fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
+            }
+            peer->ready = true;
+            // Request keyframe so new peer gets a complete picture
+            g_request_keyframe.store(true);
+        });
+
+        peer->video_track->onClosed([peer]() {
+            fprintf(stderr, "[WebRTC] Video track CLOSED for %s\n", peer->id.c_str());
+            peer->ready = false;
+        });
+
+        peer->video_track->onError([peer](std::string error) {
+            fprintf(stderr, "[WebRTC] Video track ERROR for %s: %s\n", peer->id.c_str(), error.c_str());
+        });
+    }
+
     void process_signaling(std::shared_ptr<rtc::WebSocket> ws, const std::string& msg) {
         std::string type = json_get_string(msg, "type");
 
@@ -1673,19 +1836,23 @@ private:
             // Use server-side codec preference (from prefs file)
             peer->codec = g_server_codec;
             const char* codec_name = (g_server_codec == CodecType::H264) ? "h264" :
+                                     (g_server_codec == CodecType::AV1) ? "av1" :
                                      (g_server_codec == CodecType::PNG) ? "png" : "raw";
             if (g_debug_connection) {
                 fprintf(stderr, "[WebRTC] Peer %s using %s codec (server-configured)\n",
                         peer_id.c_str(), codec_name);
             }
 
-            // Send acknowledgment with codec info so client knows what to expect
-            std::string ack = "{\"type\":\"connected\",\"peer_id\":\"" + peer_id +
-                              "\",\"codec\":\"" + codec_name + "\"}";
-            ws->send(ack);
-
             rtc::Configuration config;
-            config.iceServers.emplace_back("stun:stun.l.google.com:19302");
+            // Add STUN server if enabled (disabled by default for localhost/LAN)
+            if (g_enable_stun) {
+                config.iceServers.emplace_back(g_stun_server);
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Using STUN server: %s\n", g_stun_server.c_str());
+                }
+            } else if (g_debug_connection) {
+                fprintf(stderr, "[WebRTC] STUN disabled (localhost/LAN mode)\n");
+            }
             // Allow large video frames (up to 16MB for high-res dithered content)
             config.maxMessageSize = 16 * 1024 * 1024;
 
@@ -1697,6 +1864,11 @@ private:
                 peers_[peer_id] = peer;
                 peer_count_++;
             }
+
+            // Send acknowledgment with codec info so client initializes correct decoder
+            std::string ack = "{\"type\":\"connected\",\"peer_id\":\"" + peer_id +
+                              "\",\"codec\":\"" + codec_name + "\"}";
+            ws->send(ack);
 
             std::weak_ptr<rtc::PeerConnection> wpc = peer->pc;
             peer->pc->onGatheringStateChange([ws, peer_id, wpc](rtc::PeerConnection::GatheringState state) {
@@ -1713,43 +1885,21 @@ private:
                 }
             });
 
-            // Add video track with H.264 codec
-            // Use profile-level-id=42e01f (Constrained Baseline, Level 3.1) in SDP
-            // This matches what browsers advertise for WebRTC H.264 support.
-            // Browsers can still decode higher levels, they just don't advertise it.
-            // level-asymmetry-allowed=1 means we can send higher levels than advertised.
-            rtc::Description::Video media("video-stream", rtc::Description::Direction::SendOnly);
-            media.addH264Codec(96, "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1");
-            media.addSSRC(ssrc_, "video-stream", "stream1", "video-stream");
-            peer->video_track = peer->pc->addTrack(media);
-
-            // Set up H.264 RTP packetizer (handles NAL unit fragmentation)
-            auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
-                ssrc_, "video-stream", 96, rtc::H264RtpPacketizer::ClockRate
-            );
-            auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-                rtc::H264RtpPacketizer::Separator::LongStartSequence,
-                rtpConfig
-            );
-            peer->video_track->setMediaHandler(packetizer);
-
-            peer->video_track->onOpen([peer]() {
-                if (g_debug_connection) {
-                    fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
+            // Conditionally create video track based on codec
+            if (needs_video_track(peer->codec)) {
+                if (peer->codec == CodecType::H264) {
+                    setup_h264_track(peer);
+                } else if (peer->codec == CodecType::AV1) {
+                    setup_av1_track(peer);
                 }
-                peer->ready = true;
-                // Request keyframe so new peer gets a complete picture
-                g_request_keyframe.store(true);
-            });
-
-            peer->video_track->onClosed([peer]() {
-                fprintf(stderr, "[WebRTC] Video track CLOSED for %s\n", peer->id.c_str());
-                peer->ready = false;
-            });
-
-            peer->video_track->onError([peer](std::string error) {
-                fprintf(stderr, "[WebRTC] Video track ERROR for %s: %s\n", peer->id.c_str(), error.c_str());
-            });
+            } else {
+                // PNG/RAW codecs use DataChannel for video, mark as ready immediately
+                // when DataChannel opens (no video track needed)
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Peer %s using %s codec via DataChannel (no video track)\n",
+                            peer_id.c_str(), codec_name);
+                }
+            }
 
             peer->pc->onStateChange([peer](rtc::PeerConnection::State state) {
                 const char* state_str = "unknown";
@@ -1784,9 +1934,16 @@ private:
 
             // Add data channel for input
             peer->data_channel = peer->pc->createDataChannel("input");
-            peer->data_channel->onOpen([peer_id = peer->id]() {
+            peer->data_channel->onOpen([peer, peer_id = peer->id]() {
                 if (g_debug_connection) {
                     fprintf(stderr, "[WebRTC] DataChannel OPEN for %s\n", peer_id.c_str());
+                }
+                // For PNG/RAW codecs (no video track), mark peer as ready when DataChannel opens
+                if (peer->codec == CodecType::PNG || peer->codec == CodecType::RAW) {
+                    peer->ready = true;
+                    if (g_debug_connection) {
+                        fprintf(stderr, "[WebRTC] PNG/RAW peer %s marked ready (DataChannel opened)\n", peer_id.c_str());
+                    }
                 }
             });
             peer->data_channel->onMessage([this](auto data) {
@@ -2083,7 +2240,7 @@ static void disconnect_from_emulator(WebRTCServer* webrtc) {
  * Main video processing loop
  */
 
-static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncoder& png_encoder) {
+static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, PNGEncoder& png_encoder) {
     auto last_stats_time = std::chrono::steady_clock::now();
     auto last_emu_check = std::chrono::steady_clock::now();
     auto last_scan_time = std::chrono::steady_clock::now();
@@ -2195,7 +2352,10 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             if (current_eventfd >= 0) {
                 fprintf(stderr, "Video: Removing old eventfd %d from epoll (PID %d->%d)\n",
                         current_eventfd, current_emulator_pid, g_emulator_pid);
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr) < 0) {
+                    fprintf(stderr, "Video: Warning: Failed to remove eventfd %d from epoll: %s\n",
+                            current_eventfd, strerror(errno));
+                }
                 current_eventfd = -1;
             }
 
@@ -2234,7 +2394,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             // This read() provides memory barrier - all emulator writes before write(eventfd) are now visible
             uint64_t val;
             ssize_t ret = read(current_eventfd, &val, sizeof(val));
-            (void)ret;  // Suppress unused warning
+            if (ret != sizeof(val)) {
+                fprintf(stderr, "Video: Error reading eventfd: %s\n",
+                        ret < 0 ? strerror(errno) : "partial read");
+                continue;
+            }
         } else {
             // Timeout or error - continue loop
             continue;
@@ -2283,6 +2447,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         bool keyframe_requested = g_request_keyframe.exchange(false);
         if (keyframe_requested) {
             h264_encoder.request_keyframe();
+            av1_encoder.request_keyframe();
         }
 
         // Encode and send to H.264 peers
@@ -2295,6 +2460,15 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             }
         }
 
+        // Encode and send to AV1 peers
+        if (webrtc.has_codec_peer(CodecType::AV1)) {
+            EncodedFrame frame = av1_encoder.encode_bgra(frame_data, width, height, stride);
+            if (!frame.data.empty()) {
+                webrtc.send_av1_frame(frame.data, frame.is_keyframe);
+                frames_encoded++;
+            }
+        }
+
         // Encode and send to PNG peers using dirty rects from emulator
         if (webrtc.has_codec_peer(CodecType::PNG)) {
             // Read dirty rect from SHM (plain reads - synchronized by eventfd)
@@ -2303,8 +2477,17 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             uint32_t dirty_width = g_video_shm->dirty_width;
             uint32_t dirty_height = g_video_shm->dirty_height;
 
-            // Force full frame if keyframe requested (new peer connected)
-            if (keyframe_requested) {
+            // Debug logging for dirty rects
+            static int dirty_log_counter = 0;
+            if (++dirty_log_counter % 30 == 0) {
+                fprintf(stderr, "PNG: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %ux%u)\n",
+                        dirty_x, dirty_y, dirty_width, dirty_height, width, height);
+            }
+
+            // Force full frame if any PNG peer needs their first frame
+            // PNG peers need a full first frame to initialize the canvas
+            bool needs_first = webrtc.png_peer_needs_first_frame();
+            if (needs_first) {
                 dirty_x = 0;
                 dirty_y = 0;
                 dirty_width = width;
@@ -2341,7 +2524,16 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 EncodedFrame frame;
 
                 // Check if this is a full frame or dirty rect
-                if (dirty_x == 0 && dirty_y == 0 && dirty_width == width && dirty_height == height) {
+                bool is_full_frame = (dirty_x == 0 && dirty_y == 0 && dirty_width == width && dirty_height == height);
+
+                static int encode_log_counter = 0;
+                if (++encode_log_counter % 30 == 0) {
+                    fprintf(stderr, "PNG: Encoding %s (x=%u y=%u w=%u h=%u)\n",
+                            is_full_frame ? "FULL FRAME" : "dirty rect",
+                            dirty_x, dirty_y, dirty_width, dirty_height);
+                }
+
+                if (is_full_frame) {
                     // Full frame
                     frame = png_encoder.encode_bgra(frame_data, width, height, stride);
                 } else {
@@ -2469,6 +2661,9 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --pid PID               Connect to specific emulator PID\n");
     fprintf(stderr, "  --roms PATH             ROMs directory (default: storage/roms)\n");
     fprintf(stderr, "  --images PATH           Disk images directory (default: storage/images)\n");
+    fprintf(stderr, "\nNetwork Options:\n");
+    fprintf(stderr, "  --stun                  Enable STUN for NAT traversal (default: off)\n");
+    fprintf(stderr, "  --stun-server URL       STUN server URL (default: stun:stun.l.google.com:19302)\n");
     fprintf(stderr, "\nDebug Options:\n");
     fprintf(stderr, "  --debug-connection      Show WebRTC/ICE/signaling logs\n");
     fprintf(stderr, "  --debug-mode-switch     Show mode/resolution/color depth changes\n");
@@ -2506,6 +2701,8 @@ int main(int argc, char* argv[]) {
         {"debug-mode-switch", no_argument,      0, 1002},
         {"debug-perf",       no_argument,       0, 1003},
         {"debug-frames",     no_argument,       0, 1004},
+        {"stun",             no_argument,       0, 1005},
+        {"stun-server",      required_argument, 0, 1006},
         {0, 0, 0, 0}
     };
 
@@ -2551,6 +2748,13 @@ int main(int argc, char* argv[]) {
             case 1004:
                 g_debug_frames = true;
                 break;
+            case 1005:
+                g_enable_stun = true;
+                break;
+            case 1006:
+                g_enable_stun = true;
+                g_stun_server = optarg;
+                break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -2576,7 +2780,10 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "HTTP port:      %d\n", g_http_port);
     fprintf(stderr, "Signaling port: %d\n", g_signaling_port);
     fprintf(stderr, "Prefs file:     %s\n", g_prefs_path.c_str());
-    fprintf(stderr, "Video codec:    %s\n", g_server_codec == CodecType::H264 ? "H.264" : "PNG");
+    const char* codec_str = (g_server_codec == CodecType::H264) ? "H.264" :
+                            (g_server_codec == CodecType::AV1) ? "AV1" :
+                            (g_server_codec == CodecType::PNG) ? "PNG" : "RAW";
+    fprintf(stderr, "Video codec:    %s\n", codec_str);
     fprintf(stderr, "ROMs path:      %s\n", g_roms_path.c_str());
     fprintf(stderr, "Images path:    %s\n", g_images_path.c_str());
     if (g_target_emulator_pid > 0) {
@@ -2603,6 +2810,7 @@ int main(int argc, char* argv[]) {
 
     // Create encoders
     H264Encoder h264_encoder;
+    AV1Encoder av1_encoder;
     PNGEncoder png_encoder;
 
     // Auto-start emulator if enabled
@@ -2635,7 +2843,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
     }
 
-    video_loop(webrtc, h264_encoder, png_encoder);
+    video_loop(webrtc, h264_encoder, av1_encoder, png_encoder);
 
     // Stop emulator if we started it
     stop_emulator();

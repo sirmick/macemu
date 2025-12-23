@@ -43,6 +43,10 @@ static inline int eventfd(unsigned int initval, int flags) {
 }
 #endif
 
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+
 #ifdef __cplusplus
 #include <atomic>
 #define ATOMIC_UINT32 std::atomic<uint32_t>
@@ -135,17 +139,18 @@ typedef struct {
     uint32_t _reserved;          // Future use, alignment
 
     // Dirty rectangle for PNG optimization (computed by emulator)
-    // Updated atomically with each frame - represents changed region
-    ATOMIC_UINT32 dirty_x;       // X coordinate of dirty rect (0 for full frame)
-    ATOMIC_UINT32 dirty_y;       // Y coordinate of dirty rect
-    ATOMIC_UINT32 dirty_width;   // Width of dirty rect (0 = no changes, same as width = full frame)
-    ATOMIC_UINT32 dirty_height;  // Height of dirty rect
+    // Plain fields - synchronized by eventfd write/read
+    uint32_t dirty_x;            // X coordinate of dirty rect (0 for full frame)
+    uint32_t dirty_y;            // Y coordinate of dirty rect
+    uint32_t dirty_width;        // Width of dirty rect (0 = no changes, same as width = full frame)
+    uint32_t dirty_height;       // Height of dirty rect
 
-    // Triple buffer synchronization (lock-free)
-    ATOMIC_UINT32 write_index;   // Buffer emulator is writing to (0-2)
-    ATOMIC_UINT32 ready_index;   // Buffer ready for server to read (0-2)
-    ATOMIC_UINT64 frame_count;   // Total frames completed (monotonic)
-    ATOMIC_UINT64 timestamp_us;  // Timestamp of last completed frame (microseconds)
+    // Triple buffer synchronization
+    // Plain fields - synchronized by eventfd (kernel provides memory barriers)
+    uint32_t write_index;        // Buffer emulator is writing to (0-2)
+    uint32_t ready_index;        // Buffer ready for server to read (0-2)
+    uint64_t frame_count;        // Total frames completed (monotonic, for stats only)
+    uint64_t timestamp_us;       // Timestamp of last completed frame (microseconds)
 
     // Latency stats (written by emulator, read by server)
     // Updated every stats interval (~3 seconds)
@@ -273,43 +278,35 @@ static inline int macemu_get_bgra_stride(void) {
 
 // Get pointer to the frame currently being written by emulator
 static inline uint8_t* macemu_get_write_frame(MacEmuVideoBuffer* buf) {
-    uint32_t idx = ATOMIC_LOAD(buf->write_index);
-    return macemu_get_frame_ptr(buf, idx);
+    return macemu_get_frame_ptr(buf, buf->write_index);
 }
 
 // Get pointer to the most recently completed frame (for server to read)
 static inline uint8_t* macemu_get_ready_frame(MacEmuVideoBuffer* buf) {
-    uint32_t idx = ATOMIC_LOAD(buf->ready_index);
-    return macemu_get_frame_ptr(buf, idx);
+    return macemu_get_frame_ptr(buf, buf->ready_index);
 }
 
 // Get BGRA frame pointer for the ready frame (server use)
 static inline uint8_t* macemu_get_ready_bgra(MacEmuVideoBuffer* buf) {
-    uint32_t idx = ATOMIC_LOAD(buf->ready_index);
-    return macemu_get_frame_ptr(buf, idx);
+    return macemu_get_frame_ptr(buf, buf->ready_index);
 }
 
-// Called by emulator after frame is complete - swaps buffers atomically
+// Called by emulator after frame is complete - publishes frame via eventfd
 static inline void macemu_frame_complete(MacEmuVideoBuffer* buf, uint64_t timestamp_us) {
-    uint32_t current = ATOMIC_LOAD(buf->write_index);
+    uint32_t current = buf->write_index;
     uint32_t next = (current + 1) % MACEMU_NUM_BUFFERS;
 
-    // Update timestamp before making frame visible
-    ATOMIC_STORE(buf->timestamp_us, timestamp_us);
-
-    // Mark current buffer as ready for reading
-    ATOMIC_STORE(buf->ready_index, current);
-
-    // Move to next buffer for writing
-    ATOMIC_STORE(buf->write_index, next);
-
-    // Increment frame count (server can use this to detect new frames)
-    ATOMIC_FETCH_ADD(buf->frame_count, 1);
+    // Write all metadata (plain writes - eventfd provides memory barrier)
+    buf->timestamp_us = timestamp_us;
+    buf->ready_index = current;
+    buf->write_index = next;
+    buf->frame_count++;
 
     // NOTE: Ping t4 handling moved to video_ipc.cpp's update_ping_on_frame_complete()
     // This keeps the inline function simple and allows emulator to track echo state
 
-    // Signal eventfd to wake up server immediately (low-latency notification)
+    // Signal eventfd to wake up server (kernel write() provides memory barrier)
+    // All writes above are guaranteed visible after server's read(eventfd)
     if (buf->frame_ready_eventfd >= 0) {
         uint64_t val = 1;
         (void)write(buf->frame_ready_eventfd, &val, sizeof(val));
@@ -326,26 +323,35 @@ static inline void macemu_init_video_buffer(MacEmuVideoBuffer* buf, uint32_t pid
     buf->width = width;
     buf->height = height;
     buf->pixel_format = MACEMU_PIXFMT_BGRA;  // Default, emulator sets per-frame
-    ATOMIC_STORE(buf->write_index, 0);
-    ATOMIC_STORE(buf->ready_index, 0);
-    ATOMIC_STORE(buf->dirty_x, 0);
-    ATOMIC_STORE(buf->dirty_y, 0);
-    ATOMIC_STORE(buf->dirty_width, width);   // Full frame initially
-    ATOMIC_STORE(buf->dirty_height, height);
+
+    // Plain initialization - synchronized by eventfd
+    buf->write_index = 0;
+    buf->ready_index = 0;
+    buf->dirty_x = 0;
+    buf->dirty_y = 0;
+    buf->dirty_width = width;   // Full frame initially
+    buf->dirty_height = height;
+    buf->frame_count = 0;
+    buf->timestamp_us = 0;
+
+    // Stats (can still use atomics for thread-safe updates from stats thread if needed)
     ATOMIC_STORE(buf->mouse_latency_avg_ms, 0);
     ATOMIC_STORE(buf->mouse_latency_samples, 0);
+
     // Initialize ping tracking (timestamp struct doesn't need atomics, just zero it)
     buf->ping_timestamps.t1_browser_ms = 0;
     buf->ping_timestamps.t2_server_us = 0;
     buf->ping_timestamps.t3_emulator_us = 0;
     buf->ping_timestamps.t4_frame_us = 0;
     ATOMIC_STORE(buf->ping_sequence, 0);  // Only seq number is atomic
-    ATOMIC_STORE(buf->frame_count, 0);
-    ATOMIC_STORE(buf->timestamp_us, 0);
 
-    // Create eventfd for frame ready notification (low-latency event-driven sync)
+    // Create eventfd for frame ready notification (REQUIRED - no polling fallback)
     // EFD_NONBLOCK: reads won't block if no data, EFD_SEMAPHORE: read returns 1 per event
     buf->frame_ready_eventfd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
+    if (buf->frame_ready_eventfd < 0) {
+        fprintf(stderr, "IPC: FATAL: Failed to create eventfd: %s\n", strerror(errno));
+        // Caller must check for -1 and handle error
+    }
 }
 
 // Validate video buffer (called by server on connect)
