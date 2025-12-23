@@ -47,6 +47,7 @@
 #include <pwd.h>
 #include <poll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -1032,20 +1033,14 @@ public:
         if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
             fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEADDR: %s\n", strerror(errno));
         }
+#ifdef SO_REUSEPORT
+        if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+            fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEPORT: %s\n", strerror(errno));
+        }
+#endif
 
-        int flags = fcntl(server_fd_, F_GETFL, 0);
-        if (flags < 0) {
-            fprintf(stderr, "HTTP: Failed to get socket flags: %s\n", strerror(errno));
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
-        if (fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-            fprintf(stderr, "HTTP: Failed to set non-blocking mode: %s\n", strerror(errno));
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
+        // Keep server socket BLOCKING - poll() handles the waiting
+        // Non-blocking accept() can cause race conditions with connection drops
 
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
@@ -1059,7 +1054,7 @@ public:
             return false;
         }
 
-        if (listen(server_fd_, 10) < 0) {
+        if (listen(server_fd_, 128) < 0) {
             fprintf(stderr, "HTTP: Failed to listen\n");
             close(server_fd_);
             server_fd_ = -1;
@@ -1099,11 +1094,23 @@ private:
             int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             if (client_fd < 0) continue;
 
-            // Handle client in separate thread for concurrent connections
-            std::thread([this, client_fd]() {
-                handle_client(client_fd);
-                close(client_fd);
-            }).detach();
+            // Set socket options for reliable handling
+            struct timeval tv;
+            tv.tv_sec = 5;  // 5 second timeout
+            tv.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            // Disable Nagle's algorithm for immediate sends
+            int flag = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+            // Handle client synchronously (simple and reliable)
+            handle_client(client_fd);
+
+            // Ensure clean shutdown
+            shutdown(client_fd, SHUT_RDWR);
+            close(client_fd);
         }
     }
 
