@@ -750,7 +750,8 @@ static std::vector<FileInfo> scan_directory(const std::string& directory,
 
 static std::string get_storage_json() {
     auto roms = scan_directory(g_roms_path, {".rom"}, true, true);
-    auto disks = scan_directory(g_images_path, {".img", ".dsk", ".hfv", ".iso", ".toast"});
+    auto disks = scan_directory(g_images_path, {".img", ".dsk", ".hfv", ".toast"});
+    auto cdroms = scan_directory(g_images_path, {".iso"});
 
     std::ostringstream json;
     json << "{\n";
@@ -769,6 +770,12 @@ static std::string get_storage_json() {
     for (size_t i = 0; i < disks.size(); i++) {
         if (i > 0) json << ", ";
         json << "{\"name\": \"" << json_escape(disks[i].name) << "\", \"size\": " << disks[i].size << "}";
+    }
+    json << "],\n";
+    json << "  \"cdroms\": [";
+    for (size_t i = 0; i < cdroms.size(); i++) {
+        if (i > 0) json << ", ";
+        json << "{\"name\": \"" << json_escape(cdroms[i].name) << "\", \"size\": " << cdroms[i].size << "}";
     }
     json << "]\n";
     json << "}";

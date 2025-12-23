@@ -1974,6 +1974,9 @@ rom {{ROM_PATH}}
 # Disk images
 {{DISK_LINES}}
 
+# CD-ROM images
+{{CDROM_LINES}}
+
 # Hardware settings
 ramsize {{RAM_BYTES}}
 screen ipc/{{SCREEN_W}}/{{SCREEN_H}}
@@ -2048,6 +2051,7 @@ function parsePrefsFile(content) {
     const config = {
         rom: '',
         disks: [],
+        cdroms: [],
         ram: 32,
         screen: '800x600',
         webcodec: 'png',
@@ -2081,6 +2085,10 @@ function parsePrefsFile(content) {
             case 'disk':
                 // Store path relative to imagesPath
                 config.disks.push(value.replace(/^storage\/images\//, ''));
+                break;
+            case 'cdrom':
+                // Store path relative to imagesPath
+                config.cdroms.push(value.replace(/^storage\/images\//, ''));
                 break;
             case 'ramsize':
                 config.ram = Math.round(parseInt(value) / (1024 * 1024));
@@ -2121,6 +2129,7 @@ function generatePrefsFile(config, romsPath, imagesPath) {
     // Get absolute paths (server provides base paths)
     const romPath = config.rom ? `${romsPath}/${config.rom}` : '';
     const diskLines = config.disks.map(d => `disk ${imagesPath}/${d}`).join('\n');
+    const cdromLines = config.cdroms.map(d => `cdrom ${imagesPath}/${d}`).join('\n');
 
     // Parse screen resolution
     const screenMatch = config.screen.match(/(\d+)x(\d+)/);
@@ -2131,6 +2140,7 @@ function generatePrefsFile(config, romsPath, imagesPath) {
     let prefs = PREFS_TEMPLATE
         .replace('{{ROM_PATH}}', romPath)
         .replace('{{DISK_LINES}}', diskLines || '# No disk images configured')
+        .replace('{{CDROM_LINES}}', cdromLines || '# No CD-ROM images configured')
         .replace('{{RAM_BYTES}}', (config.ram * 1024 * 1024).toString())
         .replace('{{SCREEN_W}}', screenW)
         .replace('{{SCREEN_H}}', screenH)
@@ -2187,11 +2197,12 @@ async function openConfig() {
     if (modal) {
         modal.classList.add('open');
         storageCache = null; // Clear cache to refresh
-        // Load current config first so ROM/disk selections are correct
+        // Load current config first so ROM/disk/cdrom selections are correct
         await loadCurrentConfig();
-        // Then load the ROM and disk lists (can run in parallel)
+        // Then load the ROM, disk, and cdrom lists (can run in parallel)
         loadRomList();
         loadDiskList();
+        loadCdromList();
     }
 }
 
@@ -2296,6 +2307,41 @@ function updateDiskSelection() {
     currentConfig.disks = Array.from(checkboxes).map(cb => cb.value);
 }
 
+async function loadCdromList() {
+    const container = document.getElementById('cdrom-list');
+    if (!container) return;
+
+    try {
+        const data = await loadStorage();
+        if (!data) {
+            container.innerHTML = '<div class="empty-state">Failed to load storage</div>';
+            return;
+        }
+
+        if (data.cdroms && data.cdroms.length > 0) {
+            container.innerHTML = data.cdroms.map((cdrom, idx) => {
+                const checked = currentConfig.cdroms.includes(cdrom.name) ? 'checked' : '';
+                const sizeStr = cdrom.size ? ` (${(cdrom.size / 1024 / 1024).toFixed(1)} MB)` : '';
+                return `
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="cdrom-${idx}" value="${cdrom.name}" ${checked} onchange="updateCdromSelection()">
+                        <label for="cdrom-${idx}">${cdrom.name}${sizeStr}</label>
+                    </div>`;
+            }).join('');
+        } else {
+            container.innerHTML = '<div class="empty-state">No CD-ROM images (.iso) found in storage/images/</div>';
+        }
+    } catch (e) {
+        container.innerHTML = '<div class="empty-state">Failed to load CD-ROMs</div>';
+        logger.error('Failed to load cdrom list', { error: e.message });
+    }
+}
+
+function updateCdromSelection() {
+    const checkboxes = document.querySelectorAll('#cdrom-list input[type="checkbox"]:checked');
+    currentConfig.cdroms = Array.from(checkboxes).map(cb => cb.value);
+}
+
 function onRomChange() {
     const romName = document.getElementById('cfg-rom')?.value;
     if (!romName || !storageCache?.roms) return;
@@ -2360,6 +2406,11 @@ function updateConfigUI() {
     document.querySelectorAll('#disk-list input[type="checkbox"]').forEach(cb => {
         cb.checked = currentConfig.disks.includes(cb.value);
     });
+
+    // Update cdrom checkboxes
+    document.querySelectorAll('#cdrom-list input[type="checkbox"]').forEach(cb => {
+        cb.checked = currentConfig.cdroms.includes(cb.value);
+    });
 }
 
 async function saveConfig() {
@@ -2373,7 +2424,7 @@ async function saveConfig() {
     currentConfig.fpu = document.getElementById('cfg-fpu')?.checked ?? true;
     currentConfig.jit = document.getElementById('cfg-jit')?.checked ?? true;
     currentConfig.sound = document.getElementById('cfg-sound')?.checked ?? true;
-    // disks already updated via updateDiskSelection()
+    // disks and cdroms already updated via updateDiskSelection() and updateCdromSelection()
 
     // Generate prefs file content
     const prefsContent = generatePrefsFile(currentConfig, serverPaths.romsPath, serverPaths.imagesPath);
