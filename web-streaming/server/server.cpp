@@ -50,6 +50,9 @@
 #include <getopt.h>
 #include <libgen.h>
 
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+
 // Configuration
 static int g_http_port = 8000;
 static int g_signaling_port = 8090;
@@ -71,6 +74,7 @@ static pid_t g_emulator_pid = -1;
 static MacEmuVideoBuffer* g_video_shm = nullptr;
 static int g_video_shm_fd = -1;
 static int g_control_socket = -1;
+static int g_frame_ready_eventfd = -1;  // Server's copy of eventfd for frame notifications
 static std::string g_connected_shm_name;
 static std::string g_connected_socket_path;
 
@@ -212,6 +216,7 @@ static bool connect_to_video_shm(pid_t pid) {
                                             PROT_READ, MAP_SHARED,
                                             g_video_shm_fd, 0);
     if (g_video_shm == MAP_FAILED) {
+        fprintf(stderr, "IPC: Failed to map video SHM for PID %d: %s\n", pid, strerror(errno));
         close(g_video_shm_fd);
         g_video_shm_fd = -1;
         g_video_shm = nullptr;
@@ -281,6 +286,39 @@ static bool connect_to_control_socket(pid_t pid) {
     g_connected_socket_path = socket_path;
     g_emulator_connected = true;
     fprintf(stderr, "IPC: Connected to control socket '%s'\n", socket_path.c_str());
+
+    // Receive eventfd from emulator via SCM_RIGHTS for low-latency frame notification
+    // The emulator sends this immediately after accepting the connection
+    struct msghdr msg = {};
+    struct cmsghdr *cmsg;
+    char buf[CMSG_SPACE(sizeof(int))];
+    char data;
+    struct iovec iov = { &data, 1 };
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
+
+    // Try to receive the eventfd (with short timeout since it's sent immediately)
+    fcntl(g_control_socket, F_SETFL, flags & ~O_NONBLOCK);  // Temporarily blocking
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(g_control_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    ssize_t n = recvmsg(g_control_socket, &msg, 0);
+    if (n > 0 && data == 'E') {
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+                memcpy(&g_frame_ready_eventfd, CMSG_DATA(cmsg), sizeof(int));
+                fprintf(stderr, "IPC: Received eventfd %d from emulator for low-latency sync\n", g_frame_ready_eventfd);
+                break;
+            }
+        }
+    }
+
+    // Restore non-blocking mode
+    fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK);
+
     return true;
 }
 
@@ -288,6 +326,10 @@ static void disconnect_control_socket() {
     if (g_control_socket >= 0) {
         close(g_control_socket);
         g_control_socket = -1;
+    }
+    if (g_frame_ready_eventfd >= 0) {
+        close(g_frame_ready_eventfd);
+        g_frame_ready_eventfd = -1;
     }
     g_emulator_connected = false;
     g_connected_socket_path.clear();
@@ -337,6 +379,26 @@ static bool send_command(uint8_t command) {
     msg.hdr._reserved = 0;
     msg.command = command;
     memset(msg._reserved, 0, sizeof(msg._reserved));
+
+    return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
+}
+
+static bool send_ping_input(uint32_t sequence, uint64_t t1_browser_send_ms) {
+    if (g_control_socket < 0) return false;
+
+    // Add server receive timestamp (t2)
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t t2_server_recv_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+
+    MacEmuPingInput msg;
+    msg.hdr.type = MACEMU_INPUT_PING;
+    msg.hdr.flags = 0;
+    msg.hdr._reserved = 0;
+    msg.sequence = sequence;
+    msg.t1_browser_send_ms = t1_browser_send_ms;
+    msg.t2_server_recv_us = t2_server_recv_us;
+    msg.t3_emulator_recv_us = 0;  // Will be filled by emulator
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -413,12 +475,10 @@ static std::string find_emulator() {
         return "";
     }
 
-    // Look for emulator in current directory or relative paths
+    // Look for emulator in bin/ subdirectory only
     const char* candidates[] = {
-        "./BasiliskII",
-        "./SheepShaver",
-        "../BasiliskII/src/Unix/BasiliskII",
-        "../SheepShaver/src/Unix/SheepShaver",
+        "./bin/BasiliskII",
+        "./bin/SheepShaver",
         nullptr
     };
 
@@ -730,6 +790,98 @@ static std::string read_prefs_file() {
     std::stringstream buffer;
     buffer << file.rdbuf();
     return buffer.str();
+}
+
+// Create minimal prefs file if it doesn't exist
+// Based on template from client.js
+static void create_minimal_prefs_if_needed() {
+    // Check if file already exists
+    std::ifstream check(g_prefs_path);
+    if (check.good()) {
+        check.close();
+        return;  // File exists, nothing to do
+    }
+
+    fprintf(stderr, "Config: Creating minimal prefs file at %s\n", g_prefs_path.c_str());
+
+    // Minimal configuration template - matches client.js PREFS_TEMPLATE
+    const char* minimal_prefs =
+        "# Basilisk II preferences - minimal config for cold boot\n"
+        "\n"
+        "# ROM file (configure via web UI)\n"
+        "rom \n"
+        "\n"
+        "# Hardware settings\n"
+        "ramsize 33554432\n"  // 32 MB
+        "screen ipc/800/600\n"
+        "cpu 4\n"
+        "modelid 14\n"
+        "fpu true\n"
+        "jit true\n"
+        "nosound false\n"
+        "\n"
+        "# Video codec for web streaming (png or h264)\n"
+        "webcodec png\n"
+        "\n"
+        "# JIT settings\n"
+        "jitfpu true\n"
+        "jitcachesize 8192\n"
+        "jitlazyflush true\n"
+        "jitinline true\n"
+        "jitdebug false\n"
+        "\n"
+        "# Display settings\n"
+        "displaycolordepth 0\n"
+        "frameskip 0\n"
+        "scale_nearest false\n"
+        "scale_integer false\n"
+        "\n"
+        "# Input settings\n"
+        "keyboardtype 5\n"
+        "keycodes false\n"
+        "mousewheelmode 1\n"
+        "mousewheellines 3\n"
+        "swap_opt_cmd true\n"
+        "hotkey 0\n"
+        "\n"
+        "# Serial/Network\n"
+        "seriala /dev/null\n"
+        "serialb /dev/null\n"
+        "udptunnel false\n"
+        "udpport 6066\n"
+        "etherpermanentaddress true\n"
+        "ethermulticastmode 0\n"
+        "routerenabled false\n"
+        "ftp_port_list 21\n"
+        "\n"
+        "# Boot settings\n"
+        "bootdrive 0\n"
+        "bootdriver 0\n"
+        "nocdrom false\n"
+        "\n"
+        "# System settings\n"
+        "ignoresegv true\n"
+        "idlewait true\n"
+        "noclipconversion false\n"
+        "nogui true\n"
+        "sound_buffer 0\n"
+        "name_encoding 0\n"
+        "delay 0\n"
+        "init_grab false\n"
+        "yearofs 0\n"
+        "dayofs 0\n"
+        "reservewindowskey false\n"
+        "\n"
+        "# ExtFS settings\n"
+        "enableextfs false\n"
+        "debugextfs false\n"
+        "extfs ./storage\n"
+        "extdrives CDEFGHIJKLMNOPQRSTUVWXYZ\n"
+        "pollmedia true\n";
+
+    if (!write_prefs_file(minimal_prefs)) {
+        fprintf(stderr, "Config: Failed to create minimal prefs file\n");
+    }
 }
 
 // Read webcodec preference from prefs file
@@ -1188,20 +1340,132 @@ public:
         }
     }
 
-    // Send PNG frame via DataChannel (binary) with timestamp header for latency measurement
-    // Frame format: [8-byte timestamp_ms (little-endian)] [PNG data]
-    void send_png_frame(const std::vector<uint8_t>& data, uint64_t timestamp_ms) {
+    // Send PNG frame via DataChannel (binary) with metadata header
+    // Frame format: [8-byte t1_frame_ready] [4-byte x] [4-byte y] [4-byte width] [4-byte height]
+    //               [4-byte frame_width] [4-byte frame_height] [8-byte t4_send_time]
+    //               [4-byte ping_seq] [8-byte ping_t1] [8-byte ping_t2] [8-byte ping_t3]
+    //               [8-byte ping_t4] [8-byte ping_t5] [PNG data]
+    //   All values are little-endian uint32/uint64
+    //   t1_frame_ready = emulator frame completion time (from SHM)
+    //   t4_send_time = server send time (captured here)
+    //   x, y, width, height = dirty rect position and size
+    //   frame_width, frame_height = full screen resolution
+    //   ping_* = complete ping roundtrip with timestamps at each layer (0 if no ping)
+    void send_png_frame(const std::vector<uint8_t>& data, uint64_t t1_frame_ready_ms,
+                        uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                        uint32_t frame_width, uint32_t frame_height) {
         if (data.empty() || peer_count_ == 0) return;
 
-        // Build frame with timestamp header
-        std::vector<uint8_t> frame_with_header(8 + data.size());
-
-        // 8-byte little-endian timestamp
-        for (int i = 0; i < 8; i++) {
-            frame_with_header[i] = (timestamp_ms >> (i * 8)) & 0xFF;
+        // Sanity check: PNG data shouldn't be larger than 10MB for 1920x1080
+        if (data.size() > 10 * 1024 * 1024) {
+            fprintf(stderr, "[WebRTC] ERROR: PNG data size %zu is too large, skipping frame\n", data.size());
+            return;
         }
-        // Copy PNG data
-        memcpy(frame_with_header.data() + 8, data.data(), data.size());
+
+        // T4: Capture timestamp right before sending (Unix epoch milliseconds)
+        // Use time() * 1000 + microseconds to get accurate Unix epoch timestamp
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t t4_send_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+        // Read ping echo from SHM (emulator stores last received ping with all timestamps)
+        // OPTIMIZED: Only ping_sequence is atomic - acts as "ready" flag
+        // Read-acquire on ping_sequence ensures all timestamp writes are visible
+        uint32_t ping_seq = 0;
+        uint64_t ping_t1_browser_ms = 0;
+        uint64_t ping_t2_server_us = 0;
+        uint64_t ping_t3_emulator_us = 0;
+        uint64_t ping_t4_frame_ready_us = 0;
+        if (g_video_shm) {
+            // Atomic read-acquire: ensures visibility of all previous writes to ping_timestamps
+            ping_seq = ATOMIC_LOAD(g_video_shm->ping_sequence);
+
+            // If ping available, read timestamp struct (no atomics needed - seq acts as guard)
+            if (ping_seq > 0) {
+                ping_t1_browser_ms = g_video_shm->ping_timestamps.t1_browser_ms;
+                ping_t2_server_us = g_video_shm->ping_timestamps.t2_server_us;
+                ping_t3_emulator_us = g_video_shm->ping_timestamps.t3_emulator_us;
+                ping_t4_frame_ready_us = g_video_shm->ping_timestamps.t4_frame_us;
+
+                fprintf(stderr, "[Server] Ping #%u echo: t1=%.1fms t2=%lluμs t3=%lluμs t4=%s\n",
+                        ping_seq,
+                        ping_t1_browser_ms / 1000.0,
+                        (unsigned long long)ping_t2_server_us,
+                        (unsigned long long)ping_t3_emulator_us,
+                        ping_t4_frame_ready_us > 0 ? "set" : "NOT SET");
+            }
+        }
+        // t5 is server send time (same as t4_send_ms from frame metadata)
+        uint64_t ping_t5_server_send_us = t4_send_ms * 1000;  // Convert ms to us
+
+        // Build frame with metadata header (84 bytes total: 40 base + 44 ping)
+        std::vector<uint8_t> frame_with_header;
+        try {
+            frame_with_header.resize(84 + data.size());
+        } catch (const std::bad_alloc& e) {
+            fprintf(stderr, "[WebRTC] ERROR: Failed to allocate %zu bytes for frame header\n", 84 + data.size());
+            return;
+        }
+
+        // T1: 8-byte emulator frame ready time (from SHM)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[i] = (t1_frame_ready_ms >> (i * 8)) & 0xFF;
+        }
+        // 4-byte x coordinate (dirty rect)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[8 + i] = (x >> (i * 8)) & 0xFF;
+        }
+        // 4-byte y coordinate (dirty rect)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[12 + i] = (y >> (i * 8)) & 0xFF;
+        }
+        // 4-byte width (dirty rect)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[16 + i] = (width >> (i * 8)) & 0xFF;
+        }
+        // 4-byte height (dirty rect)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[20 + i] = (height >> (i * 8)) & 0xFF;
+        }
+        // 4-byte frame width (full resolution)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[24 + i] = (frame_width >> (i * 8)) & 0xFF;
+        }
+        // 4-byte frame height (full resolution)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[28 + i] = (frame_height >> (i * 8)) & 0xFF;
+        }
+        // T4: 8-byte server send time
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[32 + i] = (t4_send_ms >> (i * 8)) & 0xFF;
+        }
+        // Ping echo with all timestamps (44 bytes: sequence + 5 timestamps)
+        // 4-byte ping sequence number (0 if no ping received)
+        for (int i = 0; i < 4; i++) {
+            frame_with_header[40 + i] = (ping_seq >> (i * 8)) & 0xFF;
+        }
+        // 8-byte t1: browser send time (performance.now() milliseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[44 + i] = (ping_t1_browser_ms >> (i * 8)) & 0xFF;
+        }
+        // 8-byte t2: server receive time (CLOCK_REALTIME microseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[52 + i] = (ping_t2_server_us >> (i * 8)) & 0xFF;
+        }
+        // 8-byte t3: emulator receive time (CLOCK_REALTIME microseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[60 + i] = (ping_t3_emulator_us >> (i * 8)) & 0xFF;
+        }
+        // 8-byte t4: emulator/frame ready time (CLOCK_REALTIME microseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[68 + i] = (ping_t4_frame_ready_us >> (i * 8)) & 0xFF;
+        }
+        // 8-byte t5: server send time (CLOCK_REALTIME microseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[76 + i] = (ping_t5_server_send_us >> (i * 8)) & 0xFF;
+        }
+        // Copy PNG data after 84-byte header
+        memcpy(frame_with_header.data() + 84, data.data(), data.size());
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
@@ -1532,6 +1796,20 @@ private:
                 }
                 break;
             }
+            case 'P': {
+                // Ping: P sequence,timestamp
+                uint32_t sequence = 0;
+                double ts = 0;
+                if (sscanf(args, "%u,%lf", &sequence, &ts) == 2) {
+                    uint64_t timestamp_ms = static_cast<uint64_t>(ts);
+                    bool success = send_ping_input(sequence, timestamp_ms);
+                    fprintf(stderr, "[Server] Ping #%u (t1=%.1fms) forwarded to emulator: %s\n",
+                            sequence, ts, success ? "OK" : "FAILED");
+                } else {
+                    fprintf(stderr, "[Server] ERROR: Failed to parse ping message: '%s'\n", args);
+                }
+                break;
+            }
         }
     }
 
@@ -1563,6 +1841,14 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
 
     // Track input counts between stats intervals
     uint64_t last_mouse_move = 0;
+
+    // Create epoll instance for low-latency event notification
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        fprintf(stderr, "Video: Failed to create epoll: %s (falling back to polling)\n", strerror(errno));
+        epoll_fd = -1;
+    }
+    int current_eventfd = -1;  // Track which eventfd is registered
 
     fprintf(stderr, "Video: Starting frame processing loop\n");
 
@@ -1643,9 +1929,45 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             continue;
         }
 
+        // Register eventfd with epoll if we just connected to emulator
+        if (epoll_fd >= 0 && g_frame_ready_eventfd >= 0 &&
+            current_eventfd != g_frame_ready_eventfd) {
+
+            // Remove old eventfd if any
+            if (current_eventfd >= 0) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
+            }
+
+            // Add new eventfd
+            struct epoll_event ev;
+            ev.events = EPOLLIN;
+            ev.data.fd = g_frame_ready_eventfd;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_frame_ready_eventfd, &ev) == 0) {
+                current_eventfd = g_frame_ready_eventfd;
+                fprintf(stderr, "Video: Using epoll with eventfd %d for low-latency frame notification\n", current_eventfd);
+            } else {
+                fprintf(stderr, "Video: Failed to add eventfd %d to epoll: %s\n",
+                        g_frame_ready_eventfd, strerror(errno));
+            }
+        }
+
         // Check for new frame
         uint64_t current_count = ATOMIC_LOAD(g_video_shm->frame_count);
         if (current_count == last_frame_count) {
+            // Use epoll for low-latency notification if available
+            if (epoll_fd >= 0 && current_eventfd >= 0) {
+                struct epoll_event events[1];
+                // Wait up to 5ms for frame ready event
+                int n = epoll_wait(epoll_fd, events, 1, 5);
+                if (n > 0) {
+                    // Consume the eventfd value (required for semaphore mode)
+                    uint64_t val;
+                    ssize_t ret = read(current_eventfd, &val, sizeof(val));
+                    (void)ret;  // Suppress unused warning
+                }
+                continue;
+            }
+            // Fallback to polling if epoll not available
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
@@ -1653,9 +1975,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
 
         // Latency measurement: time from emulator frame completion to now
         uint64_t frame_timestamp_us = ATOMIC_LOAD(g_video_shm->timestamp_us);
-        auto server_now = std::chrono::steady_clock::now();
-        uint64_t server_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            server_now.time_since_epoch()).count();
+
+        // Use CLOCK_REALTIME to match the emulator's timestamp (both in same clock domain)
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t server_now_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
         // Read frame dimensions
         uint32_t width = g_video_shm->width;
@@ -1671,7 +1995,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         int stride = macemu_get_bgra_stride();
 
         // Check if keyframe requested (new peer connected)
-        if (g_request_keyframe.exchange(false)) {
+        bool keyframe_requested = g_request_keyframe.exchange(false);
+        if (keyframe_requested) {
             h264_encoder.request_keyframe();
         }
 
@@ -1685,18 +2010,49 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             }
         }
 
-        // Encode and send to PNG peers (with timestamp for latency measurement)
+        // Encode and send to PNG peers using dirty rects from emulator
         if (webrtc.has_codec_peer(CodecType::PNG)) {
-            EncodedFrame frame = png_encoder.encode_bgra(frame_data, width, height, stride);
-            if (!frame.data.empty()) {
-                // Generate synchronized timestamp for browser latency measurement
-                // Uses same epoch scheme as mouse input (browser syncs on first message)
-                uint64_t frame_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    server_now.time_since_epoch()).count();
+            // Read dirty rect from SHM (computed by emulator during frame conversion)
+            uint32_t dirty_x = ATOMIC_LOAD(g_video_shm->dirty_x);
+            uint32_t dirty_y = ATOMIC_LOAD(g_video_shm->dirty_y);
+            uint32_t dirty_width = ATOMIC_LOAD(g_video_shm->dirty_width);
+            uint32_t dirty_height = ATOMIC_LOAD(g_video_shm->dirty_height);
 
-                webrtc.send_png_frame(frame.data, frame_timestamp_ms);
-                frames_encoded++;
+            // Force full frame if keyframe requested (new peer connected)
+            if (keyframe_requested) {
+                dirty_x = 0;
+                dirty_y = 0;
+                dirty_width = width;
+                dirty_height = height;
             }
+
+            // Only encode if there are changes (dirty_width > 0)
+            // Ping echoes are carried in the frame metadata header of any frame being sent
+            if (dirty_width > 0 && dirty_height > 0) {
+                EncodedFrame frame;
+
+                // Check if this is a full frame or dirty rect
+                if (dirty_x == 0 && dirty_y == 0 && dirty_width == width && dirty_height == height) {
+                    // Full frame
+                    frame = png_encoder.encode_bgra(frame_data, width, height, stride);
+                } else {
+                    // Dirty rectangle only
+                    frame = png_encoder.encode_bgra_rect(frame_data, width, height, stride,
+                                                         dirty_x, dirty_y, dirty_width, dirty_height);
+                }
+
+                if (!frame.data.empty()) {
+                    // T1: Frame ready time from emulator (convert from microseconds to milliseconds)
+                    uint64_t t1_frame_ready_ms = frame_timestamp_us / 1000;
+
+                    // Send PNG with dirty rect metadata, full frame resolution, and timestamps
+                    webrtc.send_png_frame(frame.data, t1_frame_ready_ms,
+                                          dirty_x, dirty_y, dirty_width, dirty_height,
+                                          width, height);
+                    frames_encoded++;
+                }
+            }
+            // else: no changes (dirty_width == 0), skip encoding
         }
         auto encode_end = std::chrono::steady_clock::now();
 
@@ -1729,12 +2085,12 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             float avg_shm_ms = latency_samples > 0 ? (total_shm_latency_us / latency_samples) / 1000.0f : 0;
             float avg_encode_ms = latency_samples > 0 ? (total_encode_latency_us / latency_samples) / 1000.0f : 0;
 
-            fprintf(stderr, "[Server] fps=%.1f peers=%d emu=%s pid=%d | video: shm=%.1fms enc=%.1fms | mouse=%.0f/s\n",
+            fprintf(stderr, "[Server] fps=%.1f peers=%d | video: shm=%.1fms enc=%.1fms | mouse: rate=%.0f/s | emu=%s pid=%d\n",
                     fps, webrtc.peer_count(),
-                    g_emulator_connected ? "connected" : "scanning",
-                    g_emulator_pid,
                     avg_shm_ms, avg_encode_ms,
-                    mouse_rate);
+                    mouse_rate,
+                    g_emulator_connected ? "connected" : "scanning",
+                    g_emulator_pid);
 
             // Reset latency counters
             total_shm_latency_us = 0;
@@ -1773,6 +2129,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         }
     }
 
+    // Clean up epoll
+    if (epoll_fd >= 0) {
+        close(epoll_fd);
+    }
+
     fprintf(stderr, "Video: Exiting frame processing loop\n");
 }
 
@@ -1798,10 +2159,10 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  - Emulator creates socket at /tmp/macemu-{PID}.sock\n");
     fprintf(stderr, "  - Server connects to emulator resources by PID\n");
     fprintf(stderr, "  - Use --pid to connect to a specific running emulator\n");
-    fprintf(stderr, "\nThe server will look for emulators in this order:\n");
-    fprintf(stderr, "  1. Path specified by --emulator\n");
-    fprintf(stderr, "  2. ./BasiliskII or ./SheepShaver in current directory\n");
-    fprintf(stderr, "  3. ../BasiliskII/src/Unix/BasiliskII\n");
+    fprintf(stderr, "\nEmulator Discovery:\n");
+    fprintf(stderr, "  Server looks for ./bin/BasiliskII or ./bin/SheepShaver.\n");
+    fprintf(stderr, "  Create a symlink if needed:\n");
+    fprintf(stderr, "    mkdir -p bin && ln -s ../../BasiliskII/src/Unix/BasiliskII ./bin/BasiliskII\n");
 }
 
 
@@ -1869,6 +2230,9 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
+    // Create minimal prefs file if it doesn't exist (for cold boot)
+    create_minimal_prefs_if_needed();
+
     // Read codec preference from prefs file
     read_webcodec_pref();
 
@@ -1914,8 +2278,20 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "Emulator started, waiting for IPC resources...\n\n");
             }
         } else {
-            fprintf(stderr, "No emulator found. Use --emulator PATH or place BasiliskII in current directory.\n");
-            fprintf(stderr, "Scanning for running emulators...\n\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "ERROR: No emulator found!\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "Please create a symlink in the bin/ directory:\n");
+            fprintf(stderr, "  mkdir -p bin\n");
+            fprintf(stderr, "  ln -s ../../BasiliskII/src/Unix/BasiliskII ./bin/BasiliskII\n");
+            fprintf(stderr, "  or\n");
+            fprintf(stderr, "  ln -s ../../SheepShaver/src/Unix/SheepShaver ./bin/SheepShaver\n");
+            fprintf(stderr, "\n");
+            fprintf(stderr, "Alternatively, use --emulator PATH to specify the executable.\n");
+            fprintf(stderr, "\n");
+            webrtc.shutdown();
+            http_server.stop();
+            return 1;
         }
     } else if (g_target_emulator_pid > 0) {
         fprintf(stderr, "Waiting to connect to emulator PID %d...\n\n", g_target_emulator_pid);

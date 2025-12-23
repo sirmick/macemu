@@ -118,6 +118,10 @@ static MacEmuVideoBuffer* video_shm = nullptr;
 static std::string shm_name;
 static std::string socket_path;
 
+// Ping tracking - NOT in shared memory, purely emulator-side state
+static uint32_t last_echoed_ping_seq = 0;  // Last ping seq we've set t4 for
+static uint32_t ping_echo_frames_remaining = 0;  // How many more frames to echo this ping (0 = no echo)
+
 // Control socket thread
 static std::thread control_thread;
 static std::atomic<bool> control_thread_running(false);
@@ -349,6 +353,65 @@ static void process_binary_input(const uint8_t* data, size_t len) {
             }
             break;
         }
+        case MACEMU_INPUT_PING: {
+            if (len < sizeof(MacEmuPingInput)) return;
+            const MacEmuPingInput* ping = (const MacEmuPingInput*)data;
+
+            // Add emulator receive timestamp (t3)
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            uint64_t t3_emulator_recv_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+
+            // OPTIMIZED: Write timestamps to regular struct, then publish with atomic seq write
+            // Memory ordering: write-release ensures all timestamp writes visible when server reads seq
+            if (video_shm) {
+                video_shm->ping_timestamps.t1_browser_ms = ping->t1_browser_send_ms;
+                video_shm->ping_timestamps.t2_server_us = ping->t2_server_recv_us;
+                video_shm->ping_timestamps.t3_emulator_us = t3_emulator_recv_us;
+                video_shm->ping_timestamps.t4_frame_us = 0;  // Clear t4, will be set by next frame
+
+                // Atomic write-release: publishes all above writes to any thread doing atomic read-acquire
+                ATOMIC_STORE(video_shm->ping_sequence, ping->sequence);
+
+                fprintf(stderr, "[Emulator] Ping #%u received (t1=%.1fms t2=%lluμs t3=%lluμs) - waiting for next frame\n",
+                        ping->sequence,
+                        ping->t1_browser_send_ms / 1000.0,
+                        (unsigned long long)ping->t2_server_recv_us,
+                        (unsigned long long)t3_emulator_recv_us);
+            }
+            break;
+        }
+    }
+}
+
+
+/*
+ *  Update ping timestamp on frame completion
+ *  Called after each frame is complete to check if we should set t4 for a waiting ping
+ */
+static void update_ping_on_frame_complete(uint64_t timestamp_us) {
+    if (!video_shm) return;
+
+    // Read current ping sequence (atomic read-acquire ensures we see all timestamp writes)
+    uint32_t current_ping_seq = ATOMIC_LOAD(video_shm->ping_sequence);
+
+    // Check if this is a NEW ping that we haven't echoed yet
+    if (current_ping_seq > last_echoed_ping_seq) {
+        // Set t4 timestamp (when frame completed after ping arrived)
+        video_shm->ping_timestamps.t4_frame_us = timestamp_us;
+
+        // Update our tracking state
+        last_echoed_ping_seq = current_ping_seq;
+        ping_echo_frames_remaining = 5;  // Echo in next 5 frames
+
+        fprintf(stderr, "[Emulator] Ping #%u complete: set t4=%lluμs (will echo in next 5 frames)\n",
+                current_ping_seq, (unsigned long long)timestamp_us);
+    } else if (ping_echo_frames_remaining > 0) {
+        // Still echoing previous ping
+        ping_echo_frames_remaining--;
+        if (ping_echo_frames_remaining == 0) {
+            fprintf(stderr, "[Emulator] Ping #%u echo finished (sent in 5 frames)\n", last_echoed_ping_seq);
+        }
     }
 }
 
@@ -375,6 +438,33 @@ static void control_socket_thread() {
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK);
                 control_socket = fd;
                 fprintf(stderr, "IPC: Server connected\n");
+
+                // Send eventfd to server via SCM_RIGHTS for low-latency notification
+                if (video_shm && video_shm->frame_ready_eventfd >= 0) {
+                    struct msghdr msg = {};
+                    struct cmsghdr *cmsg;
+                    char buf[CMSG_SPACE(sizeof(int))];
+                    char data = 'E';  // 'E' for eventfd
+                    struct iovec iov = { &data, 1 };
+
+                    msg.msg_iov = &iov;
+                    msg.msg_iovlen = 1;
+                    msg.msg_control = buf;
+                    msg.msg_controllen = sizeof(buf);
+
+                    cmsg = CMSG_FIRSTHDR(&msg);
+                    cmsg->cmsg_level = SOL_SOCKET;
+                    cmsg->cmsg_type = SCM_RIGHTS;
+                    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+                    memcpy(CMSG_DATA(cmsg), &video_shm->frame_ready_eventfd, sizeof(int));
+
+                    if (sendmsg(control_socket, &msg, 0) > 0) {
+                        fprintf(stderr, "IPC: Sent eventfd %d to server for low-latency sync\n",
+                                video_shm->frame_ready_eventfd);
+                    } else {
+                        fprintf(stderr, "IPC: Failed to send eventfd: %s\n", strerror(errno));
+                    }
+                }
             }
         }
 
@@ -393,6 +483,7 @@ static void control_socket_thread() {
                         case MACEMU_INPUT_KEY:     msg_size = sizeof(MacEmuKeyInput); break;
                         case MACEMU_INPUT_MOUSE:   msg_size = sizeof(MacEmuMouseInput); break;
                         case MACEMU_INPUT_COMMAND: msg_size = sizeof(MacEmuCommandInput); break;
+                        case MACEMU_INPUT_PING:    msg_size = sizeof(MacEmuPingInput); break;
                         default: msg_size = sizeof(MacEmuInputHeader); break;
                     }
                     if (offset + msg_size > (size_t)n) break;
@@ -532,11 +623,102 @@ static void convert_frame_to_bgra() {
             break;
     }
 
+    // Compute dirty rectangle by comparing with previous frame (triple buffering)
+    // write_idx (already loaded above) = buffer we just wrote to
+    // ready_index = buffer server is reading (frame N-1)
+    // prev_index  = the third buffer (frame N-2), our comparison baseline
+    uint32_t ready_idx = ATOMIC_LOAD(video_shm->ready_index);
+
+    // On first few frames, indices might be the same - always send full frame
+    // Once triple buffering is active, all 3 indices will be different
+    bool can_compare = (write_idx != ready_idx);
+    uint32_t prev_idx = 0;
+    if (can_compare) {
+        prev_idx = 3 - write_idx - ready_idx;  // The third buffer (0+1+2=3)
+        // Validate prev_idx is in bounds
+        if (prev_idx >= MACEMU_NUM_BUFFERS) {
+            can_compare = false;  // Safety check
+        }
+    }
+
+    uint8_t* curr_frame = dst_frame;  // Frame we just converted
+    uint8_t* prev_frame = can_compare ? macemu_get_frame_ptr(video_shm, prev_idx) : nullptr;
+
+    // Find bounding box of changed pixels
+    // Check every pixel for accuracy (still fast - uses uint32 comparison)
+    uint32_t min_x = width, max_x = 0;
+    uint32_t min_y = height, max_y = 0;
+    bool found_change = false;
+
+    // Only compare if we have a valid previous frame
+    if (prev_frame) {
+        // Check every row from top and bottom to find vertical bounds quickly
+        for (uint32_t y = 0; y < height; y++) {
+            const uint32_t* curr_row = (const uint32_t*)(curr_frame + y * dst_stride);
+            const uint32_t* prev_row = (const uint32_t*)(prev_frame + y * dst_stride);
+
+            // Check if this row has any changes
+            bool row_changed = false;
+            for (uint32_t x = 0; x < width; x++) {
+                if (curr_row[x] != prev_row[x]) {
+                    row_changed = true;
+                    if (!found_change) {
+                        found_change = true;
+                        min_y = y;
+                    }
+                    max_y = y;
+                    if (x < min_x) min_x = x;
+                    if (x > max_x) max_x = x;
+                }
+            }
+        }
+    }
+
+    // Store dirty rect in SHM for server to read
+    if (!prev_frame) {
+        // First frame or can't compare - send full frame
+        ATOMIC_STORE(video_shm->dirty_x, 0);
+        ATOMIC_STORE(video_shm->dirty_y, 0);
+        ATOMIC_STORE(video_shm->dirty_width, width);
+        ATOMIC_STORE(video_shm->dirty_height, height);
+    } else if (!found_change) {
+        // No changes - signal this with width=0
+        ATOMIC_STORE(video_shm->dirty_x, 0);
+        ATOMIC_STORE(video_shm->dirty_y, 0);
+        ATOMIC_STORE(video_shm->dirty_width, 0);
+        ATOMIC_STORE(video_shm->dirty_height, 0);
+    } else {
+        // Add small 1-pixel margin for safety (PNG filtering artifacts)
+        uint32_t dirty_x = (min_x > 1) ? min_x - 1 : 0;
+        uint32_t dirty_y = (min_y > 1) ? min_y - 1 : 0;
+        uint32_t dirty_w = (max_x < width - 2) ? (max_x - dirty_x + 2) : (width - dirty_x);
+        uint32_t dirty_h = (max_y < height - 2) ? (max_y - dirty_y + 2) : (height - dirty_y);
+
+        // If dirty rect is >75% of screen, just use full frame
+        uint32_t dirty_pixels = dirty_w * dirty_h;
+        uint32_t total_pixels = width * height;
+        if (dirty_pixels > (total_pixels * 3 / 4)) {
+            dirty_x = 0;
+            dirty_y = 0;
+            dirty_w = width;
+            dirty_h = height;
+        }
+
+        ATOMIC_STORE(video_shm->dirty_x, dirty_x);
+        ATOMIC_STORE(video_shm->dirty_y, dirty_y);
+        ATOMIC_STORE(video_shm->dirty_width, dirty_w);
+        ATOMIC_STORE(video_shm->dirty_height, dirty_h);
+    }
+
     // Get timestamp and signal frame complete
-    auto now = std::chrono::steady_clock::now();
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-        now.time_since_epoch()).count();
-    macemu_frame_complete(video_shm, us);
+    // Use CLOCK_REALTIME for Unix epoch timestamp (needed for browser sync)
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t timestamp_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    macemu_frame_complete(video_shm, timestamp_us);
+
+    // Check if we need to update ping t4 timestamp
+    update_ping_on_frame_complete(timestamp_us);
 }
 
 
@@ -551,6 +733,13 @@ static void video_refresh_thread()
     int target_fps = 30;
     int frames_sent = 0;
     int mouse_updates = 0;
+
+    // Dirty rect statistics
+    uint64_t total_full_pixels = 0;   // Total pixels if all frames were full
+    uint64_t total_dirty_pixels = 0;  // Actual pixels sent via dirty rects
+    int dirty_rect_frames = 0;
+    int full_frames = 0;
+    int skipped_frames = 0;
 
     while (video_thread_running) {
         auto now = std::chrono::steady_clock::now();
@@ -584,11 +773,25 @@ static void video_refresh_thread()
                 ATOMIC_STORE(video_shm->mouse_latency_samples, (uint32_t)lat_samples);
             }
 
-            fprintf(stderr, "[IPC] fps=%.1f frames=%d mouse=%d latency=%.1fms server=%s\n",
-                    fps, frames_sent, mouse_updates, avg_mouse_ms,
+            // Calculate bandwidth savings from dirty rects
+            float bandwidth_saved_pct = 0.0f;
+            if (total_full_pixels > 0) {
+                bandwidth_saved_pct = 100.0f * (1.0f - (float)total_dirty_pixels / total_full_pixels);
+            }
+
+            fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: events=%d latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
+                    fps, frames_sent,
+                    mouse_updates, avg_mouse_ms,
+                    dirty_rect_frames, full_frames, skipped_frames, bandwidth_saved_pct,
                     control_socket >= 0 ? "connected" : "waiting");
+
             frames_sent = 0;
             mouse_updates = 0;
+            dirty_rect_frames = 0;
+            full_frames = 0;
+            skipped_frames = 0;
+            total_full_pixels = 0;
+            total_dirty_pixels = 0;
             last_stats_time = now;
         }
 
@@ -604,6 +807,30 @@ static void video_refresh_thread()
         // Convert frame to BGRA and signal complete
         convert_frame_to_bgra();
         frames_sent++;
+
+        // Track dirty rect statistics
+        if (video_shm) {
+            uint32_t dirty_w = ATOMIC_LOAD(video_shm->dirty_width);
+            uint32_t dirty_h = ATOMIC_LOAD(video_shm->dirty_height);
+            uint32_t width = video_shm->width;
+            uint32_t height = video_shm->height;
+
+            uint32_t full_frame_pixels = width * height;
+            total_full_pixels += full_frame_pixels;
+
+            if (dirty_w == 0) {
+                // No changes
+                skipped_frames++;
+            } else if (dirty_w == width && dirty_h == height) {
+                // Full frame
+                full_frames++;
+                total_dirty_pixels += full_frame_pixels;
+            } else {
+                // Dirty rect
+                dirty_rect_frames++;
+                total_dirty_pixels += (dirty_w * dirty_h);
+            }
+        }
     }
 }
 

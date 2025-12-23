@@ -22,6 +22,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <unistd.h>
+#include <sys/eventfd.h>
 
 #ifdef __cplusplus
 #include <atomic>
@@ -114,6 +116,13 @@ typedef struct {
     uint32_t pixel_format;       // MACEMU_PIXFMT_* (set per frame by emulator)
     uint32_t _reserved;          // Future use, alignment
 
+    // Dirty rectangle for PNG optimization (computed by emulator)
+    // Updated atomically with each frame - represents changed region
+    ATOMIC_UINT32 dirty_x;       // X coordinate of dirty rect (0 for full frame)
+    ATOMIC_UINT32 dirty_y;       // Y coordinate of dirty rect
+    ATOMIC_UINT32 dirty_width;   // Width of dirty rect (0 = no changes, same as width = full frame)
+    ATOMIC_UINT32 dirty_height;  // Height of dirty rect
+
     // Triple buffer synchronization (lock-free)
     ATOMIC_UINT32 write_index;   // Buffer emulator is writing to (0-2)
     ATOMIC_UINT32 ready_index;   // Buffer ready for server to read (0-2)
@@ -124,6 +133,25 @@ typedef struct {
     // Updated every stats interval (~3 seconds)
     ATOMIC_UINT32 mouse_latency_avg_ms;  // Average mouse input latency in ms (x10 for 0.1ms precision)
     ATOMIC_UINT32 mouse_latency_samples; // Number of samples in current average
+
+    // Ping/pong for RTT measurement (written by emulator, echoed by server in frame metadata)
+    // OPTIMIZATION: Only ping_sequence needs to be atomic - it acts as the "ready" flag
+    // All timestamps are written BEFORE setting ping_sequence (write-release semantics)
+    // Server reads ping_sequence atomically (read-acquire), which guarantees visibility of timestamps
+    struct {
+        uint64_t t1_browser_ms;   // Browser send time (performance.now())
+        uint64_t t2_server_us;    // Server receive time (CLOCK_REALTIME microseconds)
+        uint64_t t3_emulator_us;  // Emulator receive time (CLOCK_REALTIME microseconds)
+        uint64_t t4_frame_us;     // Frame ready time (CLOCK_REALTIME microseconds)
+    } ping_timestamps;            // Regular struct - no atomics needed
+
+    ATOMIC_UINT32 ping_sequence;  // Sequence number - atomic write-release / read-acquire
+                                  // When server sees non-zero, all timestamp writes are visible
+
+    // Event notification (Linux eventfd for low-latency signaling)
+    // Emulator writes to this fd after frame completion
+    // Server uses epoll to wait for new frames instead of polling
+    int32_t frame_ready_eventfd;         // eventfd for frame ready notification (-1 if not supported)
 
     // BGRA frame buffers - fixed size for max resolution
     // Each frame: width * height * 4 bytes (B, G, R, A per pixel)
@@ -141,6 +169,7 @@ typedef struct {
 #define MACEMU_INPUT_KEY       1   // Keyboard event
 #define MACEMU_INPUT_MOUSE     2   // Mouse move/button
 #define MACEMU_INPUT_COMMAND   3   // Emulator command (start/stop/reset)
+#define MACEMU_INPUT_PING      4   // Latency measurement ping (echoed in frame metadata)
 
 // Key event flags
 #define MACEMU_KEY_DOWN        0x01
@@ -190,12 +219,24 @@ typedef struct {
     uint8_t _reserved[3];
 } MacEmuCommandInput;
 
+// Ping input for RTT measurement with timestamps at each layer
+// Timestamps accumulate as ping travels: browser -> server -> emulator
+// Each layer adds its own timestamp using its local clock
+typedef struct {
+    MacEmuInputHeader hdr;           // type = MACEMU_INPUT_PING
+    uint32_t sequence;               // Ping sequence number
+    uint64_t t1_browser_send_ms;     // Browser send time (performance.now())
+    uint64_t t2_server_recv_us;      // Server receive time (CLOCK_REALTIME microseconds)
+    uint64_t t3_emulator_recv_us;    // Emulator receive time (CLOCK_REALTIME microseconds)
+} MacEmuPingInput;
+
 // Union for receiving any input type
 typedef union {
     MacEmuInputHeader hdr;
     MacEmuKeyInput key;
     MacEmuMouseInput mouse;
     MacEmuCommandInput cmd;
+    MacEmuPingInput ping;
 } MacEmuInput;
 
 /*
@@ -246,6 +287,15 @@ static inline void macemu_frame_complete(MacEmuVideoBuffer* buf, uint64_t timest
 
     // Increment frame count (server can use this to detect new frames)
     ATOMIC_FETCH_ADD(buf->frame_count, 1);
+
+    // NOTE: Ping t4 handling moved to video_ipc.cpp's update_ping_on_frame_complete()
+    // This keeps the inline function simple and allows emulator to track echo state
+
+    // Signal eventfd to wake up server immediately (low-latency notification)
+    if (buf->frame_ready_eventfd >= 0) {
+        uint64_t val = 1;
+        (void)write(buf->frame_ready_eventfd, &val, sizeof(val));
+    }
 }
 
 // Initialize video buffer (called by emulator)
@@ -260,10 +310,24 @@ static inline void macemu_init_video_buffer(MacEmuVideoBuffer* buf, uint32_t pid
     buf->pixel_format = MACEMU_PIXFMT_BGRA;  // Default, emulator sets per-frame
     ATOMIC_STORE(buf->write_index, 0);
     ATOMIC_STORE(buf->ready_index, 0);
+    ATOMIC_STORE(buf->dirty_x, 0);
+    ATOMIC_STORE(buf->dirty_y, 0);
+    ATOMIC_STORE(buf->dirty_width, width);   // Full frame initially
+    ATOMIC_STORE(buf->dirty_height, height);
     ATOMIC_STORE(buf->mouse_latency_avg_ms, 0);
     ATOMIC_STORE(buf->mouse_latency_samples, 0);
+    // Initialize ping tracking (timestamp struct doesn't need atomics, just zero it)
+    buf->ping_timestamps.t1_browser_ms = 0;
+    buf->ping_timestamps.t2_server_us = 0;
+    buf->ping_timestamps.t3_emulator_us = 0;
+    buf->ping_timestamps.t4_frame_us = 0;
+    ATOMIC_STORE(buf->ping_sequence, 0);  // Only seq number is atomic
     ATOMIC_STORE(buf->frame_count, 0);
     ATOMIC_STORE(buf->timestamp_us, 0);
+
+    // Create eventfd for frame ready notification (low-latency event-driven sync)
+    // EFD_NONBLOCK: reads won't block if no data, EFD_SEMAPHORE: read returns 1 per event
+    buf->frame_ready_eventfd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
 }
 
 // Validate video buffer (called by server on connect)
