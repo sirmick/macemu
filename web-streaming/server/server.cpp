@@ -2060,6 +2060,12 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             continue;
         }
 
+        // If eventfd was closed (emulator disconnected), reset current_eventfd
+        if (g_frame_ready_eventfd < 0 && current_eventfd >= 0) {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
+            current_eventfd = -1;
+        }
+
         // Register eventfd with epoll if we just connected to emulator
         if (g_frame_ready_eventfd >= 0 && current_eventfd != g_frame_ready_eventfd) {
             // Remove old eventfd if any
