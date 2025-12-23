@@ -216,6 +216,7 @@ const connectionSteps = new ConnectionSteps();
 
 const CodecType = {
     H264: 'h264',   // WebRTC video track with H.264
+    AV1: 'av1',     // WebRTC video track with AV1
     PNG: 'png',     // PNG over DataChannel
     RAW: 'raw'      // Raw RGBA over DataChannel
 };
@@ -297,6 +298,39 @@ class H264Decoder extends VideoDecoder {
         // H.264 data is handled by the browser's native WebRTC stack
         // This method is not used for H.264
         logger.warn('H264Decoder.handleData called - this should not happen');
+    }
+}
+
+// AV1 decoder using native WebRTC video track (same as H.264, browser handles it)
+class AV1Decoder extends VideoDecoder {
+    constructor(videoElement) {
+        super(videoElement);
+        this.videoElement = videoElement;
+    }
+
+    get type() { return CodecType.AV1; }
+    get name() { return 'AV1 (WebRTC)'; }
+
+    init() {
+        logger.info('AV1Decoder initialized');
+        return true;
+    }
+
+    cleanup() {
+        if (this.videoElement) {
+            this.videoElement.srcObject = null;
+        }
+    }
+
+    attachTrack(stream) {
+        this.videoElement.srcObject = stream;
+        this.videoElement.play().catch(e => {
+            logger.warn('Video play() failed', { error: e.message });
+        });
+    }
+
+    handleData(data) {
+        logger.warn('AV1Decoder.handleData called - this should not happen');
     }
 }
 
@@ -675,6 +709,8 @@ function createDecoder(codecType, element) {
     switch (codecType) {
         case CodecType.H264:
             return new H264Decoder(element);
+        case CodecType.AV1:
+            return new AV1Decoder(element);
         case CodecType.PNG:
             return new PNGDecoder(element);
         case CodecType.RAW:
@@ -756,7 +792,9 @@ class BasiliskWebRTC {
             this.decoder.cleanup();
         }
 
-        const element = this.codecType === CodecType.H264 ? this.video : this.canvas;
+        // AV1 and H.264 use video element, PNG/RAW use canvas
+        const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+        const element = usesVideoElement ? this.video : this.canvas;
         if (!element) {
             logger.error('No display element for codec', { codec: this.codecType });
             return false;
@@ -768,8 +806,8 @@ class BasiliskWebRTC {
         }
 
         // Show/hide appropriate element
-        if (this.video) this.video.style.display = this.codecType === CodecType.H264 ? 'block' : 'none';
-        if (this.canvas) this.canvas.style.display = this.codecType !== CodecType.H264 ? 'block' : 'none';
+        if (this.video) this.video.style.display = usesVideoElement ? 'block' : 'none';
+        if (this.canvas) this.canvas.style.display = !usesVideoElement ? 'block' : 'none';
 
         return this.decoder.init();
     }
@@ -873,6 +911,7 @@ class BasiliskWebRTC {
                 // Server tells us which codec to use
                 if (msg.codec) {
                     const serverCodec = msg.codec === 'h264' ? CodecType.H264 :
+                                       msg.codec === 'av1' ? CodecType.AV1 :
                                        msg.codec === 'png' ? CodecType.PNG :
                                        msg.codec === 'raw' ? CodecType.RAW : CodecType.PNG;
                     if (serverCodec !== this.codecType) {
@@ -880,7 +919,8 @@ class BasiliskWebRTC {
                             logger.info('Server codec', { codec: msg.codec });
                         }
                         this.codecType = serverCodec;
-                        // Reinitialize decoder for new codec
+                        this.stats.codec = msg.codec;
+                        // Reinitialize decoder for server's codec
                         this.initDecoder();
                     }
                 }
@@ -1287,7 +1327,8 @@ class BasiliskWebRTC {
         this.dataChannel.onmessage = (event) => {
             if (event.data instanceof ArrayBuffer) {
                 // Binary data - this is a video frame for PNG/RAW codec
-                if (this.decoder && this.codecType !== CodecType.H264) {
+                const usesVideoTrack = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+                if (this.decoder && !usesVideoTrack) {
                     this.decoder.handleData(event.data);
 
                     // Track PNG/RAW frame stats
@@ -1319,8 +1360,9 @@ class BasiliskWebRTC {
     }
 
     setupInputHandlers() {
-        // Use the appropriate display element (video for H.264, canvas for PNG/RAW)
-        const displayElement = this.codecType === CodecType.H264 ? this.video : this.canvas;
+        // Use the appropriate display element (video for H.264/AV1, canvas for PNG/RAW)
+        const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+        const displayElement = usesVideoElement ? this.video : this.canvas;
         if (!displayElement) return;
 
         // Click to capture mouse (pointer lock for relative movement)
@@ -1519,7 +1561,8 @@ class BasiliskWebRTC {
         const elapsed = (now - this.lastStatsTime) / 1000;
 
         // For PNG/RAW codecs, calculate stats from our own tracking
-        if (this.codecType !== CodecType.H264) {
+        const usesVideoTrack = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+        if (!usesVideoTrack) {
             if (elapsed > 0) {
                 const framesDelta = this.pngStats.framesReceived - this.lastPngFrameCount;
                 const bytesDelta = this.pngStats.bytesReceived - this.lastPngBytesReceived;
@@ -1617,7 +1660,8 @@ class BasiliskWebRTC {
 
         // Get resolution from appropriate element
         let width = 0, height = 0;
-        if (this.codecType === CodecType.H264 && this.video) {
+        const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+        if (usesVideoElement && this.video) {
             width = this.video.videoWidth;
             height = this.video.videoHeight;
         } else if (this.canvas) {
@@ -1625,10 +1669,20 @@ class BasiliskWebRTC {
             height = this.canvas.height;
         }
 
+        // Codec badge
+        const codecBadge = document.getElementById('codec-badge');
+        if (codecBadge) {
+            const codecLabel = this.codecType === CodecType.H264 ? 'H.264' :
+                              this.codecType === CodecType.AV1 ? 'AV1' :
+                              this.codecType === CodecType.PNG ? 'PNG' : 'RAW';
+            codecBadge.textContent = codecLabel;
+        }
+
         // Footer resolution
         const resEl = document.getElementById('resolution');
         if (resEl && width) {
             const codecLabel = this.codecType === CodecType.H264 ? 'H.264' :
+                              this.codecType === CodecType.AV1 ? 'AV1' :
                               this.codecType === CodecType.PNG ? 'PNG' : 'RAW';
             resEl.textContent = `${width} x ${height} (${codecLabel})`;
         }
@@ -1650,11 +1704,31 @@ class BasiliskWebRTC {
             statRes.textContent = `${width} x ${height}`;
         }
         if (statFrames) statFrames.textContent = this.stats.framesDecoded.toLocaleString();
+
+        // Packets Lost and Jitter only apply to RTP (H.264/AV1)
+        const usesRTP = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
         if (statLost) {
-            statLost.textContent = this.stats.packetsLost;
-            statLost.className = 'value ' + (this.stats.packetsLost === 0 ? 'good' : 'bad');
+            if (usesRTP) {
+                statLost.textContent = this.stats.packetsLost;
+                statLost.className = 'value ' + (this.stats.packetsLost === 0 ? 'good' : 'bad');
+            } else {
+                statLost.textContent = 'N/A';
+                statLost.className = 'value';
+            }
         }
-        if (statJitter) statJitter.textContent = `${this.stats.jitter} ms`;
+        if (statJitter) {
+            if (usesRTP) {
+                statJitter.textContent = `${this.stats.jitter} ms`;
+            } else {
+                statJitter.textContent = 'N/A';
+            }
+        }
+
+        // Show/hide ping breakdown section based on codec (only for PNG/RAW)
+        const pingBreakdownSection = document.getElementById('ping-breakdown-section');
+        if (pingBreakdownSection) {
+            pingBreakdownSection.style.display = usesRTP ? 'none' : 'block';
+        }
     }
 
     // UI helpers
@@ -2159,7 +2233,13 @@ function parsePrefsFile(content) {
                 config.sound = value !== 'true';
                 break;
             case 'webcodec':
-                config.webcodec = value === 'h264' ? 'h264' : 'png';
+                if (value === 'h264') {
+                    config.webcodec = 'h264';
+                } else if (value === 'av1') {
+                    config.webcodec = 'av1';
+                } else {
+                    config.webcodec = 'png';
+                }
                 break;
         }
     }
@@ -2549,6 +2629,25 @@ async function pollEmulatorStatus() {
         }
         if (emuPid) {
             emuPid.textContent = 'PID: ' + (data.emulator_pid > 0 ? data.emulator_pid : '-');
+        }
+
+        // Update emulator status in header status bar
+        const emuStatusDot = document.getElementById('emulator-status-dot');
+        const emuStatusText = document.getElementById('emulator-status-text');
+        if (emuStatusDot && emuStatusText) {
+            if (data.emulator_running && data.emulator_connected) {
+                emuStatusDot.style.background = '#4CAF50';  // Green
+                emuStatusText.textContent = 'ON';
+                emuStatusText.style.color = '#4CAF50';
+            } else if (data.emulator_running) {
+                emuStatusDot.style.background = '#FF9800';  // Orange
+                emuStatusText.textContent = 'STARTING';
+                emuStatusText.style.color = '#FF9800';
+            } else {
+                emuStatusDot.style.background = '#666';  // Gray
+                emuStatusText.textContent = 'OFF';
+                emuStatusText.style.color = '#999';
+            }
         }
 
         // Update mouse latency stat (from emulator via server)

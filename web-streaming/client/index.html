@@ -11,13 +11,17 @@
         <div class="logo">
             <span style="font-size: 1.5em;">&#128421;</span>
             <h1>Basilisk II Web</h1>
-            <span class="badge">libdatachannel</span>
+            <span class="badge" id="codec-badge">Loading...</span>
         </div>
 
         <div class="status-bar">
             <div class="status-item">
                 <span class="status-dot" id="status-dot"></span>
                 <span id="connection-status">Disconnected</span>
+            </div>
+            <div class="status-item" id="emulator-status-display">
+                <span class="status-dot" id="emulator-status-dot" style="background: #666;"></span>
+                <span>Emulator: <strong id="emulator-status-text">OFF</strong></span>
             </div>
             <div class="status-item" id="fps-display">
                 FPS: --
@@ -127,24 +131,26 @@
                             <div class="value" id="stat-rtt">-- ms</div>
                         </div>
                     </div>
-                    <!-- Ping Breakdown Section (PNG codec only) -->
-                    <h4 style="margin-top: 15px; margin-bottom: 10px; color: #888;">Ping Latency Breakdown (PNG only)</h4>
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="label">Network</div>
-                            <div class="value" id="stat-ping-network">-- ms</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">IPC</div>
-                            <div class="value" id="stat-ping-ipc">-- ms</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">Frame Wait</div>
-                            <div class="value" id="stat-ping-wait">-- ms</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">Encode</div>
-                            <div class="value" id="stat-ping-encode">-- ms</div>
+                    <!-- Ping Breakdown Section (PNG/RAW codec only) -->
+                    <div id="ping-breakdown-section">
+                        <h4 style="margin-top: 15px; margin-bottom: 10px; color: #888;">Ping Latency Breakdown</h4>
+                        <div class="stats-grid">
+                            <div class="stat-card">
+                                <div class="label">Network</div>
+                                <div class="value" id="stat-ping-network">-- ms</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="label">IPC</div>
+                                <div class="value" id="stat-ping-ipc">-- ms</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="label">Frame Wait</div>
+                                <div class="value" id="stat-ping-wait">-- ms</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="label">Encode</div>
+                                <div class="value" id="stat-ping-encode">-- ms</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -211,7 +217,7 @@
     </main>
 
     <footer>
-        <span>Basilisk II WebRTC Streaming (libdatachannel)</span>
+        <span>Basilisk II WebRTC Streaming</span>
         <span id="resolution">-- x --</span>
     </footer>
 
@@ -267,8 +273,9 @@
                 <div class="form-group">
                     <label>Video Codec</label>
                     <select id="cfg-webcodec">
-                        <option value="png" selected>PNG (best for 1-bit/dithered)</option>
-                        <option value="h264">H.264 (better for photos/video)</option>
+                        <option value="png" selected>PNG (good for dithered, uses dirty rects)</option>
+                        <option value="av1">AV1 (best for dithered, modern browsers)</option>
+                        <option value="h264">H.264 (avoid for dithered content)</option>
                     </select>
                 </div>
 
