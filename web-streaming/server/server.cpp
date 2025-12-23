@@ -1157,6 +1157,58 @@ private:
             return;
         }
 
+        if (path == "/api/error" && method == "POST") {
+            // Client error reporting endpoint - capture JavaScript errors, exceptions, and crashes
+            std::string message = json_get_string(body, "message");
+            std::string stack = json_get_string(body, "stack");
+            std::string url = json_get_string(body, "url");
+            std::string line = json_get_string(body, "line");
+            std::string col = json_get_string(body, "col");
+            std::string type = json_get_string(body, "type");
+
+            // Format: [Browser ERROR] with red color for visibility
+            fprintf(stderr, "\033[1;31m[Browser ERROR]\033[0m ");
+
+            if (!type.empty()) {
+                fprintf(stderr, "%s: ", type.c_str());
+            }
+
+            fprintf(stderr, "%s", message.c_str());
+
+            if (!url.empty()) {
+                fprintf(stderr, "\n  at %s", url.c_str());
+                if (!line.empty()) {
+                    fprintf(stderr, ":%s", line.c_str());
+                    if (!col.empty()) {
+                        fprintf(stderr, ":%s", col.c_str());
+                    }
+                }
+            }
+
+            if (!stack.empty()) {
+                // Print stack trace with indentation
+                fprintf(stderr, "\n  Stack trace:\n");
+                // Split by newlines and indent each line
+                size_t pos = 0;
+                std::string stack_copy = stack;
+                while ((pos = stack_copy.find('\n')) != std::string::npos) {
+                    std::string line = stack_copy.substr(0, pos);
+                    if (!line.empty()) {
+                        fprintf(stderr, "    %s\n", line.c_str());
+                    }
+                    stack_copy.erase(0, pos + 1);
+                }
+                if (!stack_copy.empty()) {
+                    fprintf(stderr, "    %s\n", stack_copy.c_str());
+                }
+            } else {
+                fprintf(stderr, "\n");
+            }
+
+            send_json_response(fd, "{\"ok\": true}");
+            return;
+        }
+
         // Static files
         std::string content_type = "text/html";
         std::string disk_path;
@@ -1386,13 +1438,7 @@ public:
                 ping_t2_server_us = g_video_shm->ping_timestamps.t2_server_us;
                 ping_t3_emulator_us = g_video_shm->ping_timestamps.t3_emulator_us;
                 ping_t4_frame_ready_us = g_video_shm->ping_timestamps.t4_frame_us;
-
-                fprintf(stderr, "[Server] Ping #%u echo: t1=%.1fms t2=%lluμs t3=%lluμs t4=%s\n",
-                        ping_seq,
-                        ping_t1_browser_ms / 1000.0,
-                        (unsigned long long)ping_t2_server_us,
-                        (unsigned long long)ping_t3_emulator_us,
-                        ping_t4_frame_ready_us > 0 ? "set" : "NOT SET");
+                // Note: Ping echo logging happens in browser when it receives the echo
             }
         }
         // t5 is server send time (same as t4_send_ms from frame metadata)
@@ -1798,6 +1844,8 @@ private:
             }
             case 'P': {
                 // Ping: P sequence,timestamp
+                // NOTE: Ping responses are only sent in PNG/RAW codec mode via DataChannel metadata header.
+                // H.264 uses RTP video track with no metadata support - ping echoes would be discarded.
                 uint32_t sequence = 0;
                 double ts = 0;
                 if (sscanf(args, "%u,%lf", &sequence, &ts) == 2) {

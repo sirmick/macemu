@@ -372,12 +372,7 @@ static void process_binary_input(const uint8_t* data, size_t len) {
 
                 // Atomic write-release: publishes all above writes to any thread doing atomic read-acquire
                 ATOMIC_STORE(video_shm->ping_sequence, ping->sequence);
-
-                fprintf(stderr, "[Emulator] Ping #%u received (t1=%.1fms t2=%lluμs t3=%lluμs) - waiting for next frame\n",
-                        ping->sequence,
-                        ping->t1_browser_send_ms / 1000.0,
-                        (unsigned long long)ping->t2_server_recv_us,
-                        (unsigned long long)t3_emulator_recv_us);
+                // Note: Detailed ping logging happens when t4 is set and in browser
             }
             break;
         }
@@ -404,14 +399,12 @@ static void update_ping_on_frame_complete(uint64_t timestamp_us) {
         last_echoed_ping_seq = current_ping_seq;
         ping_echo_frames_remaining = 5;  // Echo in next 5 frames
 
-        fprintf(stderr, "[Emulator] Ping #%u complete: set t4=%lluμs (will echo in next 5 frames)\n",
+        // Reduced logging - only log when first setting t4
+        fprintf(stderr, "[Emulator] Ping #%u ready (t4=%llu)\n",
                 current_ping_seq, (unsigned long long)timestamp_us);
     } else if (ping_echo_frames_remaining > 0) {
-        // Still echoing previous ping
+        // Still echoing previous ping - silently decrement counter
         ping_echo_frames_remaining--;
-        if (ping_echo_frames_remaining == 0) {
-            fprintf(stderr, "[Emulator] Ping #%u echo finished (sent in 5 frames)\n", last_echoed_ping_seq);
-        }
     }
 }
 

@@ -122,6 +122,30 @@
                             <div class="label">Video Latency</div>
                             <div class="value" id="stat-video-latency">-- ms</div>
                         </div>
+                        <div class="stat-card">
+                            <div class="label">RTT</div>
+                            <div class="value" id="stat-rtt">-- ms</div>
+                        </div>
+                    </div>
+                    <!-- Ping Breakdown Section (PNG codec only) -->
+                    <h4 style="margin-top: 15px; margin-bottom: 10px; color: #888;">Ping Latency Breakdown (PNG only)</h4>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="label">Network</div>
+                            <div class="value" id="stat-ping-network">-- ms</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">IPC</div>
+                            <div class="value" id="stat-ping-ipc">-- ms</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Frame Wait</div>
+                            <div class="value" id="stat-ping-wait">-- ms</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Encode</div>
+                            <div class="value" id="stat-ping-encode">-- ms</div>
+                        </div>
                     </div>
                 </div>
                 <div class="debug-pane" id="webrtc-pane">
