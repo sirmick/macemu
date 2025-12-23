@@ -1981,6 +1981,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         return;
     }
     int current_eventfd = -1;  // Track which eventfd is registered
+    pid_t current_emulator_pid = -1;  // Track which emulator we're connected to
 
     fprintf(stderr, "Video: Starting frame processing loop\n");
 
@@ -2060,32 +2061,34 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             continue;
         }
 
-        // If eventfd was closed (emulator disconnected), reset current_eventfd
-        if (g_frame_ready_eventfd < 0 && current_eventfd >= 0) {
-            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
-            current_eventfd = -1;
-        }
-
-        // Register eventfd with epoll if we just connected to emulator
-        if (g_frame_ready_eventfd >= 0 && current_eventfd != g_frame_ready_eventfd) {
-            // Remove old eventfd if any
+        // Register eventfd with epoll when emulator PID changes (new connection or restart)
+        // Kernel may reuse same fd number, so we check PID to detect new emulator
+        if (g_emulator_connected && current_emulator_pid != g_emulator_pid) {
+            // Remove old eventfd from epoll if any
             if (current_eventfd >= 0) {
+                fprintf(stderr, "Video: Removing old eventfd %d from epoll (PID %d->%d)\n",
+                        current_eventfd, current_emulator_pid, g_emulator_pid);
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
+                current_eventfd = -1;
             }
 
             // Add new eventfd
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            ev.data.fd = g_frame_ready_eventfd;
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_frame_ready_eventfd, &ev) == 0) {
-                current_eventfd = g_frame_ready_eventfd;
-                fprintf(stderr, "Video: Registered eventfd %d with epoll\n", current_eventfd);
-            } else {
-                fprintf(stderr, "Video: FATAL: Failed to add eventfd %d to epoll: %s\n",
-                        g_frame_ready_eventfd, strerror(errno));
-                // This is fatal - can't proceed without eventfd
-                disconnect_from_emulator(&webrtc);
-                continue;
+            if (g_frame_ready_eventfd >= 0) {
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = g_frame_ready_eventfd;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_frame_ready_eventfd, &ev) == 0) {
+                    current_eventfd = g_frame_ready_eventfd;
+                    current_emulator_pid = g_emulator_pid;
+                    fprintf(stderr, "Video: Registered eventfd %d with epoll for PID %d\n",
+                            current_eventfd, current_emulator_pid);
+                } else {
+                    fprintf(stderr, "Video: FATAL: Failed to add eventfd %d to epoll: %s\n",
+                            g_frame_ready_eventfd, strerror(errno));
+                    // This is fatal - can't proceed without eventfd
+                    disconnect_from_emulator(&webrtc);
+                    continue;
+                }
             }
         }
 
