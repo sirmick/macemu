@@ -1099,8 +1099,11 @@ private:
             int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             if (client_fd < 0) continue;
 
-            handle_client(client_fd);
-            close(client_fd);
+            // Handle client in separate thread for concurrent connections
+            std::thread([this, client_fd]() {
+                handle_client(client_fd);
+                close(client_fd);
+            }).detach();
         }
     }
 
