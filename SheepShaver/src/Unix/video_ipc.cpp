@@ -120,6 +120,10 @@ static std::string socket_path;
 static std::thread input_thread;
 static std::atomic<bool> input_thread_running{false};
 
+// Mouse position tracking (ADBMouseMoved expects absolute coordinates)
+static int mouse_x = 0;
+static int mouse_y = 0;
+
 // Palette for indexed modes
 static uint8 current_palette[256 * 3];
 
@@ -314,7 +318,15 @@ static void input_thread_func()
                 break;
 
             case MACEMU_INPUT_MOUSE:
-                ADBMouseMoved(input.mouse.x, input.mouse.y);
+                // Accumulate deltas into absolute position (ADBMouseMoved expects absolute coords)
+                mouse_x += input.mouse.x;
+                mouse_y += input.mouse.y;
+                // Clamp to screen bounds
+                if (mouse_x < 0) mouse_x = 0;
+                if (mouse_y < 0) mouse_y = 0;
+                if (mouse_x >= (int)frame_width) mouse_x = frame_width - 1;
+                if (mouse_y >= (int)frame_height) mouse_y = frame_height - 1;
+                ADBMouseMoved(mouse_x, mouse_y);
                 if (input.mouse.buttons & MACEMU_MOUSE_LEFT) {
                     ADBMouseDown(0);
                 } else {
@@ -497,6 +509,10 @@ bool VideoInit(void)
         case APPLE_32_BIT: frame_depth = 32; break;
     }
 
+    // Initialize mouse position to center of screen
+    mouse_x = frame_width / 2;
+    mouse_y = frame_height / 2;
+
     // Initialize IPC
     if (!init_ipc_resources(frame_width, frame_height)) {
         D(bug("IPC: Failed to initialize IPC resources\n"));
@@ -565,6 +581,10 @@ void VideoVBL(void)
 
     // Convert frame and signal to server
     convert_frame_to_bgra();
+
+    // Execute video VBL service (needed for Mac OS to process input events)
+    if (private_data != NULL && private_data->interruptsEnabled)
+        VSLDoInterruptService(private_data->vslServiceID);
 }
 
 /*

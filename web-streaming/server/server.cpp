@@ -388,13 +388,15 @@ static void disconnect_control_socket() {
 static bool send_key_input(int mac_keycode, bool down) {
     if (g_control_socket < 0) return false;
 
-    MacEmuKeyInput msg;
-    msg.hdr.type = MACEMU_INPUT_KEY;
-    msg.hdr.flags = down ? MACEMU_KEY_DOWN : MACEMU_KEY_UP;
-    msg.hdr._reserved = 0;
-    msg.mac_keycode = mac_keycode;
-    msg.modifiers = 0;  // TODO: track modifier state
-    msg._reserved = 0;
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.key.hdr.type = MACEMU_INPUT_KEY;
+    msg.key.hdr.flags = down ? MACEMU_KEY_DOWN : MACEMU_KEY_UP;
+    msg.key.hdr._reserved = 0;
+    msg.key.mac_keycode = mac_keycode;
+    msg.key.modifiers = 0;  // TODO: track modifier state
+    msg.key._reserved = 0;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -402,15 +404,16 @@ static bool send_key_input(int mac_keycode, bool down) {
 static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms) {
     if (g_control_socket < 0) return false;
 
-    MacEmuMouseInput msg;
-    msg.hdr.type = MACEMU_INPUT_MOUSE;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.x = dx;
-    msg.y = dy;
-    msg.buttons = buttons;
-    memset(msg._reserved, 0, sizeof(msg._reserved));
-    msg.timestamp_ms = browser_timestamp_ms;
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.mouse.hdr.type = MACEMU_INPUT_MOUSE;
+    msg.mouse.hdr.flags = 0;
+    msg.mouse.hdr._reserved = 0;
+    msg.mouse.x = dx;
+    msg.mouse.y = dy;
+    msg.mouse.buttons = buttons;
+    msg.mouse.timestamp_ms = browser_timestamp_ms;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -418,12 +421,13 @@ static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_t
 static bool send_command(uint8_t command) {
     if (g_control_socket < 0) return false;
 
-    MacEmuCommandInput msg;
-    msg.hdr.type = MACEMU_INPUT_COMMAND;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.command = command;
-    memset(msg._reserved, 0, sizeof(msg._reserved));
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.cmd.hdr.type = MACEMU_INPUT_COMMAND;
+    msg.cmd.hdr.flags = 0;
+    msg.cmd.hdr._reserved = 0;
+    msg.cmd.command = command;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -436,14 +440,16 @@ static bool send_ping_input(uint32_t sequence, uint64_t t1_browser_send_ms) {
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t t2_server_recv_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
-    MacEmuPingInput msg;
-    msg.hdr.type = MACEMU_INPUT_PING;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.sequence = sequence;
-    msg.t1_browser_send_ms = t1_browser_send_ms;
-    msg.t2_server_recv_us = t2_server_recv_us;
-    msg.t3_emulator_recv_us = 0;  // Will be filled by emulator
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.ping.hdr.type = MACEMU_INPUT_PING;
+    msg.ping.hdr.flags = 0;
+    msg.ping.hdr._reserved = 0;
+    msg.ping.sequence = sequence;
+    msg.ping.t1_browser_send_ms = t1_browser_send_ms;
+    msg.ping.t2_server_recv_us = t2_server_recv_us;
+    msg.ping.t3_emulator_recv_us = 0;  // Will be filled by emulator
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -2418,6 +2424,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                     fprintf(stderr, "Video: Auto-restarting emulator...\n");
                     disconnect_from_emulator(&webrtc);
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    // Re-read codec preference in case it changed
+                    read_webcodec_pref();
                     start_emulator();
                 }
             }
@@ -2432,6 +2440,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                 }
                 disconnect_from_emulator(&webrtc);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                // Re-read codec preference in case it changed
+                read_webcodec_pref();
                 if (g_auto_start_emulator) {
                     start_emulator();
                 }
