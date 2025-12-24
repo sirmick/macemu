@@ -19,18 +19,22 @@ CMAKE = @CMAKE@
 
 # Compiler and linker flags from configure
 SERVER_CFLAGS = -I../BasiliskII/src/IPC @SERVER_CFLAGS@ -I/usr/include/svt-av1 -DEB_DLL
-SERVER_LIBS = @SERVER_LIBS@ -lSvtAv1Enc
+SERVER_LIBS = @SERVER_LIBS@ -lopus -lSvtAv1Enc
 FPNG_CFLAGS = @FPNG_CFLAGS@
 
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
+              $(SERVER_DIR)/av1_encoder.cpp \
+              $(SERVER_DIR)/opus_encoder.cpp \
               $(SERVER_DIR)/png_encoder.cpp \
               $(SERVER_DIR)/fpng.cpp
 
 # Object files
 SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/h264_encoder.o \
+              $(BUILD_DIR)/av1_encoder.o \
+              $(BUILD_DIR)/opus_encoder.o \
               $(BUILD_DIR)/png_encoder.o \
               $(BUILD_DIR)/fpng.o
 
@@ -75,6 +79,17 @@ $(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp \
 $(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp \
                               $(SERVER_DIR)/h264_encoder.h \
                               $(SERVER_DIR)/codec.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile AV1 encoder
+$(BUILD_DIR)/av1_encoder.o: $(SERVER_DIR)/av1_encoder.cpp \
+                             $(SERVER_DIR)/av1_encoder.h \
+                             $(SERVER_DIR)/codec.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile Opus encoder
+$(BUILD_DIR)/opus_encoder.o: $(SERVER_DIR)/opus_encoder.cpp \
+                              $(SERVER_DIR)/opus_encoder.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile PNG encoder
