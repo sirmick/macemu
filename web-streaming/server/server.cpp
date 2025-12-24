@@ -75,6 +75,7 @@ static bool g_debug_connection = false;  // WebRTC, ICE, signaling logs
 bool g_debug_mode_switch = false;        // Mode/resolution/color depth changes (non-static for encoders)
 static bool g_debug_perf = false;        // Performance stats, ping logs
 static bool g_debug_frames = false;      // Save frame dumps to disk (.ppm files)
+static bool g_debug_audio = false;       // Audio processing logs (server + emulator)
 
 // Global state
 static std::atomic<bool> g_running(true);
@@ -2667,7 +2668,9 @@ static void audio_loop(WebRTCServer& webrtc) {
     }
     int current_eventfd = -1;  // Track which eventfd is registered
 
-    fprintf(stderr, "Audio: Starting audio processing loop\n");
+    if (g_debug_audio) {
+        fprintf(stderr, "Audio: Starting audio processing loop\n");
+    }
 
     while (g_running) {
         // Check if we need to update epoll registration
@@ -2682,7 +2685,9 @@ static void audio_loop(WebRTCServer& webrtc) {
             ev.events = EPOLLIN;
             ev.data.fd = g_audio_ready_eventfd;
             if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_audio_ready_eventfd, &ev) == 0) {
-                fprintf(stderr, "Audio: Registered audio eventfd %d with epoll\n", g_audio_ready_eventfd);
+                if (g_debug_audio) {
+                    fprintf(stderr, "Audio: Registered audio eventfd %d with epoll\n", g_audio_ready_eventfd);
+                }
                 current_eventfd = g_audio_ready_eventfd;
             } else {
                 fprintf(stderr, "Audio: WARNING: Failed to register eventfd with epoll: %s\n", strerror(errno));
@@ -2704,7 +2709,9 @@ static void audio_loop(WebRTCServer& webrtc) {
             if (current_eventfd >= 0 && g_audio_ready_eventfd < 0) {
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
                 current_eventfd = -1;
-                fprintf(stderr, "Audio: Emulator disconnected\n");
+                if (g_debug_audio) {
+                    fprintf(stderr, "Audio: Emulator disconnected\n");
+                }
             }
             continue;
         }
@@ -2712,7 +2719,9 @@ static void audio_loop(WebRTCServer& webrtc) {
         // Audio ready event received
         uint64_t event_count;
         if (read(g_audio_ready_eventfd, &event_count, sizeof(event_count)) != sizeof(event_count)) {
-            fprintf(stderr, "Audio: Failed to read eventfd: %s\n", strerror(errno));
+            if (g_debug_audio) {
+                fprintf(stderr, "Audio: Failed to read eventfd: %s\n", strerror(errno));
+            }
             continue;
         }
 
@@ -2748,6 +2757,11 @@ static void audio_loop(WebRTCServer& webrtc) {
 
         // Encode to Opus (handles dynamic sample rate/channel changes)
         if (g_audio_encoder) {
+            if (g_debug_audio) {
+                fprintf(stderr, "Audio: Processing frame: %d samples @ %dHz, %dch, %d bytes PCM\n",
+                        samples, sample_rate, channels, input_size);
+            }
+
             std::vector<uint8_t> opus_data = g_audio_encoder->encode_dynamic(
                 reinterpret_cast<const int16_t*>(audio_data),
                 samples,
@@ -2756,6 +2770,9 @@ static void audio_loop(WebRTCServer& webrtc) {
             );
 
             if (!opus_data.empty()) {
+                if (g_debug_audio) {
+                    fprintf(stderr, "Audio: Encoded to Opus: %zu bytes\n", opus_data.size());
+                }
                 webrtc.send_audio_to_all_peers(opus_data);
             }
         }
@@ -2766,7 +2783,9 @@ static void audio_loop(WebRTCServer& webrtc) {
         close(epoll_fd);
     }
 
-    fprintf(stderr, "Audio: Exiting audio processing loop\n");
+    if (g_debug_audio) {
+        fprintf(stderr, "Audio: Exiting audio processing loop\n");
+    }
 }
 
 
@@ -2794,6 +2813,7 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --debug-mode-switch     Show mode/resolution/color depth changes\n");
     fprintf(stderr, "  --debug-perf            Show performance stats and ping logs\n");
     fprintf(stderr, "  --debug-frames          Save frame dumps to disk (.ppm files)\n");
+    fprintf(stderr, "  --debug-audio           Show audio processing logs (server + emulator)\n");
     fprintf(stderr, "\nArchitecture:\n");
     fprintf(stderr, "  - Emulator creates SHM at /macemu-video-{PID}\n");
     fprintf(stderr, "  - Emulator creates socket at /tmp/macemu-{PID}.sock\n");
@@ -2826,6 +2846,7 @@ int main(int argc, char* argv[]) {
         {"debug-mode-switch", no_argument,      0, 1002},
         {"debug-perf",       no_argument,       0, 1003},
         {"debug-frames",     no_argument,       0, 1004},
+        {"debug-audio",      no_argument,       0, 1007},
         {"stun",             no_argument,       0, 1005},
         {"stun-server",      required_argument, 0, 1006},
         {0, 0, 0, 0}
@@ -2873,6 +2894,9 @@ int main(int argc, char* argv[]) {
             case 1004:
                 g_debug_frames = true;
                 break;
+            case 1007:
+                g_debug_audio = true;
+                break;
             case 1005:
                 g_enable_stun = true;
                 break;
@@ -2889,6 +2913,12 @@ int main(int argc, char* argv[]) {
     // Check environment variables
     if (const char* env = getenv("BASILISK_ROMS")) g_roms_path = env;
     if (const char* env = getenv("BASILISK_IMAGES")) g_images_path = env;
+
+    // Set MACEMU_DEBUG_AUDIO environment variable if --debug-audio enabled
+    // This will be inherited by the emulator process
+    if (g_debug_audio) {
+        setenv("MACEMU_DEBUG_AUDIO", "1", 1);
+    }
 
     // Set up signal handlers
     signal(SIGINT, signal_handler);
