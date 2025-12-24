@@ -71,7 +71,7 @@ extern "C" {
 #define MACEMU_NUM_BUFFERS 3
 
 // Total SHM size: header + 3 BGRA frames (~24.9 MB)
-#define MACEMU_VIDEO_SHM_SIZE (sizeof(MacEmuVideoBuffer))
+#define MACEMU_VIDEO_SHM_SIZE (sizeof(MacEmuIPCBuffer))
 
 // Emulator state flags
 #define MACEMU_STATE_STOPPED   0
@@ -82,6 +82,29 @@ extern "C" {
 // These describe the memory byte order of 32-bit pixels
 #define MACEMU_PIXFMT_ARGB     0   // Mac native 32-bit: bytes A,R,G,B (libyuv "BGRA")
 #define MACEMU_PIXFMT_BGRA     1   // Converted: bytes B,G,R,A (libyuv "ARGB")
+
+// Audio format flags (set per-frame by emulator, like pixel_format for video)
+#define MACEMU_AUDIO_FORMAT_NONE      0   // Audio disabled/muted
+#define MACEMU_AUDIO_FORMAT_PCM_S16   1   // 16-bit signed PCM (Mac native)
+
+// Maximum audio parameters (allocate buffers for worst case)
+// Fixed-size buffers like video - handles all Mac audio formats without reallocation
+#define MACEMU_AUDIO_MAX_SAMPLE_RATE  48000   // Max: 48kHz (WebRTC standard)
+#define MACEMU_AUDIO_MAX_CHANNELS     2       // Max: Stereo
+
+// Frame duration (fixed at 20ms for low-latency Opus streaming)
+#define MACEMU_AUDIO_FRAME_MS         20
+
+// Maximum audio frame size calculation
+// Worst case: 48kHz, stereo, 16-bit PCM, 20ms
+// = (48000 samples/sec × 0.020 sec) × 2 channels × 2 bytes = 3840 bytes
+#define MACEMU_AUDIO_MAX_SAMPLES_PER_FRAME \
+    ((MACEMU_AUDIO_MAX_SAMPLE_RATE * MACEMU_AUDIO_FRAME_MS) / 1000)
+#define MACEMU_AUDIO_MAX_FRAME_SIZE \
+    (MACEMU_AUDIO_MAX_SAMPLES_PER_FRAME * MACEMU_AUDIO_MAX_CHANNELS * 2)
+
+// Number of audio buffers (double buffering sufficient - audio changes less than video)
+#define MACEMU_AUDIO_NUM_BUFFERS      2
 
 /*
  * 32-bit Frame Layout (within each frame buffer):
@@ -105,6 +128,21 @@ extern "C" {
  * 3. On frame complete, emulator calls macemu_frame_complete()
  * 4. Server connects, maps SHM, reads from frames[ready_index]
  * 5. Server converts BGRA to I420 (H.264) or RGB (PNG) based on codec
+ */
+/*
+ * MacEmuIPCBuffer - Shared memory for video, audio, and metadata
+ *
+ * This structure contains:
+ * - Video frames (BGRA, up to 1920x1080, triple-buffered)
+ * - Audio frames (S16LE PCM, up to 48kHz stereo, double-buffered)
+ * - Mouse input latency stats
+ * - Ping/pong RTT measurements
+ * - Frame metadata (dimensions, pixel format, dirty rects, timestamps)
+ *
+ * Synchronization:
+ * - Video: frame_ready_eventfd signals new video frames
+ * - Audio: audio_ready_eventfd signals new audio frames
+ * - Separate eventfds allow independent video/audio processing
  */
 typedef struct {
     // Header - validated by server on connect
@@ -157,10 +195,32 @@ typedef struct {
     // Server uses epoll to wait for new frames instead of polling
     int32_t frame_ready_eventfd;         // eventfd for frame ready notification (-1 if not supported)
 
+    // Audio format (set per-frame like video width/height!)
+    // These fields are updated atomically with audio_ready_index
+    // Server must handle dynamic format changes (sample rate, channels)
+    uint32_t audio_sample_rate;      // DYNAMIC: 11025/22050/44100/48000 Hz (Mac supports all)
+    uint32_t audio_channels;         // DYNAMIC: 1=mono, 2=stereo
+    uint32_t audio_format;           // DYNAMIC: MACEMU_AUDIO_FORMAT_* (PCM_S16/NONE)
+    uint32_t audio_samples_in_frame; // Actual samples in current frame (≤ MAX)
+
+    // Audio synchronization (double buffering)
+    uint32_t audio_write_index;      // Buffer emulator is writing to (0-1)
+    uint32_t audio_ready_index;      // Buffer ready for server to read (0-1)
+    uint64_t audio_frame_count;      // Total audio frames completed
+    uint64_t audio_timestamp_us;     // Timestamp of last audio frame
+
+    int32_t audio_ready_eventfd;     // Separate eventfd for audio frames (-1 if not supported)
+    uint32_t _audio_padding[3];      // Future expansion, alignment
+
+    // Audio buffers (fixed size for max format: 48kHz stereo)
+    // Actual usage varies: 11025 Hz mono uses ~440 bytes, 48000 Hz stereo uses ~3840 bytes
+    // Total: 3840 × 2 = 7680 bytes (~7.5 KB, 0.03% of total SHM)
+    uint8_t audio_frames[MACEMU_AUDIO_NUM_BUFFERS][MACEMU_AUDIO_MAX_FRAME_SIZE];
+
     // BGRA frame buffers - fixed size for max resolution
     // Each frame: width * height * 4 bytes (B, G, R, A per pixel)
     uint8_t frames[MACEMU_NUM_BUFFERS][MACEMU_BGRA_FRAME_SIZE];
-} MacEmuVideoBuffer;
+} MacEmuIPCBuffer;
 
 /*
  * Binary Input Protocol - sent over Unix socket from server to emulator
@@ -248,7 +308,7 @@ typedef union {
  */
 
 // Get pointer to a specific frame buffer
-static inline uint8_t* macemu_get_frame_ptr(MacEmuVideoBuffer* buf, uint32_t index) {
+static inline uint8_t* macemu_get_frame_ptr(MacEmuIPCBuffer* buf, uint32_t index) {
     return buf->frames[index];
 }
 
@@ -258,22 +318,22 @@ static inline int macemu_get_bgra_stride(void) {
 }
 
 // Get pointer to the frame currently being written by emulator
-static inline uint8_t* macemu_get_write_frame(MacEmuVideoBuffer* buf) {
+static inline uint8_t* macemu_get_write_frame(MacEmuIPCBuffer* buf) {
     return macemu_get_frame_ptr(buf, buf->write_index);
 }
 
 // Get pointer to the most recently completed frame (for server to read)
-static inline uint8_t* macemu_get_ready_frame(MacEmuVideoBuffer* buf) {
+static inline uint8_t* macemu_get_ready_frame(MacEmuIPCBuffer* buf) {
     return macemu_get_frame_ptr(buf, buf->ready_index);
 }
 
 // Get BGRA frame pointer for the ready frame (server use)
-static inline uint8_t* macemu_get_ready_bgra(MacEmuVideoBuffer* buf) {
+static inline uint8_t* macemu_get_ready_bgra(MacEmuIPCBuffer* buf) {
     return macemu_get_frame_ptr(buf, buf->ready_index);
 }
 
 // Called by emulator after frame is complete - publishes frame via eventfd
-static inline void macemu_frame_complete(MacEmuVideoBuffer* buf, uint64_t timestamp_us) {
+static inline void macemu_frame_complete(MacEmuIPCBuffer* buf, uint64_t timestamp_us) {
     uint32_t current = buf->write_index;
     uint32_t next = (current + 1) % MACEMU_NUM_BUFFERS;
 
@@ -295,7 +355,7 @@ static inline void macemu_frame_complete(MacEmuVideoBuffer* buf, uint64_t timest
 }
 
 // Initialize video buffer (called by emulator)
-static inline void macemu_init_video_buffer(MacEmuVideoBuffer* buf, uint32_t pid,
+static inline void macemu_init_ipc_buffer(MacEmuIPCBuffer* buf, uint32_t pid,
                                             uint32_t width, uint32_t height) {
     buf->magic = MACEMU_VIDEO_MAGIC;
     buf->version = MACEMU_IPC_VERSION;
@@ -333,10 +393,29 @@ static inline void macemu_init_video_buffer(MacEmuVideoBuffer* buf, uint32_t pid
         fprintf(stderr, "IPC: FATAL: Failed to create eventfd: %s\n", strerror(errno));
         // Caller must check for -1 and handle error
     }
+
+    // Initialize audio subsystem (disabled by default until emulator enables it)
+    buf->audio_sample_rate = 0;
+    buf->audio_channels = 0;
+    buf->audio_format = MACEMU_AUDIO_FORMAT_NONE;
+    buf->audio_samples_in_frame = 0;
+    buf->audio_write_index = 0;
+    buf->audio_ready_index = 0;
+    buf->audio_frame_count = 0;
+    buf->audio_timestamp_us = 0;
+
+    // Create separate eventfd for audio
+    buf->audio_ready_eventfd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
+    if (buf->audio_ready_eventfd < 0) {
+        fprintf(stderr, "IPC: WARNING: Failed to create audio eventfd: %s (audio disabled)\n", strerror(errno));
+    }
+
+    // Zero audio buffers
+    memset(buf->audio_frames, 0, sizeof(buf->audio_frames));
 }
 
 // Validate video buffer (called by server on connect)
-static inline int macemu_validate_video_buffer(const MacEmuVideoBuffer* buf, uint32_t expected_pid) {
+static inline int macemu_validate_ipc_buffer(const MacEmuIPCBuffer* buf, uint32_t expected_pid) {
     if (buf->magic != MACEMU_VIDEO_MAGIC) return -1;
     if (buf->version != MACEMU_IPC_VERSION) return -2;
     if (buf->pid != expected_pid) return -3;
@@ -347,6 +426,56 @@ static inline int macemu_validate_video_buffer(const MacEmuVideoBuffer* buf, uin
 // Calculate actual BGRA frame size for current resolution
 static inline size_t macemu_actual_bgra_size(uint32_t width, uint32_t height) {
     return (size_t)width * height * 4;
+}
+
+// Audio helper functions
+
+// Get pointer to audio frame buffer
+static inline uint8_t* macemu_get_audio_frame_ptr(MacEmuIPCBuffer* buf, uint32_t index) {
+    return buf->audio_frames[index];
+}
+
+// Get pointer to ready audio frame (for server to read)
+static inline const uint8_t* macemu_get_ready_audio(const MacEmuIPCBuffer* buf) {
+    return buf->audio_frames[buf->audio_ready_index];
+}
+
+// Get pointer to write audio frame (for emulator to write)
+static inline uint8_t* macemu_get_write_audio(MacEmuIPCBuffer* buf) {
+    return buf->audio_frames[buf->audio_write_index];
+}
+
+// Called by emulator after audio frame is complete - publishes audio via eventfd
+// Parameters match the audio metadata fields for atomic publication
+static inline void macemu_audio_frame_complete(MacEmuIPCBuffer* buf,
+                                                uint32_t sample_rate,
+                                                uint32_t channels,
+                                                uint32_t samples,
+                                                uint64_t timestamp_us) {
+    uint32_t current = buf->audio_write_index;
+    uint32_t next = (current + 1) % MACEMU_AUDIO_NUM_BUFFERS;
+
+    // Write all metadata (plain writes - eventfd provides memory barrier)
+    buf->audio_sample_rate = sample_rate;
+    buf->audio_channels = channels;
+    buf->audio_format = MACEMU_AUDIO_FORMAT_PCM_S16;
+    buf->audio_samples_in_frame = samples;
+    buf->audio_timestamp_us = timestamp_us;
+    buf->audio_ready_index = current;
+    buf->audio_write_index = next;
+    buf->audio_frame_count++;
+
+    // Signal eventfd to wake up server (kernel write() provides memory barrier)
+    // All writes above are guaranteed visible after server's read(eventfd)
+    if (buf->audio_ready_eventfd >= 0) {
+        uint64_t val = 1;
+        (void)write(buf->audio_ready_eventfd, &val, sizeof(val));
+    }
+}
+
+// Calculate actual audio frame size based on current format
+static inline size_t macemu_actual_audio_size(const MacEmuIPCBuffer* buf) {
+    return (size_t)buf->audio_samples_in_frame * buf->audio_channels * 2;  // 2 bytes per S16 sample
 }
 
 #ifdef __cplusplus

@@ -953,6 +953,13 @@ if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
   VIDEOSRCS="../IPC/video_ipc.cpp"
   KEYCODES="../SDL/keycodes"
   EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"
+  dnl Set audio source for IPC audio if enabled
+  if [[ "x$WANT_IPC_AUDIO" = "xyes" ]]; then
+    AUDIOSRC="../IPC/audio_ipc.cpp"
+  else
+    dnl When using IPC video without IPC audio, use dummy audio
+    AUDIOSRC=../dummy/audio_dummy.cpp
+  fi
 elif [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
   AC_DEFINE(USE_SDL_VIDEO, 1, [Define to enable SDL video graphics support])
   VIDEOSRCS="../SDL/video_sdl.cpp ../SDL/video_sdl2.cpp ../SDL/video_sdl3.cpp "

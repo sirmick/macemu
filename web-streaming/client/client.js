@@ -1070,9 +1070,85 @@ class BasiliskWebRTC {
         }
         connectionSteps.setDone('track');
         connectionSteps.setActive('frames');
-        this.updateOverlayStatus('Receiving video stream...');
+        this.updateOverlayStatus('Receiving stream...');
 
-        if (event.track.kind === 'video') {
+        // Handle audio track
+        if (event.track.kind === 'audio') {
+            logger.info('Audio track received', {
+                id: event.track.id,
+                label: event.track.label,
+                enabled: event.track.enabled,
+                muted: event.track.muted,
+                readyState: event.track.readyState
+            });
+
+            this.audioTrack = event.track;
+
+            // Ensure track is enabled (not disabled)
+            event.track.enabled = true;
+
+            // Track state monitoring
+            event.track.onmute = () => {
+                logger.warn('Audio track muted');
+                this.updateWebRTCState('audio-track-muted', 'Yes');
+            };
+            event.track.onunmute = () => {
+                logger.info('Audio track unmuted');
+                this.updateWebRTCState('audio-track-muted', 'No');
+            };
+            event.track.onended = () => {
+                logger.warn('Audio track ended');
+                this.updateWebRTCState('audio-track-state', 'Ended');
+            };
+
+            // Log initial mute state
+            if (event.track.muted) {
+                logger.warn('Audio track arrived MUTED - this may indicate no audio data', {
+                    readyState: event.track.readyState,
+                    enabled: event.track.enabled
+                });
+            }
+
+            this.updateWebRTCState('audio-track-state', event.track.readyState);
+            this.updateWebRTCState('audio-track-enabled', event.track.enabled ? 'Yes' : 'No');
+            this.updateWebRTCState('audio-track-muted', event.track.muted ? 'Yes' : 'No');
+            this.updateWebRTCState('audio-format', 'Opus 48kHz Stereo');
+
+            // Create or get audio element
+            let audioElement = document.getElementById('macemu-audio');
+            if (!audioElement) {
+                audioElement = document.createElement('audio');
+                audioElement.id = 'macemu-audio';
+                audioElement.autoplay = true;
+                audioElement.volume = 1.0;
+                document.body.appendChild(audioElement);
+                logger.info('Created audio element for playback');
+            }
+
+            // Attach audio stream
+            if (event.streams && event.streams[0]) {
+                audioElement.srcObject = event.streams[0];
+
+                // Add event listeners to monitor audio playback
+                audioElement.onplay = () => logger.info('Audio element: playing');
+                audioElement.onpause = () => logger.warn('Audio element: paused');
+                audioElement.onvolumechange = () => logger.info('Audio volume changed', { volume: audioElement.volume, muted: audioElement.muted });
+
+                audioElement.play().then(() => {
+                    logger.info('Audio play() succeeded', {
+                        volume: audioElement.volume,
+                        muted: audioElement.muted,
+                        paused: audioElement.paused,
+                        readyState: audioElement.readyState
+                    });
+                }).catch(e => {
+                    logger.warn('Audio play() failed', { error: e.message });
+                });
+            }
+        }
+
+        // Handle video track
+        else if (event.track.kind === 'video') {
             this.videoTrack = event.track;
 
             // Track state monitoring
@@ -1782,7 +1858,11 @@ class BasiliskWebRTC {
             'track-state': 'track-state',
             'track-enabled': 'track-enabled',
             'track-muted': 'track-muted',
-            'video-size': 'video-size'
+            'video-size': 'video-size',
+            'audio-track-state': 'audio-track-state',
+            'audio-track-enabled': 'audio-track-enabled',
+            'audio-track-muted': 'audio-track-muted',
+            'audio-format': 'audio-format'
         };
 
         const elId = stateMap[key];
