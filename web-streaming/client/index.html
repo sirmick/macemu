@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Basilisk II - WebRTC (libdatachannel)</title>
+    <title>SheepShaver - WebRTC</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <header>
         <div class="logo">
             <span style="font-size: 1.5em;">&#128421;</span>
-            <h1>Basilisk II Web</h1>
+            <h1>SheepShaver Web</h1>
             <span class="badge" id="codec-badge">Loading...</span>
         </div>
 
@@ -48,7 +48,7 @@
                 <div class="overlay" id="overlay">
                     <div class="overlay-content">
                         <div class="spinner" id="spinner"></div>
-                        <h2 id="overlay-title">Connecting to Basilisk II</h2>
+                        <h2 id="overlay-title">Connecting to SheepShaver</h2>
                         <p id="overlay-status">Initializing...</p>
 
                         <div class="connection-steps" id="connection-steps">
@@ -217,7 +217,7 @@
     </main>
 
     <footer>
-        <span>Basilisk II WebRTC Streaming</span>
+        <span>SheepShaver WebRTC Streaming</span>
         <span id="resolution">-- x --</span>
     </footer>
 
@@ -231,7 +231,7 @@
             <div class="modal-body">
                 <div class="form-group">
                     <label>ROM File</label>
-                    <select id="cfg-rom" onchange="onRomChange()">
+                    <select id="cfg-rom">
                         <option value="">Loading...</option>
                     </select>
                 </div>
@@ -249,13 +249,12 @@
                 <div class="form-group">
                     <label>RAM Size</label>
                     <select id="cfg-ram">
-                        <option value="8">8 MB</option>
-                        <option value="16">16 MB</option>
-                        <option value="32" selected>32 MB</option>
                         <option value="64">64 MB</option>
                         <option value="128">128 MB</option>
                         <option value="256">256 MB</option>
                         <option value="512">512 MB</option>
+                        <option value="1024" selected>1 GB</option>
+                        <option value="2048">2 GB</option>
                     </select>
                 </div>
 
@@ -286,39 +285,22 @@
                 <div class="advanced-content" id="advanced-settings">
                     <div class="form-row">
                         <div class="form-group">
-                            <label>CPU Type</label>
-                            <select id="cfg-cpu">
-                                <option value="2">68020</option>
-                                <option value="3">68030</option>
-                                <option value="4" selected>68040</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Mac Model</label>
-                            <select id="cfg-model">
-                                <option value="5">Mac II</option>
-                                <option value="14" selected>Quadra 900</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
                             <div class="checkbox-group">
-                                <input type="checkbox" id="cfg-fpu" checked>
-                                <label for="cfg-fpu">Enable FPU (68881)</label>
+                                <input type="checkbox" id="cfg-jit">
+                                <label for="cfg-jit">Enable JIT Compiler</label>
                             </div>
                         </div>
                         <div class="form-group">
                             <div class="checkbox-group">
-                                <input type="checkbox" id="cfg-jit" checked>
-                                <label for="cfg-jit">Enable JIT Compiler</label>
+                                <input type="checkbox" id="cfg-sound" checked>
+                                <label for="cfg-sound">Enable Sound</label>
                             </div>
                         </div>
                     </div>
                     <div class="form-group">
                         <div class="checkbox-group">
-                            <input type="checkbox" id="cfg-sound" checked>
-                            <label for="cfg-sound">Enable Sound</label>
+                            <input type="checkbox" id="cfg-idlewait" checked>
+                            <label for="cfg-idlewait">Idle Wait (reduce CPU usage)</label>
                         </div>
                     </div>
                 </div>

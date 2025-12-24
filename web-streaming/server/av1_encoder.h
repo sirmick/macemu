@@ -1,13 +1,16 @@
 /*
  * AV1 Encoder using SVT-AV1
+ * Note: SVT-AV1 is only available on Linux. On macOS, this provides a stub.
  */
 
 #ifndef AV1_ENCODER_H
 #define AV1_ENCODER_H
 
 #include "codec.h"
-#include <EbSvtAv1Enc.h>
 #include <vector>
+
+#ifdef HAVE_AV1
+#include <EbSvtAv1Enc.h>
 
 class AV1Encoder : public VideoCodec {
 public:
@@ -41,5 +44,37 @@ private:
     EbBufferHeaderType* input_buffer_ = nullptr;
     EbSvtIOFormat* input_picture_ = nullptr;
 };
+
+#else
+// Stub implementation for platforms without SVT-AV1
+
+class AV1Encoder : public VideoCodec {
+public:
+    AV1Encoder() = default;
+    ~AV1Encoder() override { cleanup(); }
+
+    CodecType type() const override { return CodecType::AV1; }
+    const char* name() const override { return "AV1 (unavailable)"; }
+
+    bool init(int, int, int = 30) override {
+        fprintf(stderr, "AV1: SVT-AV1 not available on this platform\n");
+        return false;
+    }
+
+    void cleanup() override {}
+
+    EncodedFrame encode_i420(const uint8_t*, const uint8_t*, const uint8_t*,
+                             int, int, int, int) override {
+        return EncodedFrame();
+    }
+
+    EncodedFrame encode_bgra(const uint8_t*, int, int, int) override {
+        return EncodedFrame();
+    }
+
+    void request_keyframe() override {}
+};
+
+#endif // HAVE_AV1
 
 #endif // AV1_ENCODER_H

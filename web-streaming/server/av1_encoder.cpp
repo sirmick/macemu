@@ -1,6 +1,9 @@
 /*
  * AV1 Encoder using SVT-AV1
+ * Only compiled when HAVE_AV1 is defined (SVT-AV1 available)
  */
+
+#ifdef HAVE_AV1
 
 #include "av1_encoder.h"
 #include <cstdio>
@@ -268,3 +271,5 @@ EncodedFrame AV1Encoder::encode_bgra(const uint8_t* bgra, int width, int height,
 
     return encode_i420(y, u, v, width, height, width, width / 2);
 }
+
+#endif // HAVE_AV1

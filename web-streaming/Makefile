@@ -1,9 +1,21 @@
 # macemu WebRTC Streaming Server Makefile
-# Generated from Makefile.in by configure
 
-CXX = g++ -std=c++17
-CXXFLAGS = -g -O2 -Wall -Wextra -O2 -g -fPIC
+CXX = clang++
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fPIC
+LDFLAGS = -lpthread
 INSTALL = /usr/bin/install -c
+
+# Platform detection
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+ifeq ($(UNAME_S),Darwin)
+    NPROC := $(shell sysctl -n hw.ncpu)
+    RT_LIBS :=
+else
+    NPROC := $(shell nproc)
+    RT_LIBS := -lrt
+endif
 
 # Directories
 SERVER_DIR = server
@@ -14,25 +26,44 @@ BUILD_DIR = build
 LIBDATACHANNEL_DIR = libdatachannel
 LIBDATACHANNEL_BUILD = libdatachannel/build
 LIBDATACHANNEL_LIB = libdatachannel/build/libdatachannel.a
-HAVE_LIBDATACHANNEL = yes
-CMAKE = 
+LIBDATACHANNEL_INCLUDES = -Ilibdatachannel/include
 
-# Compiler and linker flags from configure
-SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include -I/usr/include/svt-av1 -DEB_DLL -msse4.1 -mpclmul
-SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264 -lSvtAv1Enc -lssl -lcrypto -lyuv -lpthread -lrt
-FPNG_CFLAGS = -msse4.1 -mpclmul
+# libdatachannel dependencies (built alongside libdatachannel)
+LIBJUICE = $(LIBDATACHANNEL_BUILD)/deps/libjuice/libjuice.a
+LIBSRTP = $(LIBDATACHANNEL_BUILD)/deps/libsrtp/libsrtp2.a
+USRSCTP = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
+
+# OpenH264 (system package)
+H264_CFLAGS = $(shell pkg-config --cflags openh264 2>/dev/null)
+H264_LIBS = $(shell pkg-config --libs openh264 2>/dev/null || echo "-lopenh264")
+
+# OpenSSL (system package)
+OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS = $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
+
+# fpng (included - fast PNG encoder, no external dependency)
+# fpng uses CRC32 intrinsics - ARM uses __crc32, x86 uses SSE4.1/pclmul
+ifeq ($(UNAME_M),arm64)
+    FPNG_CFLAGS = -mcrc
+else ifeq ($(UNAME_M),aarch64)
+    FPNG_CFLAGS = -mcrc
+else
+    FPNG_CFLAGS = -msse4.1 -mpclmul
+endif
+
+# Combined flags (no libyuv dependency - using manual conversion)
+SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(H264_CFLAGS) $(OPENSSL_CFLAGS) $(FPNG_CFLAGS)
+SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(H264_LIBS) $(OPENSSL_LIBS) -lpthread $(RT_LIBS)
 
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
-              $(SERVER_DIR)/av1_encoder.cpp \
               $(SERVER_DIR)/png_encoder.cpp \
               $(SERVER_DIR)/fpng.cpp
 
 # Object files
 SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/h264_encoder.o \
-              $(BUILD_DIR)/av1_encoder.o \
               $(BUILD_DIR)/png_encoder.o \
               $(BUILD_DIR)/fpng.o
 
@@ -40,7 +71,7 @@ SERVER_OBJS = $(BUILD_DIR)/server.o \
 SERVER = $(BUILD_DIR)/macemu-webrtc
 
 # Default target
-all: libdatachannel dirs $(SERVER)
+all: deps-check libdatachannel dirs $(SERVER)
 	@echo ""
 	@echo "Build complete!"
 	@echo "Server: $(SERVER)"
@@ -48,49 +79,43 @@ all: libdatachannel dirs $(SERVER)
 	@echo "Usage:"
 	@echo "  1. Start the server: ./$(SERVER)"
 	@echo "     (note the PID-based socket path it prints)"
-	@echo "  2. Build Basilisk II with: ./configure --enable-ipc-video && make"
-	@echo "  3. Run emulator: MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
+	@echo "  2. Build SheepShaver with: ./configure --enable-ipc-video && make"
+	@echo "  3. Run emulator: ./SheepShaver"
 	@echo "  4. Open http://localhost:8000 in your browser"
 
 # Create build directory
 dirs:
 	@mkdir -p $(BUILD_DIR)
 
-# libdatachannel must be built before running configure
-# This is just a placeholder target
-libdatachannel:
-	@echo "libdatachannel is already built (checked by configure)"
+# Build libdatachannel
+libdatachannel: $(LIBDATACHANNEL_LIB)
 
 $(LIBDATACHANNEL_LIB):
-	@echo "ERROR: libdatachannel not found."
-	@echo "This should have been caught by configure. Please re-run ./configure"
-	@exit 1
+	@echo "Building libdatachannel..."
+	@mkdir -p $(LIBDATACHANNEL_BUILD)
+	cd $(LIBDATACHANNEL_BUILD) && cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DNO_WEBSOCKET=OFF \
+		-DNO_MEDIA=OFF \
+		-DNO_EXAMPLES=ON \
+		-DNO_TESTS=ON \
+		-DUSE_GNUTLS=OFF \
+		-DUSE_MBEDTLS=OFF \
+		-DUSE_NICE=OFF \
+		-DBUILD_SHARED_LIBS=OFF
+	$(MAKE) -C $(LIBDATACHANNEL_BUILD) -j$(NPROC)
+	@echo "libdatachannel built successfully"
 
 # Compile server
-$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp \
-                       ../BasiliskII/src/IPC/ipc_protocol.h \
-                       $(SERVER_DIR)/codec.h \
-                       $(SERVER_DIR)/h264_encoder.h \
-                       $(LIBDATACHANNEL_LIB)
+$(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp $(SERVER_DIR)/codec.h $(SERVER_DIR)/h264_encoder.h $(LIBDATACHANNEL_LIB)
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile H.264 encoder
-$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp \
-                              $(SERVER_DIR)/h264_encoder.h \
-                              $(SERVER_DIR)/codec.h
-	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
-
-# Compile AV1 encoder
-$(BUILD_DIR)/av1_encoder.o: $(SERVER_DIR)/av1_encoder.cpp \
-                             $(SERVER_DIR)/av1_encoder.h \
-                             $(SERVER_DIR)/codec.h
+$(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp $(SERVER_DIR)/h264_encoder.h $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile PNG encoder
-$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp \
-                             $(SERVER_DIR)/png_encoder.h \
-                             $(SERVER_DIR)/codec.h \
-                             $(SERVER_DIR)/fpng.h
+$(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp $(SERVER_DIR)/png_encoder.h $(SERVER_DIR)/codec.h $(SERVER_DIR)/fpng.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile fpng (fast PNG library)
@@ -110,10 +135,27 @@ clean:
 	rm -rf $(BUILD_DIR)
 	rm -f config.h config.log config.status
 
-# Clean everything including libdatachannel and configure artifacts
+# Clean everything including libdatachannel
 distclean: clean
 	rm -rf $(LIBDATACHANNEL_BUILD)
-	rm -f Makefile
+
+# Check dependencies
+deps-check:
+	@echo "Checking dependencies..."
+	@which cmake >/dev/null 2>&1 || (echo "ERROR: cmake not found" && exit 1)
+	@which pkg-config >/dev/null 2>&1 || (echo "ERROR: pkg-config not found" && exit 1)
+	@pkg-config --exists openh264 2>/dev/null || (echo "ERROR: openh264 not found" && exit 1)
+	@pkg-config --exists openssl 2>/dev/null || (echo "ERROR: openssl not found" && exit 1)
+	@echo "All dependencies found!"
+
+# Install dependencies (platform-specific)
+ifeq ($(UNAME_S),Darwin)
+deps:
+	brew install cmake pkg-config openh264 openssl
+else
+deps:
+	sudo apt-get install -y cmake pkg-config libopenh264-dev libssl-dev
+endif
 
 # Install server
 install: $(SERVER)
@@ -146,4 +188,4 @@ help:
 	@echo "     MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
 	@echo "  6. Open http://localhost:8000 in browser"
 
-.PHONY: all dirs run clean distclean help libdatachannel install
+.PHONY: all dirs run clean distclean deps deps-check help libdatachannel install

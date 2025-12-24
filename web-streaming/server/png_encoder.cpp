@@ -8,8 +8,12 @@
 #include <cstring>
 #include <cstdio>
 
-// libyuv for fast I420 to RGB conversion
+// Use libyuv if available, otherwise use fallback
+#ifdef HAVE_LIBYUV
 #include <libyuv.h>
+#else
+#include "libyuv_fallback.h"
+#endif
 
 // Debug flags (from server.cpp)
 extern bool g_debug_mode_switch;

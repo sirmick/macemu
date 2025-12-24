@@ -27,6 +27,7 @@
 #include <atomic>
 #include <map>
 #include <vector>
+#include <deque>
 #include <thread>
 #include <chrono>
 #include <functional>
@@ -47,13 +48,21 @@
 #include <pwd.h>
 #include <poll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
 
+// Platform-specific event notification
+#ifdef __linux__
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#define HAVE_EPOLL 1
+#else
+// macOS and others: use poll() fallback
+#define HAVE_EPOLL 0
+#endif
 
 // Configuration
 static int g_http_port = 8000;
@@ -92,6 +101,12 @@ static std::string g_connected_socket_path;
 static std::atomic<uint64_t> g_mouse_move_count(0);
 static std::atomic<uint64_t> g_mouse_click_count(0);
 static std::atomic<uint64_t> g_key_count(0);
+
+// Emulator log capture
+static int g_emulator_log_pipe[2] = {-1, -1};  // Pipe for capturing emulator stdout/stderr
+static std::mutex g_emulator_logs_mutex;
+static std::deque<std::string> g_emulator_logs;  // Ring buffer of recent log lines
+static const size_t MAX_EMULATOR_LOGS = 200;  // Keep last 200 lines
 
 
 // Global flag to request keyframe (set when new peer connects)
@@ -373,13 +388,15 @@ static void disconnect_control_socket() {
 static bool send_key_input(int mac_keycode, bool down) {
     if (g_control_socket < 0) return false;
 
-    MacEmuKeyInput msg;
-    msg.hdr.type = MACEMU_INPUT_KEY;
-    msg.hdr.flags = down ? MACEMU_KEY_DOWN : MACEMU_KEY_UP;
-    msg.hdr._reserved = 0;
-    msg.mac_keycode = mac_keycode;
-    msg.modifiers = 0;  // TODO: track modifier state
-    msg._reserved = 0;
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.key.hdr.type = MACEMU_INPUT_KEY;
+    msg.key.hdr.flags = down ? MACEMU_KEY_DOWN : MACEMU_KEY_UP;
+    msg.key.hdr._reserved = 0;
+    msg.key.mac_keycode = mac_keycode;
+    msg.key.modifiers = 0;  // TODO: track modifier state
+    msg.key._reserved = 0;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -387,15 +404,16 @@ static bool send_key_input(int mac_keycode, bool down) {
 static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms) {
     if (g_control_socket < 0) return false;
 
-    MacEmuMouseInput msg;
-    msg.hdr.type = MACEMU_INPUT_MOUSE;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.x = dx;
-    msg.y = dy;
-    msg.buttons = buttons;
-    memset(msg._reserved, 0, sizeof(msg._reserved));
-    msg.timestamp_ms = browser_timestamp_ms;
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.mouse.hdr.type = MACEMU_INPUT_MOUSE;
+    msg.mouse.hdr.flags = 0;
+    msg.mouse.hdr._reserved = 0;
+    msg.mouse.x = dx;
+    msg.mouse.y = dy;
+    msg.mouse.buttons = buttons;
+    msg.mouse.timestamp_ms = browser_timestamp_ms;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -403,12 +421,13 @@ static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_t
 static bool send_command(uint8_t command) {
     if (g_control_socket < 0) return false;
 
-    MacEmuCommandInput msg;
-    msg.hdr.type = MACEMU_INPUT_COMMAND;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.command = command;
-    memset(msg._reserved, 0, sizeof(msg._reserved));
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.cmd.hdr.type = MACEMU_INPUT_COMMAND;
+    msg.cmd.hdr.flags = 0;
+    msg.cmd.hdr._reserved = 0;
+    msg.cmd.command = command;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -421,14 +440,16 @@ static bool send_ping_input(uint32_t sequence, uint64_t t1_browser_send_ms) {
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t t2_server_recv_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
-    MacEmuPingInput msg;
-    msg.hdr.type = MACEMU_INPUT_PING;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.sequence = sequence;
-    msg.t1_browser_send_ms = t1_browser_send_ms;
-    msg.t2_server_recv_us = t2_server_recv_us;
-    msg.t3_emulator_recv_us = 0;  // Will be filled by emulator
+    // Send full union size - emulator expects sizeof(MacEmuInput) with MSG_WAITALL
+    MacEmuInput msg;
+    memset(&msg, 0, sizeof(msg));  // Zero padding
+    msg.ping.hdr.type = MACEMU_INPUT_PING;
+    msg.ping.hdr.flags = 0;
+    msg.ping.hdr._reserved = 0;
+    msg.ping.sequence = sequence;
+    msg.ping.t1_browser_send_ms = t1_browser_send_ms;
+    msg.ping.t2_server_recv_us = t2_server_recv_us;
+    msg.ping.t3_emulator_recv_us = 0;  // Will be filled by emulator
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -458,12 +479,16 @@ static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr);
 
 
 /*
- * Scan for running emulators (look for SHM files)
+ * Scan for running emulators
+ * Linux: look for SHM files in /dev/shm
+ * macOS: look for socket files in /tmp
  */
 
 static std::vector<pid_t> scan_for_emulators() {
     std::vector<pid_t> pids;
 
+#ifdef __linux__
+    // Linux: scan /dev/shm for SHM files
     DIR* dir = opendir("/dev/shm");
     if (!dir) return pids;
 
@@ -483,6 +508,40 @@ static std::vector<pid_t> scan_for_emulators() {
         }
     }
     closedir(dir);
+#else
+    // macOS: scan /tmp for socket files
+    DIR* dir = opendir("/tmp");
+    if (!dir) return pids;
+
+    struct dirent* entry;
+    const char* prefix = "macemu-";
+    const char* suffix = ".sock";
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+
+    while ((entry = readdir(dir)) != nullptr) {
+        size_t name_len = strlen(entry->d_name);
+        if (name_len > prefix_len + suffix_len &&
+            strncmp(entry->d_name, prefix, prefix_len) == 0 &&
+            strcmp(entry->d_name + name_len - suffix_len, suffix) == 0) {
+            // Extract PID from filename (macemu-PID.sock)
+            char pid_str[32];
+            size_t pid_len = name_len - prefix_len - suffix_len;
+            if (pid_len < sizeof(pid_str)) {
+                strncpy(pid_str, entry->d_name + prefix_len, pid_len);
+                pid_str[pid_len] = '\0';
+                pid_t pid = atoi(pid_str);
+                if (pid > 0) {
+                    // Check if process still exists
+                    if (kill(pid, 0) == 0) {
+                        pids.push_back(pid);
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
+#endif
 
     return pids;
 }
@@ -525,6 +584,52 @@ static std::string find_emulator() {
 
 static pid_t g_started_emulator_pid = -1;  // PID of emulator we started
 
+// Add emulator log line to ring buffer
+static void add_emulator_log(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_emulator_logs_mutex);
+    g_emulator_logs.push_back(line);
+    while (g_emulator_logs.size() > MAX_EMULATOR_LOGS) {
+        g_emulator_logs.pop_front();
+    }
+    // Also print to server console
+    fprintf(stderr, "[Emu] %s\n", line.c_str());
+}
+
+// Thread function to read emulator output
+static void emulator_log_reader_thread() {
+    char buffer[4096];
+    std::string partial_line;
+
+    while (g_running && g_emulator_log_pipe[0] >= 0) {
+        ssize_t n = read(g_emulator_log_pipe[0], buffer, sizeof(buffer) - 1);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            break;  // Pipe closed or error
+        }
+        buffer[n] = '\0';
+
+        // Split into lines
+        partial_line += buffer;
+        size_t pos;
+        while ((pos = partial_line.find('\n')) != std::string::npos) {
+            std::string line = partial_line.substr(0, pos);
+            // Remove carriage return if present
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (!line.empty()) {
+                add_emulator_log(line);
+            }
+            partial_line = partial_line.substr(pos + 1);
+        }
+    }
+
+    // Handle any remaining partial line
+    if (!partial_line.empty()) {
+        add_emulator_log(partial_line);
+    }
+}
+
 static bool start_emulator() {
     if (g_started_emulator_pid > 0) {
         // Already started one, check if still alive
@@ -546,6 +651,20 @@ static bool start_emulator() {
 
     fprintf(stderr, "Emulator: Starting %s --config %s\n", emu_path.c_str(), g_prefs_path.c_str());
 
+    // Create pipe for capturing emulator output
+    if (g_emulator_log_pipe[0] >= 0) {
+        close(g_emulator_log_pipe[0]);
+        g_emulator_log_pipe[0] = -1;
+    }
+    if (g_emulator_log_pipe[1] >= 0) {
+        close(g_emulator_log_pipe[1]);
+        g_emulator_log_pipe[1] = -1;
+    }
+    if (pipe(g_emulator_log_pipe) < 0) {
+        fprintf(stderr, "Emulator: Failed to create log pipe: %s\n", strerror(errno));
+        // Continue anyway, just won't capture logs
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "Emulator: Fork failed: %s\n", strerror(errno));
@@ -554,6 +673,14 @@ static bool start_emulator() {
 
     if (pid == 0) {
         // Child process
+
+        // Redirect stdout and stderr to pipe
+        if (g_emulator_log_pipe[1] >= 0) {
+            dup2(g_emulator_log_pipe[1], STDOUT_FILENO);
+            dup2(g_emulator_log_pipe[1], STDERR_FILENO);
+            close(g_emulator_log_pipe[0]);
+            close(g_emulator_log_pipe[1]);
+        }
 
         // Close server's file descriptors
         for (int fd = 3; fd < 1024; fd++) {
@@ -566,14 +693,9 @@ static bool start_emulator() {
         if (g_debug_frames) setenv("MACEMU_DEBUG_FRAMES", "1", 1);
 
         // Execute emulator with prefs file
-        // BasiliskII uses --config, SheepShaver uses --prefs
-        if (emu_path.find("SheepShaver") != std::string::npos) {
-            execl(emu_path.c_str(), emu_path.c_str(),
-                  "--prefs", g_prefs_path.c_str(), nullptr);
-        } else {
-            execl(emu_path.c_str(), emu_path.c_str(),
-                  "--config", g_prefs_path.c_str(), nullptr);
-        }
+        // Both SheepShaver and BasiliskII support --config
+        execl(emu_path.c_str(), emu_path.c_str(),
+              "--config", g_prefs_path.c_str(), nullptr);
 
         // If exec fails
         fprintf(stderr, "Emulator: Exec failed: %s\n", strerror(errno));
@@ -583,6 +705,18 @@ static bool start_emulator() {
     // Parent process
     g_started_emulator_pid = pid;
     fprintf(stderr, "Emulator: Started with PID %d\n", pid);
+
+    // Close write end of pipe (only child writes)
+    if (g_emulator_log_pipe[1] >= 0) {
+        close(g_emulator_log_pipe[1]);
+        g_emulator_log_pipe[1] = -1;
+    }
+
+    // Start thread to read emulator output
+    if (g_emulator_log_pipe[0] >= 0) {
+        std::thread(emulator_log_reader_thread).detach();
+    }
+
     return true;
 }
 
@@ -987,20 +1121,14 @@ public:
         if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
             fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEADDR: %s\n", strerror(errno));
         }
+#ifdef SO_REUSEPORT
+        if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+            fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEPORT: %s\n", strerror(errno));
+        }
+#endif
 
-        int flags = fcntl(server_fd_, F_GETFL, 0);
-        if (flags < 0) {
-            fprintf(stderr, "HTTP: Failed to get socket flags: %s\n", strerror(errno));
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
-        if (fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-            fprintf(stderr, "HTTP: Failed to set non-blocking mode: %s\n", strerror(errno));
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
+        // Keep server socket BLOCKING - poll() handles the waiting
+        // Non-blocking accept() can cause race conditions with connection drops
 
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
@@ -1014,7 +1142,7 @@ public:
             return false;
         }
 
-        if (listen(server_fd_, 10) < 0) {
+        if (listen(server_fd_, 128) < 0) {
             fprintf(stderr, "HTTP: Failed to listen\n");
             close(server_fd_);
             server_fd_ = -1;
@@ -1054,7 +1182,22 @@ private:
             int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
             if (client_fd < 0) continue;
 
+            // Set socket options for reliable handling
+            struct timeval tv;
+            tv.tv_sec = 5;  // 5 second timeout
+            tv.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            // Disable Nagle's algorithm for immediate sends
+            int flag = 1;
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+            // Handle client synchronously (simple and reliable)
             handle_client(client_fd);
+
+            // Ensure clean shutdown
+            shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
         }
     }
@@ -1127,8 +1270,10 @@ private:
             std::string content = json_get_string(body, "content");
             fprintf(stderr, "Config: Extracted content length=%zu\n", content.size());
             if (content.empty()) {
-                fprintf(stderr, "Config: WARNING - extracted content is empty! Body: %s\n",
+                fprintf(stderr, "Config: ERROR - rejecting empty content! Body: %s\n",
                         body.substr(0, 200).c_str());
+                send_json_response(fd, "{\"success\": false, \"error\": \"Empty content - rejected\"}");
+                return;
             }
             if (write_prefs_file(content)) {
                 send_json_response(fd, "{\"success\": true}");
@@ -1165,6 +1310,23 @@ private:
                 json << ", \"mouse_latency_samples\": " << latency_samples;
             }
             json << "}";
+            send_json_response(fd, json.str());
+            return;
+        }
+
+        if (path == "/api/emulator-logs" && method == "GET") {
+            std::ostringstream json;
+            json << "{\"logs\": [";
+            {
+                std::lock_guard<std::mutex> lock(g_emulator_logs_mutex);
+                bool first = true;
+                for (const auto& line : g_emulator_logs) {
+                    if (!first) json << ",";
+                    first = false;
+                    json << "\"" << json_escape(line) << "\"";
+                }
+            }
+            json << "]}";
             send_json_response(fd, json.str());
             return;
         }
@@ -2204,7 +2366,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
     // Track input counts between stats intervals
     uint64_t last_mouse_move = 0;
 
-    // Create epoll instance for low-latency event notification (REQUIRED)
+    // Create event notification (platform-specific)
+#if HAVE_EPOLL
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         fprintf(stderr, "Video: FATAL: Failed to create epoll: %s\n", strerror(errno));
@@ -2212,7 +2375,13 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         return;
     }
     int current_eventfd = -1;  // Track which eventfd is registered
+#else
+    // macOS: use polling fallback
+    int epoll_fd = -1;  // Not used on macOS
+    (void)epoll_fd;
+#endif
     pid_t current_emulator_pid = -1;  // Track which emulator we're connected to
+    uint64_t last_frame_count = 0;  // For polling fallback
 
     fprintf(stderr, "Video: Starting frame processing loop\n");
 
@@ -2255,6 +2424,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                     fprintf(stderr, "Video: Auto-restarting emulator...\n");
                     disconnect_from_emulator(&webrtc);
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    // Re-read codec preference in case it changed
+                    read_webcodec_pref();
                     start_emulator();
                 }
             }
@@ -2269,6 +2440,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                 }
                 disconnect_from_emulator(&webrtc);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                // Re-read codec preference in case it changed
+                read_webcodec_pref();
                 if (g_auto_start_emulator) {
                     start_emulator();
                 }
@@ -2292,6 +2465,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             continue;
         }
 
+#if HAVE_EPOLL
         // Register eventfd with epoll when emulator PID changes (new connection or restart)
         // Kernel may reuse same fd number, so we check PID to detect new emulator
         if (g_emulator_connected && current_emulator_pid != g_emulator_pid) {
@@ -2350,6 +2524,23 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             // Timeout or error - continue loop
             continue;
         }
+#else
+        // macOS: use polling fallback - check frame_count for new frames
+        if (g_emulator_connected && current_emulator_pid != g_emulator_pid) {
+            current_emulator_pid = g_emulator_pid;
+            last_frame_count = 0;  // Reset on new connection
+            fprintf(stderr, "Video: Connected to emulator PID %d (polling mode)\n", current_emulator_pid);
+        }
+
+        // Poll for new frames by checking frame_count
+        uint64_t current_frame_count = ATOMIC_LOAD(g_video_shm->frame_count);
+        if (current_frame_count == last_frame_count) {
+            // No new frame, wait briefly and continue
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        last_frame_count = current_frame_count;
+#endif
 
         // Latency measurement: time from emulator frame completion to now
         // Plain read - synchronized by eventfd read above
@@ -2565,9 +2756,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
     }
 
     // Clean up epoll
+#if HAVE_EPOLL
     if (epoll_fd >= 0) {
         close(epoll_fd);
     }
+#endif
 
     fprintf(stderr, "Video: Exiting frame processing loop\n");
 }
@@ -2692,6 +2885,21 @@ int main(int argc, char* argv[]) {
     // Check environment variables
     if (const char* env = getenv("BASILISK_ROMS")) g_roms_path = env;
     if (const char* env = getenv("BASILISK_IMAGES")) g_images_path = env;
+
+    // Convert paths to absolute (required for emulator which may have different cwd)
+    char* abs_path;
+    if ((abs_path = realpath(g_roms_path.c_str(), nullptr)) != nullptr) {
+        g_roms_path = abs_path;
+        free(abs_path);
+    }
+    if ((abs_path = realpath(g_images_path.c_str(), nullptr)) != nullptr) {
+        g_images_path = abs_path;
+        free(abs_path);
+    }
+    if ((abs_path = realpath(g_prefs_path.c_str(), nullptr)) != nullptr) {
+        g_prefs_path = abs_path;
+        free(abs_path);
+    }
 
     // Set up signal handlers
     signal(SIGINT, signal_handler);

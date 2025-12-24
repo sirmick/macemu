@@ -75,6 +75,10 @@ AC_ARG_ENABLE(sdl-framework-prefix,    [  --enable-sdl-framework-prefix=PFX    d
 AC_ARG_WITH(sdl1,            [  --with-sdl1             use SDL 1.x, rather than SDL 2.x [default=no]], [WANT_SDL_VERSION_MAJOR=1], [])
 AC_ARG_WITH(sdl3,            [  --with-sdl3             use SDL 3.x, rather than SDL 2.x [default=no]], [WANT_SDL_VERSION_MAJOR=3], [])
 
+dnl IPC options (for headless mode with standalone WebRTC server).
+AC_ARG_ENABLE(ipc-video,     [  --enable-ipc-video      use IPC for video graphics [default=no]], [WANT_IPC_VIDEO=$enableval], [WANT_IPC_VIDEO=no])
+AC_ARG_ENABLE(ipc-audio,     [  --enable-ipc-audio      use IPC for audio [default=no]], [WANT_IPC_AUDIO=$enableval], [WANT_IPC_AUDIO=no])
+
 dnl Checks for programs.
 AC_PROG_CC_C99
 AC_PROG_CPP
@@ -174,6 +178,19 @@ LIBS="$saved_LIBS"; CPPFLAGS="$saved_CPPFLAGS"; $4]
   AS_VAR_POPDEF([ac_Framework])
 ])
 
+dnl IPC video mode is mutually exclusive with all other video drivers (headless)
+if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
+  WANT_SDL_VIDEO=no
+  WANT_XF86_DGA=no
+  WANT_XF86_VIDMODE=no
+  WANT_FBDEV_DGA=no
+fi
+
+dnl IPC audio mode is mutually exclusive with SDL audio
+if [[ "x$WANT_IPC_AUDIO" = "xyes" ]]; then
+  WANT_SDL_AUDIO=no
+fi
+
 dnl Do we need SDL?
 WANT_SDL=no
 if [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
@@ -260,8 +277,8 @@ else
   SDL_SUPPORT="none"
 fi
 
-dnl We need X11, if not using SDL.
-if [[ "x$WANT_SDL_VIDEO" != "xyes" ]]; then
+dnl We need X11, if not using SDL or IPC video mode.
+if [[ "x$WANT_SDL_VIDEO" != "xyes" -a "x$WANT_IPC_VIDEO" != "xyes" ]]; then
   AC_PATH_XTRA
   if [[ "x$no_x" = "xyes" ]]; then
     AC_MSG_ERROR([You need X11 to run SheepShaver.])
@@ -768,11 +785,59 @@ if [[ -n "$CAN_SLIRP" ]]; then
 fi
 AC_SUBST(SLIRP_SRCS)
 
+dnl IPC video support (shared memory for standalone WebRTC server)
+if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
+  dnl macOS doesn't need -lrt (shm_open is in libc), Linux does
+  case $target_os in
+  linux*)
+    LIBS="$LIBS -lrt -lpthread"
+    ;;
+  darwin*)
+    dnl No -lrt needed on macOS
+    ;;
+  esac
+
+  dnl Check for libyuv (optional - we have a fallback implementation)
+  AC_CHECK_LIB(yuv, I420Copy,
+    [LIBS="$LIBS -lyuv"; AC_DEFINE(HAVE_LIBYUV, 1, [Define if libyuv is available])],
+    [AC_MSG_NOTICE([libyuv not found, using built-in fallback for color conversion])])
+
+  AC_DEFINE(ENABLE_IPC_VIDEO, 1, [Define to enable IPC-based video])
+  AC_DEFINE(ENABLE_HEADLESS, 1, [Define to enable headless mode])
+fi
+
+dnl IPC audio support (shared memory for standalone WebRTC server)
+if [[ "x$WANT_IPC_AUDIO" = "xyes" ]]; then
+  dnl macOS doesn't need -lrt, Linux does (may already be added by video)
+  case $target_os in
+  linux*)
+    case "$LIBS" in
+      *-lrt*) ;;
+      *) LIBS="$LIBS -lrt" ;;
+    esac
+    ;;
+  esac
+
+  AC_DEFINE(ENABLE_IPC_AUDIO, 1, [Define to enable IPC-based audio])
+fi
+
 dnl SDL overrides
 if [[ "x$WANT_SDL" = "xyes" ]]; then
   AC_DEFINE(USE_SDL, 1, [Define to enble SDL support.])
 fi
-if [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
+
+dnl Video source selection - IPC video is mutually exclusive with SDL/X11
+if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
+  dnl IPC video mode - SheepShaver-specific implementation
+  VIDEOSRCS="video_ipc.cpp"
+  KEYCODES="../SDL/keycodes"
+  EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"
+  dnl On macOS, we still need utils_macosx for main_unix.cpp
+  if [[ "x$ac_cv_framework_Carbon" = "xyes" ]]; then
+    EXTRASYSSRCS="$EXTRASYSSRCS ../MacOSX/utils_macosx.mm"
+    CPPFLAGS="$CPPFLAGS -I../MacOSX"
+  fi
+elif [[ "x$WANT_SDL_VIDEO" = "xyes" ]]; then
   AC_DEFINE(USE_SDL_VIDEO, 1, [Define to enable SDL video graphics support.])
   VIDEOSRCS="../SDL/video_sdl.cpp ../SDL/video_sdl2.cpp ../SDL/video_sdl3.cpp"
   KEYCODES="../SDL/keycodes"
@@ -1213,7 +1278,8 @@ if [[ -n "$sigsegv_recovery" ]]; then
 fi
 
 dnl Enable VOSF screen updates with this feature is requested and feasible
-if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" ]]; then
+dnl VOSF is not needed for IPC video mode (we stream the full buffer)
+if [[ "x$WANT_VOSF" = "xyes" -a "x$CAN_VOSF" = "xyes" -a "x$WANT_IPC_VIDEO" = "xno" ]]; then
     AC_DEFINE(ENABLE_VOSF, 1, [Define if using video enabled on SEGV signals.])
 else
     WANT_VOSF=no
@@ -1772,5 +1838,7 @@ echo GTK user interface ............... : $WANT_GTK
 echo mon debugger support ............. : $WANT_MON
 echo Addressing mode .................. : $WANT_ADDRESSING_MODE
 echo Bad memory access recovery type .. : $sigsegv_recovery
+echo IPC video ........................ : $WANT_IPC_VIDEO
+echo IPC audio ........................ : $WANT_IPC_AUDIO
 echo
 echo "Configuration done. Now type \"make\"."

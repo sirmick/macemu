@@ -4,7 +4,13 @@
 
 #include "h264_encoder.h"
 #include <cstdio>
+
+// Use libyuv if available, otherwise use fallback
+#ifdef HAVE_LIBYUV
 #include <libyuv.h>
+#else
+#include "libyuv_fallback.h"
+#endif
 
 // Debug flags (from server.cpp)
 extern bool g_debug_mode_switch;

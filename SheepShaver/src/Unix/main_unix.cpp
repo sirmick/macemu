@@ -938,7 +938,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_IPC_VIDEO)
 	// Open display
 	x_display = XOpenDisplay(x_display_name);
 	if (x_display == NULL) {
@@ -1295,7 +1295,7 @@ static void Quit(void)
 #endif
 
 	// Close X11 server connection
-#ifndef USE_SDL_VIDEO
+#if !defined(USE_SDL_VIDEO) && !defined(ENABLE_IPC_VIDEO)
 	if (x_display)
 		XCloseDisplay(x_display);
 #endif
