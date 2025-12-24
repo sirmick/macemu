@@ -15,6 +15,7 @@ CFLAGS += -I$(QEMU_SRC)/include
 CFLAGS += -I$(QEMU_BUILD)
 CFLAGS += -I$(QEMU_SRC)/target/m68k
 CFLAGS += -I$(QEMU_SRC)/target/ppc
+CFLAGS += $(shell pkg-config --cflags glib-2.0 pixman-1)
 
 # QEMU libraries and dependencies
 QEMU_LIBS = $(shell pkg-config --libs glib-2.0 pixman-1)
@@ -53,6 +54,14 @@ test_compile:
 	@echo ""
 	@echo "Note: Linking would require full QEMU library setup."
 	@echo "See QEMU_LINKING_STRATEGY.md for full integration approach."
+
+# Memory test (compile only - links via adapter layer later)
+test_memory_compile:
+	@echo "Compiling memory test (syntax check only)..."
+	$(CC) $(CFLAGS) -I../../qemu-cpu -c test_memory.c -o test_memory.o
+	@echo "✓ Memory test code compiles!"
+	@echo ""
+	@echo "Note: This will be linked as part of the full adapter build."
 
 # Simpler verification test that doesn't need full QEMU
 verify_hooks:

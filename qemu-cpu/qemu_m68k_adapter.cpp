@@ -16,8 +16,8 @@ extern "C" {
 #include "qemu-common.h"
 #include "cpu.h"
 #include "exec/exec-all.h"
-#include "exec/address-spaces.h"
-#include "exec/memory.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 }
 
 /* BasiliskII includes */
@@ -31,8 +31,9 @@ static M68kCPU *qemu_cpu = NULL;
 static CPUM68KState *qemu_env = NULL;
 
 /* Memory regions */
-static MemoryRegion *ram_region = NULL;
-static MemoryRegion *rom_region = NULL;
+static MemoryRegion ram_region;
+static MemoryRegion rom_region;
+static bool memory_initialized = false;
 
 /* Memory pointers (from BasiliskII) */
 static uint8_t *mac_ram_base = NULL;
@@ -110,6 +111,8 @@ static void copy_regs_from_qemu(M68kRegisters *r, const CPUM68KState *env)
  * Setup Memory Regions
  *
  * Called by BasiliskII to tell us where RAM and ROM are located.
+ * This creates QEMU MemoryRegion objects that point to BasiliskII's
+ * pre-allocated RAM and ROM buffers (zero-copy approach).
  */
 void QEMU_SetupMemory(uint8_t *ram_base, uint32_t ram_size,
                       uint8_t *rom_base, uint32_t rom_size)
@@ -122,12 +125,72 @@ void QEMU_SetupMemory(uint8_t *ram_base, uint32_t ram_size,
     D(bug("QEMU memory setup: RAM=%p size=0x%x, ROM=%p size=0x%x\n",
           ram_base, ram_size, rom_base, rom_size));
 
-    /* TODO: Create QEMU memory regions pointing to BasiliskII's memory */
-    /* This will be implemented when we integrate with QEMU's memory system */
+    if (memory_initialized) {
+        D(bug("QEMU memory already initialized, skipping\n"));
+        return;
+    }
+
+    if (!qemu_cpu) {
+        fprintf(stderr, "QEMU: CPU not initialized, cannot setup memory\n");
+        return;
+    }
+
+    /* Get the system memory region (root of the address space) */
+    MemoryRegion *sysmem = get_system_memory();
+
+    /*
+     * Initialize RAM region using zero-copy approach
+     * memory_region_init_ram_ptr() creates a MemoryRegion that points
+     * directly to BasiliskII's pre-allocated RAM buffer
+     */
+    memory_region_init_ram_ptr(&ram_region,
+                               OBJECT(qemu_cpu),
+                               "mac.ram",
+                               ram_size,
+                               ram_base);
+
+    /*
+     * Mac RAM starts at address 0 in the 68k address space
+     * BasiliskII uses REAL_ADDRESSING mode where Mac addresses = host addresses
+     */
+    memory_region_add_subregion(sysmem, 0x00000000, &ram_region);
+
+    D(bug("QEMU: Mapped RAM at 0x%08x size 0x%x\n", 0x00000000, ram_size));
+
+    /*
+     * Initialize ROM region (also zero-copy)
+     * ROM is typically at 0x00400000 (4MB) in Classic Mac II/Quadra
+     */
+    memory_region_init_ram_ptr(&rom_region,
+                               OBJECT(qemu_cpu),
+                               "mac.rom",
+                               rom_size,
+                               rom_base);
+
+    /* ROM is read-only */
+    memory_region_set_readonly(&rom_region, true);
+
+    /*
+     * ROM base address - BasiliskII typically places ROM at RAMSize
+     * For now, use a fixed address of 0x00400000 (4MB) which is standard
+     * for Mac II/Quadra. TODO: Make this configurable based on ROMBaseMac
+     */
+    uint32_t rom_addr = 0x00400000;
+    memory_region_add_subregion(sysmem, rom_addr, &rom_region);
+
+    D(bug("QEMU: Mapped ROM at 0x%08x size 0x%x (read-only)\n", rom_addr, rom_size));
+
+    memory_initialized = true;
+    D(bug("QEMU memory setup complete\n"));
 }
 
 /*
  * Initialize QEMU CPU
+ *
+ * Initialization order:
+ * 1. Init680x0_QEMU() - creates CPU and registers hooks
+ * 2. QEMU_SetupMemory() - called by BasiliskII after RAM/ROM allocation
+ * 3. Start680x0_QEMU() - starts main execution loop
  */
 bool Init680x0_QEMU(void)
 {
@@ -151,7 +214,10 @@ bool Init680x0_QEMU(void)
     m68k_illegal_insn_hook = emulop_hook_handler;
     D(bug("EmulOp hook registered at %p\n", (void*)m68k_illegal_insn_hook));
 
-    /* TODO: Setup memory regions when memory pointers are available */
+    /*
+     * Memory setup happens later via QEMU_SetupMemory()
+     * BasiliskII will call it after allocating RAM/ROM buffers
+     */
 
     /* Initialize CPU state */
     qemu_env->pc = 0;  /* Will be set by ROM */
@@ -168,14 +234,16 @@ void Exit680x0_QEMU(void)
 {
     D(bug("Exit680x0_QEMU: Shutting down QEMU CPU\n"));
 
-    /* Clean up memory regions */
-    if (ram_region) {
-        /* TODO: memory_region_unref(ram_region); */
-        ram_region = NULL;
-    }
-    if (rom_region) {
-        /* TODO: memory_region_unref(rom_region); */
-        rom_region = NULL;
+    /* Clean up memory regions if initialized */
+    if (memory_initialized) {
+        MemoryRegion *sysmem = get_system_memory();
+
+        /* Remove regions from address space before destroying */
+        memory_region_del_subregion(sysmem, &rom_region);
+        memory_region_del_subregion(sysmem, &ram_region);
+
+        D(bug("QEMU: Memory regions removed\n"));
+        memory_initialized = false;
     }
 
     /* CPU will be cleaned up by QEMU */
