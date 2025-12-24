@@ -27,6 +27,7 @@
 #include <atomic>
 #include <map>
 #include <vector>
+#include <deque>
 #include <thread>
 #include <chrono>
 #include <functional>
@@ -100,6 +101,12 @@ static std::string g_connected_socket_path;
 static std::atomic<uint64_t> g_mouse_move_count(0);
 static std::atomic<uint64_t> g_mouse_click_count(0);
 static std::atomic<uint64_t> g_key_count(0);
+
+// Emulator log capture
+static int g_emulator_log_pipe[2] = {-1, -1};  // Pipe for capturing emulator stdout/stderr
+static std::mutex g_emulator_logs_mutex;
+static std::deque<std::string> g_emulator_logs;  // Ring buffer of recent log lines
+static const size_t MAX_EMULATOR_LOGS = 200;  // Keep last 200 lines
 
 
 // Global flag to request keyframe (set when new peer connects)
@@ -571,6 +578,52 @@ static std::string find_emulator() {
 
 static pid_t g_started_emulator_pid = -1;  // PID of emulator we started
 
+// Add emulator log line to ring buffer
+static void add_emulator_log(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_emulator_logs_mutex);
+    g_emulator_logs.push_back(line);
+    while (g_emulator_logs.size() > MAX_EMULATOR_LOGS) {
+        g_emulator_logs.pop_front();
+    }
+    // Also print to server console
+    fprintf(stderr, "[Emu] %s\n", line.c_str());
+}
+
+// Thread function to read emulator output
+static void emulator_log_reader_thread() {
+    char buffer[4096];
+    std::string partial_line;
+
+    while (g_running && g_emulator_log_pipe[0] >= 0) {
+        ssize_t n = read(g_emulator_log_pipe[0], buffer, sizeof(buffer) - 1);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            break;  // Pipe closed or error
+        }
+        buffer[n] = '\0';
+
+        // Split into lines
+        partial_line += buffer;
+        size_t pos;
+        while ((pos = partial_line.find('\n')) != std::string::npos) {
+            std::string line = partial_line.substr(0, pos);
+            // Remove carriage return if present
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (!line.empty()) {
+                add_emulator_log(line);
+            }
+            partial_line = partial_line.substr(pos + 1);
+        }
+    }
+
+    // Handle any remaining partial line
+    if (!partial_line.empty()) {
+        add_emulator_log(partial_line);
+    }
+}
+
 static bool start_emulator() {
     if (g_started_emulator_pid > 0) {
         // Already started one, check if still alive
@@ -592,6 +645,20 @@ static bool start_emulator() {
 
     fprintf(stderr, "Emulator: Starting %s --config %s\n", emu_path.c_str(), g_prefs_path.c_str());
 
+    // Create pipe for capturing emulator output
+    if (g_emulator_log_pipe[0] >= 0) {
+        close(g_emulator_log_pipe[0]);
+        g_emulator_log_pipe[0] = -1;
+    }
+    if (g_emulator_log_pipe[1] >= 0) {
+        close(g_emulator_log_pipe[1]);
+        g_emulator_log_pipe[1] = -1;
+    }
+    if (pipe(g_emulator_log_pipe) < 0) {
+        fprintf(stderr, "Emulator: Failed to create log pipe: %s\n", strerror(errno));
+        // Continue anyway, just won't capture logs
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "Emulator: Fork failed: %s\n", strerror(errno));
@@ -600,6 +667,14 @@ static bool start_emulator() {
 
     if (pid == 0) {
         // Child process
+
+        // Redirect stdout and stderr to pipe
+        if (g_emulator_log_pipe[1] >= 0) {
+            dup2(g_emulator_log_pipe[1], STDOUT_FILENO);
+            dup2(g_emulator_log_pipe[1], STDERR_FILENO);
+            close(g_emulator_log_pipe[0]);
+            close(g_emulator_log_pipe[1]);
+        }
 
         // Close server's file descriptors
         for (int fd = 3; fd < 1024; fd++) {
@@ -612,14 +687,9 @@ static bool start_emulator() {
         if (g_debug_frames) setenv("MACEMU_DEBUG_FRAMES", "1", 1);
 
         // Execute emulator with prefs file
-        // BasiliskII uses --config, SheepShaver uses --prefs
-        if (emu_path.find("SheepShaver") != std::string::npos) {
-            execl(emu_path.c_str(), emu_path.c_str(),
-                  "--prefs", g_prefs_path.c_str(), nullptr);
-        } else {
-            execl(emu_path.c_str(), emu_path.c_str(),
-                  "--config", g_prefs_path.c_str(), nullptr);
-        }
+        // Both SheepShaver and BasiliskII support --config
+        execl(emu_path.c_str(), emu_path.c_str(),
+              "--config", g_prefs_path.c_str(), nullptr);
 
         // If exec fails
         fprintf(stderr, "Emulator: Exec failed: %s\n", strerror(errno));
@@ -629,6 +699,18 @@ static bool start_emulator() {
     // Parent process
     g_started_emulator_pid = pid;
     fprintf(stderr, "Emulator: Started with PID %d\n", pid);
+
+    // Close write end of pipe (only child writes)
+    if (g_emulator_log_pipe[1] >= 0) {
+        close(g_emulator_log_pipe[1]);
+        g_emulator_log_pipe[1] = -1;
+    }
+
+    // Start thread to read emulator output
+    if (g_emulator_log_pipe[0] >= 0) {
+        std::thread(emulator_log_reader_thread).detach();
+    }
+
     return true;
 }
 
@@ -1182,8 +1264,10 @@ private:
             std::string content = json_get_string(body, "content");
             fprintf(stderr, "Config: Extracted content length=%zu\n", content.size());
             if (content.empty()) {
-                fprintf(stderr, "Config: WARNING - extracted content is empty! Body: %s\n",
+                fprintf(stderr, "Config: ERROR - rejecting empty content! Body: %s\n",
                         body.substr(0, 200).c_str());
+                send_json_response(fd, "{\"success\": false, \"error\": \"Empty content - rejected\"}");
+                return;
             }
             if (write_prefs_file(content)) {
                 send_json_response(fd, "{\"success\": true}");
@@ -1220,6 +1304,23 @@ private:
                 json << ", \"mouse_latency_samples\": " << latency_samples;
             }
             json << "}";
+            send_json_response(fd, json.str());
+            return;
+        }
+
+        if (path == "/api/emulator-logs" && method == "GET") {
+            std::ostringstream json;
+            json << "{\"logs\": [";
+            {
+                std::lock_guard<std::mutex> lock(g_emulator_logs_mutex);
+                bool first = true;
+                for (const auto& line : g_emulator_logs) {
+                    if (!first) json << ",";
+                    first = false;
+                    json << "\"" << json_escape(line) << "\"";
+                }
+            }
+            json << "]}";
             send_json_response(fd, json.str());
             return;
         }
@@ -2774,6 +2875,21 @@ int main(int argc, char* argv[]) {
     // Check environment variables
     if (const char* env = getenv("BASILISK_ROMS")) g_roms_path = env;
     if (const char* env = getenv("BASILISK_IMAGES")) g_images_path = env;
+
+    // Convert paths to absolute (required for emulator which may have different cwd)
+    char* abs_path;
+    if ((abs_path = realpath(g_roms_path.c_str(), nullptr)) != nullptr) {
+        g_roms_path = abs_path;
+        free(abs_path);
+    }
+    if ((abs_path = realpath(g_images_path.c_str(), nullptr)) != nullptr) {
+        g_images_path = abs_path;
+        free(abs_path);
+    }
+    if ((abs_path = realpath(g_prefs_path.c_str(), nullptr)) != nullptr) {
+        g_prefs_path = abs_path;
+        free(abs_path);
+    }
 
     // Set up signal handlers
     signal(SIGINT, signal_handler);
