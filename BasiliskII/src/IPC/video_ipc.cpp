@@ -114,7 +114,7 @@ static std::atomic<bool> video_thread_running(false);
 static int video_shm_fd = -1;
 static int listen_socket = -1;             // Listening socket for server connections
 static int control_socket = -1;            // Connected server
-static MacEmuVideoBuffer* video_shm = nullptr;
+static MacEmuIPCBuffer* video_shm = nullptr;
 static std::string shm_name;
 static std::string socket_path;
 
@@ -135,9 +135,13 @@ static bool latency_epoch_set = false;
 // Palette for indexed color modes
 static uint8 current_palette[256 * 3];
 
+// Debug flags (read once at initialization)
+static bool g_debug_perf = false;
+static bool g_debug_mode_switch = false;
+
 
 /*
- *  Create shared memory for video (emulator owns this)
+ *  Create shared memory 
  */
 
 static bool create_video_shm() {
@@ -155,7 +159,7 @@ static bool create_video_shm() {
     }
 
     // Fixed size for all resolutions up to 1080p
-    size_t shm_size = sizeof(MacEmuVideoBuffer);
+    size_t shm_size = sizeof(MacEmuIPCBuffer);
     if (ftruncate(video_shm_fd, shm_size) < 0) {
         fprintf(stderr, "IPC: Failed to size video SHM: %s\n", strerror(errno));
         close(video_shm_fd);
@@ -164,7 +168,7 @@ static bool create_video_shm() {
         return false;
     }
 
-    video_shm = (MacEmuVideoBuffer*)mmap(nullptr, shm_size,
+    video_shm = (MacEmuIPCBuffer*)mmap(nullptr, shm_size,
                                           PROT_READ | PROT_WRITE, MAP_SHARED,
                                           video_shm_fd, 0);
     if (video_shm == MAP_FAILED) {
@@ -177,7 +181,7 @@ static bool create_video_shm() {
     }
 
     // Initialize header
-    macemu_init_video_buffer(video_shm, pid, frame_width, frame_height);
+    macemu_init_ipc_buffer(video_shm, pid, frame_width, frame_height);
 
     // Check if eventfd creation failed
     if (video_shm->frame_ready_eventfd < 0) {
@@ -198,7 +202,7 @@ static bool create_video_shm() {
 
 static void destroy_video_shm() {
     if (video_shm && video_shm != MAP_FAILED) {
-        munmap(video_shm, sizeof(MacEmuVideoBuffer));
+        munmap(video_shm, sizeof(MacEmuIPCBuffer));
         video_shm = nullptr;
     }
     if (video_shm_fd >= 0) {
@@ -408,9 +412,6 @@ static void process_binary_input(const uint8_t* data, size_t len) {
 static void update_ping_on_frame_complete(uint64_t timestamp_us) {
     if (!video_shm) return;
 
-    // Check debug flag (cached at startup for performance)
-    static bool debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
-
     // Read current ping sequence (atomic read-acquire ensures we see all timestamp writes)
     uint32_t current_ping_seq = ATOMIC_LOAD(video_shm->ping_sequence);
 
@@ -424,7 +425,7 @@ static void update_ping_on_frame_complete(uint64_t timestamp_us) {
         ping_echo_frames_remaining = 5;  // Echo in next 5 frames
 
         // Debug logging - only if debug_perf enabled
-        if (debug_perf) {
+        if (g_debug_perf) {
             fprintf(stderr, "[Emulator] Ping #%u ready (t4=%llu)\n",
                     current_ping_seq, (unsigned long long)timestamp_us);
         }
@@ -467,11 +468,23 @@ static void control_socket_thread() {
                 control_socket = fd;
                 fprintf(stderr, "IPC: Server connected\n");
 
-                // Send eventfd to server via SCM_RIGHTS for low-latency notification
+                // Send eventfds to server via SCM_RIGHTS for low-latency notification
+                // Send both video and audio eventfds in one message
                 if (video_shm && video_shm->frame_ready_eventfd >= 0) {
+                    int fds[2];
+                    int num_fds = 0;
+
+                    // Always send video eventfd
+                    fds[num_fds++] = video_shm->frame_ready_eventfd;
+
+                    // Add audio eventfd if available
+                    if (video_shm->audio_ready_eventfd >= 0) {
+                        fds[num_fds++] = video_shm->audio_ready_eventfd;
+                    }
+
                     struct msghdr msg = {};
                     struct cmsghdr *cmsg;
-                    char buf[CMSG_SPACE(sizeof(int))];
+                    char buf[CMSG_SPACE(sizeof(int) * 2)];  // Space for 2 fds
                     char data = 'E';  // 'E' for eventfd
                     struct iovec iov = { &data, 1 };
 
@@ -483,12 +496,16 @@ static void control_socket_thread() {
                     cmsg = CMSG_FIRSTHDR(&msg);
                     cmsg->cmsg_level = SOL_SOCKET;
                     cmsg->cmsg_type = SCM_RIGHTS;
-                    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-                    memcpy(CMSG_DATA(cmsg), &video_shm->frame_ready_eventfd, sizeof(int));
+                    cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fds);
+                    memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * num_fds);
 
                     if (sendmsg(control_socket, &msg, 0) > 0) {
                         fprintf(stderr, "IPC: Sent eventfd %d to server for low-latency sync\n",
                                 video_shm->frame_ready_eventfd);
+                        if (num_fds > 1) {
+                            fprintf(stderr, "IPC: Sent audio eventfd %d to server\n",
+                                    video_shm->audio_ready_eventfd);
+                        }
                     } else {
                         fprintf(stderr, "IPC: Failed to send eventfd: %s\n", strerror(errno));
                     }
@@ -797,8 +814,7 @@ static void video_refresh_thread()
                 bandwidth_saved_pct = 100.0f * (1.0f - (float)total_dirty_pixels / total_full_pixels);
             }
 
-            static bool debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
-            if (debug_perf) {
+            if (g_debug_perf) {
                 fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
                         fps, frames_sent,
                         avg_mouse_ms,
@@ -908,9 +924,7 @@ void IPC_monitor_desc::switch_to_current_mode(void)
     MacScreenWidth = mode.x;
     MacScreenHeight = mode.y;
 
-    // Check debug flag (cached at startup for performance)
-    static bool debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
-    if (debug_mode_switch) {
+    if (g_debug_mode_switch) {
         fprintf(stderr, "IPC: Switched to mode %dx%d @ %d bpp (bytes_per_row=%d)\n",
                 mode.x, mode.y, frame_depth, frame_bytes_per_row);
     }
@@ -926,9 +940,7 @@ void IPC_monitor_desc::set_palette(uint8 *pal, int num)
         current_palette[i * 3 + 2] = pal[i * 3 + 2];
     }
 
-    // Debug logging - only if debug_mode_switch enabled
-    static bool debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
-    if (debug_mode_switch) {
+    if (g_debug_mode_switch) {
         fprintf(stderr, "IPC: set_palette(%d entries) [0]=(%d,%d,%d) [1]=(%d,%d,%d)\n",
                 num,
                 current_palette[0], current_palette[1], current_palette[2],
@@ -1038,6 +1050,10 @@ static bool IPC_VideoInit(bool classic)
     frame_height = default_height;
     frame_depth = 32;
     frame_bytes_per_row = TrivialBytesPerRow(frame_width, VDEPTH_32BIT);
+
+    // Read debug flags once at startup
+    g_debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
+    g_debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
 
     fprintf(stderr, "IPC: Initializing video driver (v3, emulator-owned resources)\n");
 
@@ -1202,5 +1218,16 @@ void VideoRefresh(void)
     IPC_VideoRefresh();
 }
 #endif
+
+
+/*
+ *  Get video SHM pointer (for audio_ipc.cpp)
+ */
+
+MacEmuIPCBuffer* IPC_GetVideoSHM(void)
+{
+    return video_shm;
+}
+
 
 #endif // ENABLE_IPC_VIDEO
