@@ -77,6 +77,7 @@ static inline int ARGBToBGRA(
 #include "user_strings.h"
 #include "video.h"
 #include "video_defs.h"
+#include "vm_alloc.h"
 
 // IPC protocol definitions
 #include "ipc_protocol.h"
@@ -121,9 +122,6 @@ static std::atomic<bool> input_thread_running{false};
 
 // Palette for indexed modes
 static uint8 current_palette[256 * 3];
-
-// VidLocals storage
-static VidLocals vid_locals;
 
 // Forward declarations
 static bool init_ipc_resources(uint32 width, uint32 height);
@@ -438,16 +436,19 @@ bool VideoInit(void)
 {
     D(bug("VideoInit (IPC mode)\n"));
 
-    // Initialize VidLocals - must use new since video.cpp calls delete
-    private_data = new VidLocals;
-    memset(private_data, 0, sizeof(VidLocals));
+    // Don't allocate private_data here - video.cpp handles it in VideoDoDriverIO()
+    private_data = NULL;
 
     // Get requested resolution from prefs
     const char *mode_str = PrefsFindString("screen");
     int width = 800, height = 600, depth = 32;
 
     if (mode_str) {
-        if (sscanf(mode_str, "win/%d/%d/%d", &width, &height, &depth) != 3) {
+        // Try various screen mode formats
+        // IPC mode: ipc/width/height (no depth - always 32-bit)
+        if (sscanf(mode_str, "ipc/%d/%d", &width, &height) == 2) {
+            depth = 32;  // IPC always uses 32-bit
+        } else if (sscanf(mode_str, "win/%d/%d/%d", &width, &height, &depth) != 3) {
             if (sscanf(mode_str, "dga/%d/%d/%d", &width, &height, &depth) != 3) {
                 sscanf(mode_str, "%d/%d/%d", &width, &height, &depth);
             }
@@ -502,17 +503,23 @@ bool VideoInit(void)
         return false;
     }
 
-    // Allocate frame buffer
+    // Allocate frame buffer at a specific Mac address
+    // Must be outside RAM/ROM areas but within valid Mac address space
+    // Use 0x60000000 as a safe video buffer address
     the_buffer_size = frame_bytes_per_row * frame_height;
-    the_buffer = (uint8 *)malloc(the_buffer_size);
-    if (!the_buffer) {
+    const uint32 VIDEO_BUFFER_MAC_ADDR = 0x60000000;
+
+    // Allocate at the Mac address (will be VMBaseDiff + VIDEO_BUFFER_MAC_ADDR on host)
+    if (vm_acquire_fixed(Mac2HostAddr(VIDEO_BUFFER_MAC_ADDR), the_buffer_size) != 0) {
+        printf("IPC video: Failed to allocate video buffer at Mac address 0x%08x\n", VIDEO_BUFFER_MAC_ADDR);
         cleanup_ipc_resources();
         return false;
     }
+    the_buffer = Mac2HostAddr(VIDEO_BUFFER_MAC_ADDR);
     memset(the_buffer, 0, the_buffer_size);
 
     // Set Mac frame buffer base
-    screen_base = Host2MacAddr(the_buffer);
+    screen_base = VIDEO_BUFFER_MAC_ADDR;
 
     // Initialize palette to grayscale
     for (int i = 0; i < 256; i++) {
@@ -542,7 +549,9 @@ void VideoExit(void)
     cleanup_ipc_resources();
 
     if (the_buffer) {
-        free(the_buffer);
+        // Release at the Mac address we allocated at
+        const uint32 VIDEO_BUFFER_MAC_ADDR = 0x60000000;
+        vm_release(Mac2HostAddr(VIDEO_BUFFER_MAC_ADDR), the_buffer_size);
         the_buffer = NULL;
     }
 }
