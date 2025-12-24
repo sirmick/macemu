@@ -14,8 +14,10 @@
 #include "h264_encoder.h"
 #include "av1_encoder.h"
 #include "png_encoder.h"
+#include "opus_encoder.h"
 
 #include <rtc/rtc.hpp>
+#include <rtc/rtppacketizer.hpp>
 #include <rtc/h264rtppacketizer.hpp>
 #include <rtc/av1rtppacketizer.hpp>
 #include <rtc/rtppacketizationconfig.hpp>
@@ -81,10 +83,11 @@ static std::atomic<bool> g_restart_emulator_requested(false);
 static pid_t g_emulator_pid = -1;
 
 // IPC handles - server connects to emulator's resources
-static MacEmuVideoBuffer* g_video_shm = nullptr;
+static MacEmuIPCBuffer* g_video_shm = nullptr;
 static int g_video_shm_fd = -1;
 static int g_control_socket = -1;
-static int g_frame_ready_eventfd = -1;  // Server's copy of eventfd for frame notifications
+static int g_frame_ready_eventfd = -1;  // Server's copy of eventfd for video frame notifications
+static int g_audio_ready_eventfd = -1;  // Server's copy of eventfd for audio frame notifications
 static std::string g_connected_shm_name;
 static std::string g_connected_socket_path;
 
@@ -96,6 +99,9 @@ static std::atomic<uint64_t> g_key_count(0);
 
 // Global flag to request keyframe (set when new peer connects)
 static std::atomic<bool> g_request_keyframe(false);
+
+// Audio encoder (shared across all peers)
+static std::unique_ptr<OpusAudioEncoder> g_audio_encoder;
 
 // Forward declarations
 class WebRTCServer;
@@ -225,9 +231,9 @@ static bool connect_to_video_shm(pid_t pid) {
     }
 
     // Map shared memory (read-only for server)
-    g_video_shm = (MacEmuVideoBuffer*)mmap(nullptr, sizeof(MacEmuVideoBuffer),
-                                            PROT_READ, MAP_SHARED,
-                                            g_video_shm_fd, 0);
+    g_video_shm = (MacEmuIPCBuffer*)mmap(nullptr, sizeof(MacEmuIPCBuffer),
+                                          PROT_READ, MAP_SHARED,
+                                          g_video_shm_fd, 0);
     if (g_video_shm == MAP_FAILED) {
         fprintf(stderr, "IPC: Failed to map video SHM for PID %d: %s\n", pid, strerror(errno));
         close(g_video_shm_fd);
@@ -237,10 +243,10 @@ static bool connect_to_video_shm(pid_t pid) {
     }
 
     // Validate
-    int result = macemu_validate_video_buffer(g_video_shm, pid);
+    int result = macemu_validate_ipc_buffer(g_video_shm, pid);
     if (result != 0) {
         fprintf(stderr, "IPC: SHM validation failed for PID %d (error %d)\n", pid, result);
-        munmap(g_video_shm, sizeof(MacEmuVideoBuffer));
+        munmap(g_video_shm, sizeof(MacEmuIPCBuffer));
         close(g_video_shm_fd);
         g_video_shm_fd = -1;
         g_video_shm = nullptr;
@@ -256,7 +262,7 @@ static bool connect_to_video_shm(pid_t pid) {
 
 static void disconnect_video_shm() {
     if (g_video_shm && g_video_shm != MAP_FAILED) {
-        munmap(g_video_shm, sizeof(MacEmuVideoBuffer));
+        munmap(g_video_shm, sizeof(MacEmuIPCBuffer));
         g_video_shm = nullptr;
     }
     if (g_video_shm_fd >= 0) {
@@ -311,11 +317,11 @@ static bool connect_to_control_socket(pid_t pid) {
     g_emulator_connected = true;
     fprintf(stderr, "IPC: Connected to control socket '%s'\n", socket_path.c_str());
 
-    // Receive eventfd from emulator via SCM_RIGHTS for low-latency frame notification
-    // The emulator sends this immediately after accepting the connection
+    // Receive eventfds from emulator via SCM_RIGHTS for low-latency notifications
+    // The emulator sends video and audio eventfds immediately after accepting the connection
     struct msghdr msg = {};
     struct cmsghdr *cmsg;
-    char buf[CMSG_SPACE(sizeof(int))];
+    char buf[CMSG_SPACE(sizeof(int) * 2)];  // Space for 2 file descriptors
     char data;
     struct iovec iov = { &data, 1 };
 
@@ -324,7 +330,7 @@ static bool connect_to_control_socket(pid_t pid) {
     msg.msg_control = buf;
     msg.msg_controllen = sizeof(buf);
 
-    // Try to receive the eventfd (with short timeout since it's sent immediately)
+    // Try to receive the eventfds (with short timeout since it's sent immediately)
     if (fcntl(g_control_socket, F_SETFL, flags & ~O_NONBLOCK) < 0) {
         fprintf(stderr, "IPC: Warning: Failed to set blocking mode: %s\n", strerror(errno));
     }
@@ -337,8 +343,18 @@ static bool connect_to_control_socket(pid_t pid) {
     if (n > 0 && data == 'E') {
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-                memcpy(&g_frame_ready_eventfd, CMSG_DATA(cmsg), sizeof(int));
-                fprintf(stderr, "IPC: Received eventfd %d from emulator for low-latency sync\n", g_frame_ready_eventfd);
+                // Receive 1 or 2 eventfds (video, and optionally audio)
+                size_t num_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                int* fds = (int*)CMSG_DATA(cmsg);
+
+                if (num_fds >= 1) {
+                    g_frame_ready_eventfd = fds[0];
+                    fprintf(stderr, "IPC: Received eventfd %d from emulator for low-latency sync\n", g_frame_ready_eventfd);
+                }
+                if (num_fds >= 2) {
+                    g_audio_ready_eventfd = fds[1];
+                    fprintf(stderr, "IPC: Received audio eventfd %d from emulator\n", g_audio_ready_eventfd);
+                }
                 break;
             }
         }
@@ -360,6 +376,10 @@ static void disconnect_control_socket() {
     if (g_frame_ready_eventfd >= 0) {
         close(g_frame_ready_eventfd);
         g_frame_ready_eventfd = -1;
+    }
+    if (g_audio_ready_eventfd >= 0) {
+        close(g_audio_ready_eventfd);
+        g_audio_ready_eventfd = -1;
     }
     g_emulator_connected = false;
     g_connected_socket_path.clear();
@@ -1355,6 +1375,7 @@ private:
 struct PeerConnection {
     std::shared_ptr<rtc::PeerConnection> pc;
     std::shared_ptr<rtc::Track> video_track;
+    std::shared_ptr<rtc::Track> audio_track;
     std::shared_ptr<rtc::DataChannel> data_channel;
     std::string id;
     CodecType codec = CodecType::H264;  // Codec type for this peer
@@ -1490,6 +1511,32 @@ public:
                         frameInfo);
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] AV1 send error to %s: %s\n", id.c_str(), e.what());
+                }
+            }
+        }
+    }
+
+    // Send Opus audio frame via RTP audio track
+    void send_audio_to_all_peers(const std::vector<uint8_t>& opus_data) {
+        if (opus_data.empty() || peer_count_ == 0) return;
+
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+
+        // Calculate audio timestamp using chrono for precise timing
+        // Opus clock rate is 48000 Hz
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - audio_start_time_);
+        rtc::FrameInfo frameInfo(elapsed);
+
+        for (auto& [id, peer] : peers_) {
+            if (peer->audio_track && peer->audio_track->isOpen()) {
+                try {
+                    peer->audio_track->sendFrame(
+                        reinterpret_cast<const std::byte*>(opus_data.data()),
+                        opus_data.size(),
+                        frameInfo);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[WebRTC] Audio send error to %s: %s\n", id.c_str(), e.what());
                 }
             }
         }
@@ -1780,6 +1827,36 @@ private:
         });
     }
 
+    // Helper: Setup Opus audio track with RTP packetizer
+    void setup_audio_track(std::shared_ptr<PeerConnection> peer) {
+        rtc::Description::Audio media("audio-stream", rtc::Description::Direction::SendOnly);
+        media.addOpusCodec(97);  // Opus uses payload type 97
+        media.addSSRC(ssrc_ + 1, "audio-stream", "stream1", "audio-stream");
+        peer->audio_track = peer->pc->addTrack(media);
+
+        // Set up Opus RTP packetizer
+        // Opus uses 48000 Hz clock rate (defined in OpusRtpPacketizer template parameter)
+        auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc_ + 1, "audio-stream", 97, 48000
+        );
+        auto packetizer = std::make_shared<rtc::OpusRtpPacketizer>(rtpConfig);
+        peer->audio_track->setMediaHandler(packetizer);
+
+        peer->audio_track->onOpen([peer]() {
+            if (g_debug_connection) {
+                fprintf(stderr, "[WebRTC] Audio track OPEN for %s\n", peer->id.c_str());
+            }
+        });
+
+        peer->audio_track->onClosed([peer]() {
+            fprintf(stderr, "[WebRTC] Audio track CLOSED for %s\n", peer->id.c_str());
+        });
+
+        peer->audio_track->onError([peer](std::string error) {
+            fprintf(stderr, "[WebRTC] Audio track ERROR for %s: %s\n", peer->id.c_str(), error.c_str());
+        });
+    }
+
     void process_signaling(std::shared_ptr<rtc::WebSocket> ws, const std::string& msg) {
         std::string type = json_get_string(msg, "type");
 
@@ -1855,6 +1932,9 @@ private:
                             peer_id.c_str(), codec_name);
                 }
             }
+
+            // Always setup audio track for all peers
+            setup_audio_track(peer);
 
             peer->pc->onStateChange([peer](rtc::PeerConnection::State state) {
                 const char* state_str = "unknown";
@@ -2170,6 +2250,7 @@ private:
     int port_ = 8090;
     std::unique_ptr<rtc::WebSocketServer> ws_server_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point audio_start_time_ = std::chrono::steady_clock::now();
 
     std::mutex peers_mutex_;
     std::map<std::string, std::shared_ptr<PeerConnection>> peers_;
@@ -2574,6 +2655,122 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
 
 
 /*
+ * Main audio processing loop
+ */
+
+static void audio_loop(WebRTCServer& webrtc) {
+    // Create epoll instance for low-latency event notification
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        fprintf(stderr, "Audio: FATAL: Failed to create epoll: %s\n", strerror(errno));
+        return;
+    }
+    int current_eventfd = -1;  // Track which eventfd is registered
+
+    fprintf(stderr, "Audio: Starting audio processing loop\n");
+
+    while (g_running) {
+        // Check if we need to update epoll registration
+        if (g_audio_ready_eventfd >= 0 && g_audio_ready_eventfd != current_eventfd) {
+            // Unregister old eventfd if any
+            if (current_eventfd >= 0) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
+            }
+
+            // Register new eventfd
+            struct epoll_event ev;
+            ev.events = EPOLLIN;
+            ev.data.fd = g_audio_ready_eventfd;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_audio_ready_eventfd, &ev) == 0) {
+                fprintf(stderr, "Audio: Registered audio eventfd %d with epoll\n", g_audio_ready_eventfd);
+                current_eventfd = g_audio_ready_eventfd;
+            } else {
+                fprintf(stderr, "Audio: WARNING: Failed to register eventfd with epoll: %s\n", strerror(errno));
+            }
+        }
+
+        // Wait for audio ready event (100ms timeout)
+        struct epoll_event events[1];
+        int nfds = epoll_wait(epoll_fd, events, 1, 100);
+
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "Audio: epoll_wait error: %s\n", strerror(errno));
+            break;
+        }
+
+        if (nfds == 0) {
+            // Timeout - check if emulator disconnected
+            if (current_eventfd >= 0 && g_audio_ready_eventfd < 0) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
+                current_eventfd = -1;
+                fprintf(stderr, "Audio: Emulator disconnected\n");
+            }
+            continue;
+        }
+
+        // Audio ready event received
+        uint64_t event_count;
+        if (read(g_audio_ready_eventfd, &event_count, sizeof(event_count)) != sizeof(event_count)) {
+            fprintf(stderr, "Audio: Failed to read eventfd: %s\n", strerror(errno));
+            continue;
+        }
+
+        if (!g_video_shm) continue;
+
+        // Read audio buffer index (plain field, synchronized by eventfd)
+        int ready_index = g_video_shm->audio_ready_index;
+        if (ready_index < 0 || ready_index >= MACEMU_AUDIO_NUM_BUFFERS) continue;
+
+        // Get audio format (dynamic per-frame like video width/height)
+        int audio_format = g_video_shm->audio_format;
+        if (audio_format == MACEMU_AUDIO_FORMAT_NONE) continue;
+
+        // Read audio metadata (all synchronized by eventfd read above)
+        int sample_rate = g_video_shm->audio_sample_rate;
+        int channels = g_video_shm->audio_channels;
+        int samples = g_video_shm->audio_samples_in_frame;
+
+        if (samples <= 0 || samples > MACEMU_AUDIO_MAX_SAMPLES_PER_FRAME) {
+            continue;
+        }
+
+        // Get pointer to ready audio frame
+        const uint8_t* audio_data = macemu_get_ready_audio(g_video_shm);
+
+        // Calculate input size in bytes (16-bit PCM)
+        int bytes_per_sample = 2 * channels;  // S16 = 2 bytes per sample
+        int input_size = samples * bytes_per_sample;
+
+        if (input_size > MACEMU_AUDIO_MAX_FRAME_SIZE) {
+            input_size = MACEMU_AUDIO_MAX_FRAME_SIZE;
+        }
+
+        // Encode to Opus (handles dynamic sample rate/channel changes)
+        if (g_audio_encoder) {
+            std::vector<uint8_t> opus_data = g_audio_encoder->encode_dynamic(
+                reinterpret_cast<const int16_t*>(audio_data),
+                samples,
+                sample_rate,
+                channels
+            );
+
+            if (!opus_data.empty()) {
+                webrtc.send_audio_to_all_peers(opus_data);
+            }
+        }
+    }
+
+    // Clean up epoll
+    if (epoll_fd >= 0) {
+        close(epoll_fd);
+    }
+
+    fprintf(stderr, "Audio: Exiting audio processing loop\n");
+}
+
+
+/*
  * Print usage
  */
 
@@ -2740,6 +2937,7 @@ int main(int argc, char* argv[]) {
     H264Encoder h264_encoder;
     AV1Encoder av1_encoder;
     PNGEncoder png_encoder;
+    g_audio_encoder = std::make_unique<OpusAudioEncoder>();
 
     // Auto-start emulator if enabled
     if (g_auto_start_emulator && g_target_emulator_pid == 0) {
@@ -2771,7 +2969,14 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
     }
 
+    // Launch audio thread
+    std::thread audio_thread(audio_loop, std::ref(webrtc));
+
+    // Run video loop in main thread
     video_loop(webrtc, h264_encoder, av1_encoder, png_encoder);
+
+    // Wait for audio thread to finish
+    audio_thread.join();
 
     // Stop emulator if we started it
     stop_emulator();

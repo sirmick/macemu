@@ -1,0 +1,58 @@
+From: MacEmu QEMU Integration <macemu@example.com>
+Date: Tue, 24 Dec 2024 00:15:00 +0000
+Subject: [PATCH] m68k: Add illegal instruction hook for BasiliskII/SheepShaver EmulOps
+
+This patch adds a hook that allows external code (BasiliskII/SheepShaver)
+to intercept illegal instructions in the 0x71xx range, which are used as
+EmulOp opcodes for device emulation.
+
+The hook is called before the normal illegal instruction exception is
+raised, allowing the emulator to handle these special opcodes.
+
+Signed-off-by: MacEmu QEMU Integration <macemu@example.com>
+---
+ target/m68k/cpu.h       | 4 ++++
+ target/m68k/translate.c | 8 ++++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/target/m68k/cpu.h b/target/m68k/cpu.h
+index 1234567890..abcdef1234 100644
+--- a/target/m68k/cpu.h
++++ b/target/m68k/cpu.h
+@@ -579,4 +579,8 @@ static inline int cpu_mmu_index(CPUM68KState *env, bool ifetch)
+
+ void m68k_cpu_list(void);
+
++/* Hook for external illegal instruction handler (BasiliskII/SheepShaver) */
++/* Returns true if handled, false to continue with normal exception */
++extern bool (*m68k_illegal_insn_hook)(CPUM68KState *env, uint16_t opcode);
++
+ #endif
+diff --git a/target/m68k/translate.c b/target/m68k/translate.c
+index 9876543210..fedcba9876 100644
+--- a/target/m68k/translate.c
++++ b/target/m68k/translate.c
+@@ -49,6 +49,9 @@
+ #undef DEFO32
+ #undef DEFO64
+
++/* External illegal instruction hook (NULL by default) */
++bool (*m68k_illegal_insn_hook)(CPUM68KState *env, uint16_t opcode) = NULL;
++
+ /* is_jmp field values */
+ #define DISAS_JUMP      DISAS_TARGET_0 /* only pc was modified dynamically */
+ #define DISAS_EXIT      DISAS_TARGET_1 /* cpu state was modified dynamically */
+@@ -2698,6 +2701,11 @@ DISAS_INSN(nop)
+
+ DISAS_INSN(illegal)
+ {
++    /* Check for external hook (BasiliskII/SheepShaver EmulOps in 0x71xx range) */
++    if (m68k_illegal_insn_hook != NULL) {
++        /* Hook will be called at runtime via helper */
++        gen_helper_check_illegal_hook(tcg_env, tcg_constant_i32(insn));
++    }
+     gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
+ }
+
+--
+2.34.1

@@ -1,0 +1,68 @@
+From: MacEmu Project <macemu@example.com>
+Date: Tue, 24 Dec 2024 00:25:00 +0000
+Subject: [PATCH 2/2] ppc: Add illegal instruction hook for SheepShaver EmulOps
+
+SheepShaver uses reserved PPC instructions (opcode 6, 0x18000000 range)
+as "EmulOps" and "NativeOps" - special opcodes that trap to the emulator
+for device emulation and native code execution.
+
+This patch adds a hook that allows external code to intercept these
+opcodes before the normal program exception (illegal instruction) is raised.
+
+The hook is checked when a POWERPC_EXCP_PROGRAM with POWERPC_EXCP_INVAL
+error code is raised, where we can still read the offending instruction.
+
+Signed-off-by: MacEmu Project <macemu@example.com>
+---
+ target/ppc/cpu.h         |  4 ++++
+ target/ppc/excp_helper.c | 15 +++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/target/ppc/cpu.h b/target/ppc/cpu.h
+index 1234567890..abcdef1234 100644
+--- a/target/ppc/cpu.h
++++ b/target/ppc/cpu.h
+@@ -1543,4 +1543,8 @@ static inline bool lsw_reg_in_range(int start, int nregs, int rx)
+     return (start + nregs) > rx && rx >= start;
+ }
+
++/* Hook for external illegal instruction handler (SheepShaver EmulOps/NativeOps) */
++/* Returns true if handled, false if normal program exception should occur */
++extern bool (*ppc_illegal_insn_hook)(CPUPPCState *env, uint32_t opcode);
++
+ #endif /* PPC_CPU_H */
+diff --git a/target/ppc/excp_helper.c b/target/ppc/excp_helper.c
+index 9876543210..fedcba9876 100644
+--- a/target/ppc/excp_helper.c
++++ b/target/ppc/excp_helper.c
+@@ -36,6 +36,9 @@
+ #include "exec/log.h"
+ #include "sysemu/tcg.h"
+
++/* External illegal instruction hook (NULL by default) */
++bool (*ppc_illegal_insn_hook)(CPUPPCState *env, uint32_t opcode) = NULL;
++
+ /*****************************************************************************/
+ /* Exception processing */
+ #if !defined(CONFIG_USER_ONLY)
+@@ -484,6 +487,18 @@ static void powerpc_excp_40x(PowerPCCPU *cpu, int excp)
+             break;
+         case POWERPC_EXCP_INVAL:
+             trace_ppc_excp_inval(env->nip);
++            /* Check for external hook (SheepShaver EmulOps/NativeOps) */
++            if (ppc_illegal_insn_hook != NULL) {
++                /* Read the opcode that caused the invalid instruction exception */
++                uint32_t opcode = cpu_ldl_code(env, env->nip);
++
++                /* Call the hook - if it returns true, it handled the opcode */
++                if (ppc_illegal_insn_hook(env, opcode)) {
++                    /* Hook handled it, skip exception processing and continue */
++                    powerpc_reset_excp_state(cpu);
++                    return;
++                }
++            }
+             env->spr[SPR_40x_ESR] = ESR_PIL;
+             break;
+         case POWERPC_EXCP_PRIV:
+--
+2.34.1

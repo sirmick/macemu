@@ -18,8 +18,8 @@ HAVE_LIBDATACHANNEL = @HAVE_LIBDATACHANNEL@
 CMAKE = @CMAKE@
 
 # Compiler and linker flags from configure
-SERVER_CFLAGS = -I../BasiliskII/src/IPC @SERVER_CFLAGS@
-SERVER_LIBS = @SERVER_LIBS@
+SERVER_CFLAGS = -I../BasiliskII/src/IPC @SERVER_CFLAGS@ -I/usr/include/svt-av1 -DEB_DLL
+SERVER_LIBS = @SERVER_LIBS@ -lSvtAv1Enc
 FPNG_CFLAGS = @FPNG_CFLAGS@
 
 # Source files
@@ -44,11 +44,10 @@ all: libdatachannel dirs $(SERVER)
 	@echo "Server: $(SERVER)"
 	@echo ""
 	@echo "Usage:"
-	@echo "  1. Start the server: ./$(SERVER)"
-	@echo "     (note the PID-based socket path it prints)"
-	@echo "  2. Build Basilisk II with: ./configure --enable-ipc-video && make"
-	@echo "  3. Run emulator: MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
-	@echo "  4. Open http://localhost:8000 in your browser"
+	@echo "  0. Populate storage/roms and storage/images"
+	@echo "  1. Build Basilisk II with: ./configure --enable-ipc-video --enable-ipc-audio && make"
+	@echo "  2. Start the server: ./$(SERVER)"	
+	@echo "  3. Open http://<yourip>:8000 in your browser"
 
 # Create build directory
 dirs:

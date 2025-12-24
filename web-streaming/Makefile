@@ -18,14 +18,15 @@ HAVE_LIBDATACHANNEL = yes
 CMAKE = 
 
 # Compiler and linker flags from configure
-SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include -I/usr/include/svt-av1 -DEB_DLL -msse4.1 -mpclmul
-SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264 -lSvtAv1Enc -lssl -lcrypto -lyuv -lpthread -lrt
+SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include   -msse4.1 -mpclmul -I/usr/include/svt-av1 -DEB_DLL
+SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lopus -lpthread -lrt -lSvtAv1Enc
 FPNG_CFLAGS = -msse4.1 -mpclmul
 
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
               $(SERVER_DIR)/av1_encoder.cpp \
+              $(SERVER_DIR)/opus_encoder.cpp \
               $(SERVER_DIR)/png_encoder.cpp \
               $(SERVER_DIR)/fpng.cpp
 
@@ -33,6 +34,7 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
 SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/h264_encoder.o \
               $(BUILD_DIR)/av1_encoder.o \
+              $(BUILD_DIR)/opus_encoder.o \
               $(BUILD_DIR)/png_encoder.o \
               $(BUILD_DIR)/fpng.o
 
@@ -46,11 +48,10 @@ all: libdatachannel dirs $(SERVER)
 	@echo "Server: $(SERVER)"
 	@echo ""
 	@echo "Usage:"
-	@echo "  1. Start the server: ./$(SERVER)"
-	@echo "     (note the PID-based socket path it prints)"
-	@echo "  2. Build Basilisk II with: ./configure --enable-ipc-video && make"
-	@echo "  3. Run emulator: MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
-	@echo "  4. Open http://localhost:8000 in your browser"
+	@echo "  0. Populate storage/roms and storage/images"
+	@echo "  1. Build Basilisk II with: ./configure --enable-ipc-video --enable-ipc-audio && make"
+	@echo "  2. Start the server: ./$(SERVER)"	
+	@echo "  3. Open http://<yourip>:8000 in your browser"
 
 # Create build directory
 dirs:
@@ -84,6 +85,11 @@ $(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp \
 $(BUILD_DIR)/av1_encoder.o: $(SERVER_DIR)/av1_encoder.cpp \
                              $(SERVER_DIR)/av1_encoder.h \
                              $(SERVER_DIR)/codec.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile Opus encoder
+$(BUILD_DIR)/opus_encoder.o: $(SERVER_DIR)/opus_encoder.cpp \
+                              $(SERVER_DIR)/opus_encoder.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile PNG encoder

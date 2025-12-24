@@ -1,3 +1,6 @@
 [submodule "web-streaming/libdatachannel"]
 	path = web-streaming/libdatachannel
 	url = https://github.com/paullouisageneau/libdatachannel.git
+[submodule "qemu"]
+	path = qemu
+	url = https://github.com/qemu/qemu.git
