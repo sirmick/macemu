@@ -18,15 +18,19 @@ HAVE_LIBDATACHANNEL = yes
 CMAKE = 
 
 # Compiler and linker flags from configure
-SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include   -msse4.1 -mpclmul -I/usr/include/svt-av1 -DEB_DLL
-SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lopus -lpthread -lrt -lSvtAv1Enc
+SERVER_CFLAGS = -I../BasiliskII/src/IPC \
+                -Ilibdatachannel/include \
+                -Ilibdatachannel/deps/json/include \
+                -Iserver \
+                -msse4.1 -mpclmul \
+                -I/usr/include/svt-av1 -DEB_DLL
+SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lpthread -lrt -lopus -lSvtAv1Enc
 FPNG_CFLAGS = -msse4.1 -mpclmul
 
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp \
-              $(SERVER_DIR)/json_utils.cpp \
-              $(SERVER_DIR)/keycode_map.cpp \
-              $(SERVER_DIR)/storage_manager.cpp \
+              $(SERVER_DIR)/utils/keyboard_map.cpp \
+              $(SERVER_DIR)/utils/json_utils.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
               $(SERVER_DIR)/av1_encoder.cpp \
               $(SERVER_DIR)/opus_encoder.cpp \
@@ -35,9 +39,8 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
 
 # Object files
 SERVER_OBJS = $(BUILD_DIR)/server.o \
+              $(BUILD_DIR)/keyboard_map.o \
               $(BUILD_DIR)/json_utils.o \
-              $(BUILD_DIR)/keycode_map.o \
-              $(BUILD_DIR)/storage_manager.o \
               $(BUILD_DIR)/h264_encoder.o \
               $(BUILD_DIR)/av1_encoder.o \
               $(BUILD_DIR)/opus_encoder.o \
@@ -73,39 +76,23 @@ $(LIBDATACHANNEL_LIB):
 	@echo "This should have been caught by configure. Please re-run ./configure"
 	@exit 1
 
+# Compile utilities
+$(BUILD_DIR)/keyboard_map.o: $(SERVER_DIR)/utils/keyboard_map.cpp \
+                              $(SERVER_DIR)/utils/keyboard_map.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/json_utils.o: $(SERVER_DIR)/utils/json_utils.cpp \
+                            $(SERVER_DIR)/utils/json_utils.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
 # Compile server
 $(BUILD_DIR)/server.o: $(SERVER_DIR)/server.cpp \
                        ../BasiliskII/src/IPC/ipc_protocol.h \
                        $(SERVER_DIR)/codec.h \
-                       $(SERVER_DIR)/video_stream.h \
-                       $(SERVER_DIR)/h264_stream.h \
-                       $(SERVER_DIR)/av1_stream.h \
-                       $(SERVER_DIR)/png_stream.h \
-                       $(SERVER_DIR)/json_utils.h \
-                       $(SERVER_DIR)/keycode_map.h \
-                       $(SERVER_DIR)/storage_manager.h \
                        $(SERVER_DIR)/h264_encoder.h \
-                       $(SERVER_DIR)/av1_encoder.h \
-                       $(SERVER_DIR)/png_encoder.h \
-                       $(SERVER_DIR)/httplib.h \
+                       $(SERVER_DIR)/utils/keyboard_map.h \
+                       $(SERVER_DIR)/utils/json_utils.h \
                        $(LIBDATACHANNEL_LIB)
-	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
-
-# Compile JSON utilities
-$(BUILD_DIR)/json_utils.o: $(SERVER_DIR)/json_utils.cpp \
-                            $(SERVER_DIR)/json_utils.h
-	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
-
-# Compile keycode map
-$(BUILD_DIR)/keycode_map.o: $(SERVER_DIR)/keycode_map.cpp \
-                             $(SERVER_DIR)/keycode_map.h
-	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
-
-# Compile storage manager
-$(BUILD_DIR)/storage_manager.o: $(SERVER_DIR)/storage_manager.cpp \
-                                 $(SERVER_DIR)/storage_manager.h \
-                                 $(SERVER_DIR)/json_utils.h \
-                                 $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile H.264 encoder

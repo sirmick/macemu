@@ -15,12 +15,10 @@
 #include "av1_encoder.h"
 #include "png_encoder.h"
 #include "opus_encoder.h"
-#include "h264_stream.h"
-#include "av1_stream.h"
-#include "png_stream.h"
-#include "json_utils.h"
-#include "keycode_map.h"
-#include "storage_manager.h"
+
+// Utility modules
+#include "utils/keyboard_map.h"
+#include "utils/json_utils.h"
 
 #include <rtc/rtc.hpp>
 #include <rtc/rtppacketizer.hpp>
@@ -66,11 +64,13 @@
 // Configuration
 static int g_http_port = 8000;
 static int g_signaling_port = 8090;
-// g_roms_path, g_images_path, g_prefs_path now in storage_manager.cpp/h
+static std::string g_roms_path = "storage/roms";
+static std::string g_images_path = "storage/images";
+static std::string g_prefs_path = "basilisk_ii.prefs";
 static std::string g_emulator_path;    // Path to BasiliskII/SheepShaver executable
 static bool g_auto_start_emulator = true;
 static pid_t g_target_emulator_pid = 0;  // If specified, connect to this PID
-CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG) - now non-static for storage_manager
+static CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG)
 static bool g_enable_stun = false;  // STUN disabled by default (for localhost/LAN)
 static std::string g_stun_server = "stun:stun.l.google.com:19302";  // Default STUN server
 
@@ -118,10 +118,32 @@ static void signal_handler(int sig) {
 }
 
 
-// Browser keycode conversion moved to keycode_map.cpp/h
+// Browser keycode to Mac ADB keycode conversion moved to utils/keyboard_map.cpp
 
+// JSON helpers moved to utils/json_utils.cpp
+// Using nlohmann/json library instead of hand-written parsing
+using json = json_utils::json;
 
-// JSON helpers moved to json_utils.cpp/h
+// Temporary compatibility shims for manual JSON string building
+// TODO: Replace with proper nlohmann/json usage in Phase 6 (HTTP refactor)
+static std::string json_escape(const std::string& s) {
+    json j = s;
+    std::string result = j.dump();
+    // Remove surrounding quotes added by dump()
+    if (result.size() >= 2 && result.front() == '"' && result.back() == '"') {
+        result = result.substr(1, result.size() - 2);
+    }
+    return result;
+}
+
+static std::string json_get_string(const std::string& json_str, const std::string& key) {
+    try {
+        json j = json::parse(json_str);
+        return json_utils::get_string(j, key);
+    } catch (...) {
+        return "";
+    }
+}
 
 
 /*
@@ -574,107 +596,506 @@ static int check_emulator_status() {
 }
 
 
-// Storage scanning and config moved to storage_manager.cpp/h
+/*
+ * Storage scanning and config
+ */
+
+static bool has_extension(const std::string& filename, const std::vector<std::string>& extensions) {
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = filename.substr(dot);
+    for (auto& c : ext) c = tolower(c);
+    for (const auto& e : extensions) {
+        if (ext == e) return true;
+    }
+    return false;
+}
+
+struct FileInfo {
+    std::string name;
+    int64_t size;
+    uint32_t checksum;
+    bool has_checksum;
+};
+
+static uint32_t read_rom_checksum(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    uint8_t buf[4];
+    if (fread(buf, 1, 4, f) != 4) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+}
+
+static void scan_directory_recursive(const std::string& base_dir, const std::string& relative_path,
+                                     const std::vector<std::string>& extensions, bool read_checksums,
+                                     std::vector<FileInfo>& files) {
+    std::string current_dir = relative_path.empty() ? base_dir : base_dir + "/" + relative_path;
+
+    DIR* dir = opendir(current_dir.c_str());
+    if (!dir) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        std::string name = entry->d_name;
+        std::string full_path = current_dir + "/" + name;
+        std::string rel_name = relative_path.empty() ? name : relative_path + "/" + name;
+
+        struct stat st;
+        if (stat(full_path.c_str(), &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_directory_recursive(base_dir, rel_name, extensions, read_checksums, files);
+        } else if (S_ISREG(st.st_mode)) {
+            if (has_extension(name, extensions)) {
+                FileInfo info;
+                info.name = rel_name;
+                info.size = st.st_size;
+                info.checksum = 0;
+                info.has_checksum = false;
+
+                if (read_checksums) {
+                    info.checksum = read_rom_checksum(full_path);
+                    info.has_checksum = true;
+                }
+
+                files.push_back(info);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+static std::vector<FileInfo> scan_directory(const std::string& directory,
+                                            const std::vector<std::string>& extensions,
+                                            bool read_checksums = false, bool recursive = false) {
+    std::vector<FileInfo> files;
+
+    if (recursive) {
+        scan_directory_recursive(directory, "", extensions, read_checksums, files);
+    } else {
+        DIR* dir = opendir(directory.c_str());
+        if (!dir) return files;
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (entry->d_name[0] == '.') continue;
+
+            std::string name = entry->d_name;
+            if (has_extension(name, extensions)) {
+                FileInfo info;
+                info.name = name;
+                info.size = 0;
+                info.checksum = 0;
+                info.has_checksum = false;
+
+                std::string full_path = directory + "/" + name;
+                struct stat st;
+                if (stat(full_path.c_str(), &st) == 0) {
+                    info.size = st.st_size;
+                }
+
+                if (read_checksums) {
+                    info.checksum = read_rom_checksum(full_path);
+                    info.has_checksum = true;
+                }
+
+                files.push_back(info);
+            }
+        }
+        closedir(dir);
+    }
+
+    std::sort(files.begin(), files.end(), [](const FileInfo& a, const FileInfo& b) {
+        return a.name < b.name;
+    });
+    return files;
+}
+
+static std::string get_storage_json() {
+    auto roms = scan_directory(g_roms_path, {".rom"}, true, true);
+    auto disks = scan_directory(g_images_path, {".img", ".dsk", ".hfv", ".toast"});
+    auto cdroms = scan_directory(g_images_path, {".iso"});
+
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"romsPath\": \"" << json_escape(g_roms_path) << "\",\n";
+    json << "  \"imagesPath\": \"" << json_escape(g_images_path) << "\",\n";
+    json << "  \"roms\": [";
+    for (size_t i = 0; i < roms.size(); i++) {
+        if (i > 0) json << ", ";
+        json << "{\"name\": \"" << json_escape(roms[i].name) << "\", \"size\": " << roms[i].size;
+        char checksum_hex[16];
+        snprintf(checksum_hex, sizeof(checksum_hex), "%08x", roms[i].checksum);
+        json << ", \"checksum\": \"" << checksum_hex << "\"}";
+    }
+    json << "],\n";
+    json << "  \"disks\": [";
+    for (size_t i = 0; i < disks.size(); i++) {
+        if (i > 0) json << ", ";
+        json << "{\"name\": \"" << json_escape(disks[i].name) << "\", \"size\": " << disks[i].size << "}";
+    }
+    json << "],\n";
+    json << "  \"cdroms\": [";
+    for (size_t i = 0; i < cdroms.size(); i++) {
+        if (i > 0) json << ", ";
+        json << "{\"name\": \"" << json_escape(cdroms[i].name) << "\", \"size\": " << cdroms[i].size << "}";
+    }
+    json << "]\n";
+    json << "}";
+
+    return json.str();
+}
+
+// Write raw prefs file content (JS frontend handles all serialization)
+static bool write_prefs_file(const std::string& content) {
+    std::ofstream file(g_prefs_path);
+    if (!file) {
+        fprintf(stderr, "Config: Failed to open prefs file for writing: %s\n", g_prefs_path.c_str());
+        return false;
+    }
+
+    file << content;
+    file.close();
+
+    fprintf(stderr, "Config: Wrote prefs file: %s (%zu bytes)\n", g_prefs_path.c_str(), content.size());
+    return true;
+}
+
+// Read raw prefs file content (JS frontend handles all parsing)
+static std::string read_prefs_file() {
+    std::ifstream file(g_prefs_path);
+    if (!file) {
+        return "";  // Empty string means no file exists
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+// Create minimal prefs file if it doesn't exist
+// Based on template from client.js
+static void create_minimal_prefs_if_needed() {
+    // Check if file already exists
+    std::ifstream check(g_prefs_path);
+    if (check.good()) {
+        check.close();
+        return;  // File exists, nothing to do
+    }
+
+    fprintf(stderr, "Config: Creating minimal prefs file at %s\n", g_prefs_path.c_str());
+
+    // Minimal configuration template - matches client.js PREFS_TEMPLATE
+    const char* minimal_prefs =
+        "# Basilisk II preferences - minimal config for cold boot\n"
+        "\n"
+        "# ROM file (configure via web UI)\n"
+        "rom \n"
+        "\n"
+        "# Hardware settings\n"
+        "ramsize 33554432\n"  // 32 MB
+        "screen ipc/800/600\n"
+        "cpu 4\n"
+        "modelid 14\n"
+        "fpu true\n"
+        "jit true\n"
+        "nosound false\n"
+        "\n"
+        "# Video codec for web streaming (png or h264)\n"
+        "webcodec png\n"
+        "\n"
+        "# JIT settings\n"
+        "jitfpu true\n"
+        "jitcachesize 8192\n"
+        "jitlazyflush true\n"
+        "jitinline true\n"
+        "jitdebug false\n"
+        "\n"
+        "# Display settings\n"
+        "displaycolordepth 0\n"
+        "frameskip 0\n"
+        "scale_nearest false\n"
+        "scale_integer false\n"
+        "\n"
+        "# Input settings\n"
+        "keyboardtype 5\n"
+        "keycodes false\n"
+        "mousewheelmode 1\n"
+        "mousewheellines 3\n"
+        "swap_opt_cmd true\n"
+        "hotkey 0\n"
+        "\n"
+        "# Serial/Network\n"
+        "seriala /dev/null\n"
+        "serialb /dev/null\n"
+        "udptunnel false\n"
+        "udpport 6066\n"
+        "etherpermanentaddress true\n"
+        "ethermulticastmode 0\n"
+        "routerenabled false\n"
+        "ftp_port_list 21\n"
+        "\n"
+        "# Boot settings\n"
+        "bootdrive 0\n"
+        "bootdriver 0\n"
+        "nocdrom false\n"
+        "\n"
+        "# System settings\n"
+        "ignoresegv true\n"
+        "idlewait true\n"
+        "noclipconversion false\n"
+        "nogui true\n"
+        "sound_buffer 0\n"
+        "name_encoding 0\n"
+        "delay 0\n"
+        "init_grab false\n"
+        "yearofs 0\n"
+        "dayofs 0\n"
+        "reservewindowskey false\n"
+        "\n"
+        "# ExtFS settings\n"
+        "enableextfs false\n"
+        "debugextfs false\n"
+        "extfs ./storage\n"
+        "extdrives CDEFGHIJKLMNOPQRSTUVWXYZ\n"
+        "pollmedia true\n";
+
+    if (!write_prefs_file(minimal_prefs)) {
+        fprintf(stderr, "Config: Failed to create minimal prefs file\n");
+    }
+}
+
+// Read webcodec preference from prefs file
+static void read_webcodec_pref() {
+    std::ifstream file(g_prefs_path);
+    if (!file) {
+        fprintf(stderr, "Config: No prefs file, defaulting to PNG codec\n");
+        g_server_codec = CodecType::PNG;
+        return;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') continue;
+
+        // Look for "webcodec" preference
+        if (line.rfind("webcodec ", 0) == 0) {
+            std::string value = line.substr(9);
+            // Trim whitespace
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r')) {
+                value.pop_back();
+            }
+
+            if (value == "h264" || value == "H264") {
+                g_server_codec = CodecType::H264;
+                fprintf(stderr, "Config: webcodec = h264\n");
+            } else if (value == "av1" || value == "AV1") {
+                g_server_codec = CodecType::AV1;
+                fprintf(stderr, "Config: webcodec = av1\n");
+            } else if (value == "png" || value == "PNG") {
+                g_server_codec = CodecType::PNG;
+                fprintf(stderr, "Config: webcodec = png\n");
+            } else {
+                fprintf(stderr, "Config: Unknown webcodec '%s', defaulting to PNG\n", value.c_str());
+                g_server_codec = CodecType::PNG;
+            }
+            return;
+        }
+    }
+
+    // Not found - default to PNG
+    fprintf(stderr, "Config: webcodec not set, defaulting to PNG\n");
+    g_server_codec = CodecType::PNG;
+}
 
 
 /*
- * HTTP Server with simple routing
+ * HTTP Server
  */
-
-// HTTP Server using cpp-httplib
-#include "httplib.h"
 
 class HTTPServer {
 public:
-    HTTPServer() {
-        setup_routes();
-    }
-
     bool start(int port) {
         port_ = port;
 
-        // Start server in background thread
-        thread_ = std::thread([this, port]() {
-            fprintf(stderr, "HTTP: Starting server on port %d\n", port);
-            if (!server_.listen("0.0.0.0", port)) {
-                fprintf(stderr, "HTTP: Failed to bind port %d\n", port);
-            }
-        });
+        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd_ < 0) {
+            fprintf(stderr, "HTTP: Failed to create socket\n");
+            return false;
+        }
 
-        // Wait for server to be ready
-        server_.wait_until_ready();
-        fprintf(stderr, "HTTP: Server ready on port %d\n", port);
+        int opt = 1;
+        if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEADDR: %s\n", strerror(errno));
+        }
+
+        int flags = fcntl(server_fd_, F_GETFL, 0);
+        if (flags < 0) {
+            fprintf(stderr, "HTTP: Failed to get socket flags: %s\n", strerror(errno));
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
+        if (fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+            fprintf(stderr, "HTTP: Failed to set non-blocking mode: %s\n", strerror(errno));
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
+
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "HTTP: Failed to bind port %d\n", port);
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
+
+        if (listen(server_fd_, 10) < 0) {
+            fprintf(stderr, "HTTP: Failed to listen\n");
+            close(server_fd_);
+            server_fd_ = -1;
+            return false;
+        }
+
+        running_ = true;
+        thread_ = std::thread(&HTTPServer::run, this);
+
+        fprintf(stderr, "HTTP: Server on port %d\n", port);
         return true;
     }
 
     void stop() {
-        server_.stop();
+        running_ = false;
+        if (server_fd_ >= 0) {
+            close(server_fd_);
+            server_fd_ = -1;
+        }
         if (thread_.joinable()) {
             thread_.join();
         }
     }
 
 private:
-    void setup_routes() {
-        // Static file serving
-        if (!server_.set_mount_point("/", "client")) {
-            fprintf(stderr, "HTTP: Warning: Failed to set mount point for client files\n");
+    void run() {
+        while (running_ && g_running) {
+            struct pollfd pfd;
+            pfd.fd = server_fd_;
+            pfd.events = POLLIN;
+
+            int ret = poll(&pfd, 1, 100);
+            if (ret <= 0) continue;
+
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
+            if (client_fd < 0) continue;
+
+            handle_client(client_fd);
+            close(client_fd);
+        }
+    }
+
+    void handle_client(int fd) {
+        char buffer[8192];
+        ssize_t n = recv(fd, buffer, sizeof(buffer) - 1, 0);
+        if (n <= 0) return;
+        buffer[n] = '\0';
+
+        std::string request(buffer);
+        std::string method;
+        std::string path = "/";
+
+        size_t method_end = request.find(' ');
+        if (method_end != std::string::npos) {
+            method = request.substr(0, method_end);
+            size_t path_end = request.find(' ', method_end + 1);
+            if (path_end != std::string::npos) {
+                path = request.substr(method_end + 1, path_end - method_end - 1);
+            }
+        }
+
+        // Strip query string from path
+        size_t query_pos = path.find('?');
+        if (query_pos != std::string::npos) {
+            path = path.substr(0, query_pos);
+        }
+
+        // Extract request body for POST requests
+        std::string body;
+        size_t body_start = request.find("\r\n\r\n");
+        if (body_start != std::string::npos) {
+            body = request.substr(body_start + 4);
         }
 
         // API endpoints
-
-        // GET /api/config - Return debug configuration flags
-        server_.Get("/api/config", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/config" && method == "GET") {
+            // Return debug configuration flags
             std::ostringstream json;
             json << "{";
             json << "\"debug_connection\": " << (g_debug_connection ? "true" : "false");
             json << ", \"debug_mode_switch\": " << (g_debug_mode_switch ? "true" : "false");
             json << ", \"debug_perf\": " << (g_debug_perf ? "true" : "false");
             json << "}";
-            res.set_content(json.str(), "application/json");
-        });
+            send_json_response(fd, json.str());
+            return;
+        }
 
-        // GET /api/storage - Return storage information
-        server_.Get("/api/storage", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/storage" && method == "GET") {
             std::string json_body = get_storage_json();
-            res.set_content(json_body, "application/json");
-        });
+            send_json_response(fd, json_body);
+            return;
+        }
 
-        // GET /api/prefs - Return prefs file content
-        server_.Get("/api/prefs", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/prefs" && method == "GET") {
+            // Return raw prefs file content
             std::string prefs_content = read_prefs_file();
             std::string json_body = "{\"content\": \"" + json_escape(prefs_content) + "\", ";
             json_body += "\"path\": \"" + json_escape(g_prefs_path) + "\", ";
             json_body += "\"romsPath\": \"" + json_escape(g_roms_path) + "\", ";
             json_body += "\"imagesPath\": \"" + json_escape(g_images_path) + "\"}";
-            res.set_content(json_body, "application/json");
-        });
+            send_json_response(fd, json_body);
+            return;
+        }
 
-        // POST /api/prefs - Write prefs file content
-        server_.Post("/api/prefs", [](const httplib::Request& req, httplib::Response& res) {
-            fprintf(stderr, "Config: Received prefs POST (body length=%zu)\n", req.body.size());
-            std::string content = json_get_string(req.body, "content");
+        if (path == "/api/prefs" && method == "POST") {
+            // Write raw prefs file content from JSON body
+            fprintf(stderr, "Config: Received prefs POST (body length=%zu)\n", body.size());
+            std::string content = json_get_string(body, "content");
             fprintf(stderr, "Config: Extracted content length=%zu\n", content.size());
             if (content.empty()) {
                 fprintf(stderr, "Config: WARNING - extracted content is empty! Body: %s\n",
-                        req.body.substr(0, 200).c_str());
+                        body.substr(0, 200).c_str());
             }
             if (write_prefs_file(content)) {
-                res.set_content("{\"success\": true}", "application/json");
+                send_json_response(fd, "{\"success\": true}");
             } else {
-                res.set_content("{\"success\": false, \"error\": \"Failed to write prefs file\"}", "application/json");
+                send_json_response(fd, "{\"success\": false, \"error\": \"Failed to write prefs file\"}");
             }
-        });
+            return;
+        }
 
-        // POST /api/restart - Restart emulator
-        server_.Post("/api/restart", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/restart" && method == "POST") {
             fprintf(stderr, "Server: Restart requested via API\n");
             send_command(MACEMU_CMD_RESET);
-            res.set_content("{\"success\": true, \"message\": \"Restart sent to emulator\"}", "application/json");
-        });
+            std::string json_body = "{\"success\": true, \"message\": \"Restart sent to emulator\"}";
+            send_json_response(fd, json_body);
+            return;
+        }
 
-        // GET /api/status - Return emulator status
-        server_.Get("/api/status", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/status" && method == "GET") {
             std::ostringstream json;
             json << "{";
             json << "\"emulator_connected\": " << (g_emulator_connected ? "true" : "false");
@@ -683,7 +1104,7 @@ private:
             if (g_video_shm) {
                 json << ", \"video\": {\"width\": " << g_video_shm->width;
                 json << ", \"height\": " << g_video_shm->height;
-                json << ", \"frame_count\": " << g_video_shm->frame_count;
+                json << ", \"frame_count\": " << g_video_shm->frame_count;  // Plain read, stats only
                 json << ", \"state\": " << g_video_shm->state << "}";
 
                 // Mouse latency from emulator (atomic - can be updated by stats thread)
@@ -693,11 +1114,11 @@ private:
                 json << ", \"mouse_latency_samples\": " << latency_samples;
             }
             json << "}";
-            res.set_content(json.str(), "application/json");
-        });
+            send_json_response(fd, json.str());
+            return;
+        }
 
-        // POST /api/emulator/start - Start emulator
-        server_.Post("/api/emulator/start", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/emulator/start" && method == "POST") {
             std::string json_body;
             if (g_started_emulator_pid > 0) {
                 json_body = "{\"success\": false, \"message\": \"Emulator already running\", \"pid\": " + std::to_string(g_started_emulator_pid) + "}";
@@ -706,11 +1127,11 @@ private:
             } else {
                 json_body = "{\"success\": false, \"message\": \"Failed to start emulator\"}";
             }
-            res.set_content(json_body, "application/json");
-        });
+            send_json_response(fd, json_body);
+            return;
+        }
 
-        // POST /api/emulator/stop - Stop emulator
-        server_.Post("/api/emulator/stop", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/emulator/stop" && method == "POST") {
             std::string json_body;
             if (g_started_emulator_pid <= 0 && g_emulator_pid <= 0) {
                 json_body = "{\"success\": false, \"message\": \"Emulator not running\"}";
@@ -724,21 +1145,24 @@ private:
                 }
                 json_body = "{\"success\": true, \"message\": \"Emulator stopped\"}";
             }
-            res.set_content(json_body, "application/json");
-        });
+            send_json_response(fd, json_body);
+            return;
+        }
 
-        // POST /api/emulator/restart - Restart emulator
-        server_.Post("/api/emulator/restart", [](const httplib::Request& req, httplib::Response& res) {
+        if (path == "/api/emulator/restart" && method == "POST") {
             g_restart_emulator_requested = true;
-            res.set_content("{\"success\": true, \"message\": \"Restart requested\"}", "application/json");
-        });
+            std::string json_body = "{\"success\": true, \"message\": \"Restart requested\"}";
+            send_json_response(fd, json_body);
+            return;
+        }
 
-        // POST /api/log - Client logging endpoint
-        server_.Post("/api/log", [](const httplib::Request& req, httplib::Response& res) {
-            std::string level = json_get_string(req.body, "level");
-            std::string msg = json_get_string(req.body, "message");
-            std::string data = json_get_string(req.body, "data");
+        if (path == "/api/log" && method == "POST") {
+            // Client logging endpoint - parse and display browser logs
+            std::string level = json_get_string(body, "level");
+            std::string msg = json_get_string(body, "message");
+            std::string data = json_get_string(body, "data");
 
+            // Format: [Browser] level: message
             const char* prefix = "[Browser]";
             if (level == "error") {
                 fprintf(stderr, "\033[31m%s ERROR: %s%s%s\033[0m\n", prefix, msg.c_str(),
@@ -751,18 +1175,20 @@ private:
                         data.empty() ? "" : " | ", data.c_str());
             }
 
-            res.set_content("{\"ok\": true}", "application/json");
-        });
+            send_json_response(fd, "{\"ok\": true}");
+            return;
+        }
 
-        // POST /api/error - Client error reporting endpoint
-        server_.Post("/api/error", [](const httplib::Request& req, httplib::Response& res) {
-            std::string message = json_get_string(req.body, "message");
-            std::string stack = json_get_string(req.body, "stack");
-            std::string url = json_get_string(req.body, "url");
-            std::string line = json_get_string(req.body, "line");
-            std::string col = json_get_string(req.body, "col");
-            std::string type = json_get_string(req.body, "type");
+        if (path == "/api/error" && method == "POST") {
+            // Client error reporting endpoint - capture JavaScript errors, exceptions, and crashes
+            std::string message = json_get_string(body, "message");
+            std::string stack = json_get_string(body, "stack");
+            std::string url = json_get_string(body, "url");
+            std::string line = json_get_string(body, "line");
+            std::string col = json_get_string(body, "col");
+            std::string type = json_get_string(body, "type");
 
+            // Format: [Browser ERROR] with red color for visibility
             fprintf(stderr, "\033[1;31m[Browser ERROR]\033[0m ");
 
             if (!type.empty()) {
@@ -782,7 +1208,9 @@ private:
             }
 
             if (!stack.empty()) {
+                // Print stack trace with indentation
                 fprintf(stderr, "\n  Stack trace:\n");
+                // Split by newlines and indent each line
                 size_t pos = 0;
                 std::string stack_copy = stack;
                 while ((pos = stack_copy.find('\n')) != std::string::npos) {
@@ -799,13 +1227,73 @@ private:
                 fprintf(stderr, "\n");
             }
 
-            res.set_content("{\"ok\": true}", "application/json");
-        });
+            send_json_response(fd, "{\"ok\": true}");
+            return;
+        }
+
+        // Static files
+        std::string content_type = "text/html";
+        std::string disk_path;
+
+        // Map paths to files and content types
+        if (path == "/" || path == "/index.html") {
+            disk_path = client_dir_ + "/index.html";
+            content_type = "text/html";
+        } else if (path == "/client.js") {
+            disk_path = client_dir_ + "/client.js";
+            content_type = "application/javascript";
+        } else if (path == "/styles.css") {
+            disk_path = client_dir_ + "/styles.css";
+            content_type = "text/css";
+        }
+
+        // Read file from disk
+        std::string file_content;
+        if (!disk_path.empty()) {
+            std::ifstream file(disk_path);
+            if (file.is_open()) {
+                std::stringstream buffer;
+                buffer << file.rdbuf();
+                file_content = buffer.str();
+            }
+        }
+
+        if (!file_content.empty()) {
+            size_t content_len = file_content.size();
+
+            std::string response = "HTTP/1.1 200 OK\r\n";
+            response += "Content-Type: " + content_type + "\r\n";
+            response += "Content-Length: " + std::to_string(content_len) + "\r\n";
+            response += "Connection: close\r\n";
+            response += "\r\n";
+            send(fd, response.c_str(), response.size(), 0);
+            send(fd, file_content.c_str(), content_len, 0);
+        } else {
+            std::string response = "HTTP/1.1 404 Not Found\r\n";
+            response += "Content-Type: text/plain\r\n";
+            response += "Content-Length: 9\r\n";
+            response += "Connection: close\r\n";
+            response += "\r\n";
+            response += "Not Found";
+            send(fd, response.c_str(), response.size(), 0);
+        }
+    }
+
+    void send_json_response(int fd, const std::string& json_body) {
+        std::string response = "HTTP/1.1 200 OK\r\n";
+        response += "Content-Type: application/json\r\n";
+        response += "Content-Length: " + std::to_string(json_body.size()) + "\r\n";
+        response += "Connection: close\r\n";
+        response += "\r\n";
+        response += json_body;
+        send(fd, response.c_str(), response.size(), 0);
     }
 
     int port_ = 8000;
-    httplib::Server server_;
+    int server_fd_ = -1;
+    std::atomic<bool> running_{false};
     std::thread thread_;
+    std::string client_dir_ = "client";  // Directory for client files
 };
 
 
@@ -1573,7 +2061,7 @@ private:
                 if (len < 12) return;  // 1 + 2 + 1 + 8
                 uint16_t keycode = *reinterpret_cast<const uint16_t*>(data + 1);
                 uint8_t down = data[3];
-                int mac_code = browser_to_mac_keycode(keycode);
+                int mac_code = keyboard_map::browser_to_mac_keycode(keycode);
                 if (mac_code >= 0) {
                     send_key_input(mac_code, down != 0);
                     g_key_count++;
@@ -1647,7 +2135,7 @@ private:
             case 'K': {
                 // Key down: K keycode
                 int keycode = atoi(args);
-                int mac_code = browser_to_mac_keycode(keycode);
+                int mac_code = keyboard_map::browser_to_mac_keycode(keycode);
                 if (mac_code >= 0) {
                     send_key_input(mac_code, true);
                     g_key_count++;
@@ -1657,7 +2145,7 @@ private:
             case 'k': {
                 // Key up: k keycode
                 int keycode = atoi(args);
-                int mac_code = browser_to_mac_keycode(keycode);
+                int mac_code = keyboard_map::browser_to_mac_keycode(keycode);
                 if (mac_code >= 0) {
                     send_key_input(mac_code, false);
                     g_key_count++;
@@ -1713,382 +2201,11 @@ static void disconnect_from_emulator(WebRTCServer* webrtc) {
     // should continue seamlessly across emulator restarts.
 }
 
-
-/*
- * Video Stream Implementations
- * (defined here after WebRTCServer to avoid circular dependencies)
- */
-
-// H264Stream Implementation
-H264Stream::H264Stream(WebRTCServer* webrtc)
-    : webrtc_(webrtc)
-{
-}
-
-H264Stream::~H264Stream() {
-    cleanup();
-}
-
-bool H264Stream::init(int width, int height, int fps) {
-    return encoder_.init(width, height, fps);
-}
-
-void H264Stream::cleanup() {
-    encoder_.cleanup();
-    stats_ = StreamStats{};
-}
-
-bool H264Stream::process_frame(
-    const uint8_t* bgra_data,
-    int width, int height, int stride,
-    const MacEmuIPCBuffer* shm,
-    uint64_t server_timestamp_us)
-{
-    (void)shm;  // H.264 doesn't use SHM metadata
-    (void)server_timestamp_us;  // RTP has its own timestamps
-
-    if (!has_peers()) {
-        return false;
-    }
-
-    // Encode frame
-    last_encode_start_ = std::chrono::steady_clock::now();
-    EncodedFrame frame = encoder_.encode_bgra(bgra_data, width, height, stride);
-    last_encode_end_ = std::chrono::steady_clock::now();
-
-    if (frame.data.empty()) {
-        return false;
-    }
-
-    // Send via WebRTC RTP
-    webrtc_->send_h264_frame(frame.data, frame.is_keyframe);
-
-    // Update stats
-    stats_.frames_sent++;
-    stats_.bytes_sent += frame.data.size();
-
-    auto encode_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-        last_encode_end_ - last_encode_start_);
-    stats_.avg_encode_ms = encode_duration.count() / 1000.0f;
-    stats_.avg_size_kb = frame.data.size() / 1024.0f;
-
-    return true;
-}
-
-void H264Stream::request_keyframe() {
-    encoder_.request_keyframe();
-}
-
-bool H264Stream::has_peers() const {
-    return webrtc_->has_codec_peer(CodecType::H264);
-}
-
-StreamStats H264Stream::get_stats() const {
-    StreamStats s = stats_;
-    s.peers = webrtc_->has_codec_peer(CodecType::H264) ? 1 : 0;
-    return s;
-}
-
-void H264Stream::reset_stats() {
-    stats_.frames_sent = 0;
-    stats_.bytes_sent = 0;
-    stats_.avg_encode_ms = 0.0f;
-    stats_.avg_size_kb = 0.0f;
-}
-
-// AV1Stream Implementation
-AV1Stream::AV1Stream(WebRTCServer* webrtc)
-    : webrtc_(webrtc)
-{
-}
-
-AV1Stream::~AV1Stream() {
-    cleanup();
-}
-
-bool AV1Stream::init(int width, int height, int fps) {
-    return encoder_.init(width, height, fps);
-}
-
-void AV1Stream::cleanup() {
-    encoder_.cleanup();
-    stats_ = StreamStats{};
-}
-
-bool AV1Stream::process_frame(
-    const uint8_t* bgra_data,
-    int width, int height, int stride,
-    const MacEmuIPCBuffer* shm,
-    uint64_t server_timestamp_us)
-{
-    (void)shm;  // AV1 doesn't use SHM metadata
-    (void)server_timestamp_us;  // RTP has its own timestamps
-
-    if (!has_peers()) {
-        return false;
-    }
-
-    // Encode frame
-    last_encode_start_ = std::chrono::steady_clock::now();
-    EncodedFrame frame = encoder_.encode_bgra(bgra_data, width, height, stride);
-    last_encode_end_ = std::chrono::steady_clock::now();
-
-    if (frame.data.empty()) {
-        return false;
-    }
-
-    // Send via WebRTC RTP
-    webrtc_->send_av1_frame(frame.data, frame.is_keyframe);
-
-    // Update stats
-    stats_.frames_sent++;
-    stats_.bytes_sent += frame.data.size();
-
-    auto encode_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-        last_encode_end_ - last_encode_start_);
-    stats_.avg_encode_ms = encode_duration.count() / 1000.0f;
-    stats_.avg_size_kb = frame.data.size() / 1024.0f;
-
-    return true;
-}
-
-void AV1Stream::request_keyframe() {
-    encoder_.request_keyframe();
-}
-
-bool AV1Stream::has_peers() const {
-    return webrtc_->has_codec_peer(CodecType::AV1);
-}
-
-StreamStats AV1Stream::get_stats() const {
-    StreamStats s = stats_;
-    s.peers = webrtc_->has_codec_peer(CodecType::AV1) ? 1 : 0;
-    return s;
-}
-
-void AV1Stream::reset_stats() {
-    stats_.frames_sent = 0;
-    stats_.bytes_sent = 0;
-    stats_.avg_encode_ms = 0.0f;
-    stats_.avg_size_kb = 0.0f;
-}
-
-// PNGStream Implementation
-PNGStream::PNGStream(WebRTCServer* webrtc)
-    : webrtc_(webrtc)
-    , last_heartbeat_(std::chrono::steady_clock::now())
-{
-}
-
-PNGStream::~PNGStream() {
-    cleanup();
-}
-
-bool PNGStream::init(int width, int height, int fps) {
-    return encoder_.init(width, height, fps);
-}
-
-void PNGStream::cleanup() {
-    encoder_.cleanup();
-    stats_ = StreamStats{};
-}
-
-bool PNGStream::process_frame(
-    const uint8_t* bgra_data,
-    int width, int height, int stride,
-    const MacEmuIPCBuffer* shm,
-    uint64_t server_timestamp_us)
-{
-    if (!has_peers()) {
-        return false;
-    }
-
-    // Extract dirty rect from SHM
-    DirtyRect rect = extract_dirty_rect(shm, width, height);
-
-    // Force full frame if any PNG peer needs their first frame
-    // PNG peers need a full first frame to initialize the canvas
-    if (webrtc_->png_peer_needs_first_frame()) {
-        rect.x = 0;
-        rect.y = 0;
-        rect.w = width;
-        rect.h = height;
-    }
-
-    // Heartbeat mechanism: Send tiny frame to carry ping echoes even when screen is static
-    // This prevents ping responses from being delayed indefinitely on idle screens
-    auto now = std::chrono::steady_clock::now();
-    if (rect.is_empty()) {
-        if (has_pending_ping(shm)) {
-            if (should_send_heartbeat()) {
-                // Send a tiny 1x1 pixel frame just to carry the ping echo
-                rect.x = 0;
-                rect.y = 0;
-                rect.w = 1;
-                rect.h = 1;
-                last_heartbeat_ = now;
-                // Note: This encodes/sends 1 pixel which is ~100 bytes - negligible overhead
-            }
-        }
-    } else {
-        // Screen is updating, reset heartbeat timer
-        last_heartbeat_ = now;
-    }
-
-    // Only encode if there are changes or heartbeat triggered
-    if (rect.is_empty()) {
-        return false;
-    }
-
-    // Debug logging for dirty rects
-    if (g_debug_mode_switch) {
-        if (++dirty_log_counter_ % 30 == 0) {
-            fprintf(stderr, "PNG: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %dx%d)\n",
-                    rect.x, rect.y, rect.w, rect.h, width, height);
-        }
-    }
-
-    // Encode the frame
-    last_encode_start_ = std::chrono::steady_clock::now();
-    EncodedFrame frame;
-
-    bool is_full_frame = rect.is_full_frame(width, height);
-
-    if (g_debug_mode_switch) {
-        if (++encode_log_counter_ % 30 == 0) {
-            fprintf(stderr, "PNG: Encoding %s (x=%u y=%u w=%u h=%u)\n",
-                    is_full_frame ? "FULL FRAME" : "dirty rect",
-                    rect.x, rect.y, rect.w, rect.h);
-        }
-    }
-
-    if (is_full_frame) {
-        frame = encoder_.encode_bgra(bgra_data, width, height, stride);
-    } else {
-        frame = encoder_.encode_bgra_rect(bgra_data, width, height, stride,
-                                          rect.x, rect.y, rect.w, rect.h);
-    }
-
-    last_encode_end_ = std::chrono::steady_clock::now();
-
-    if (frame.data.empty()) {
-        return false;
-    }
-
-    // Extract timestamps from SHM
-    uint64_t t1_frame_ready_ms = shm->timestamp_us / 1000;
-
-    // Send PNG with metadata via DataChannel
-    webrtc_->send_png_frame(frame.data, t1_frame_ready_ms,
-                            rect.x, rect.y, rect.w, rect.h,
-                            width, height);
-
-    // Update stats
-    stats_.frames_sent++;
-    stats_.bytes_sent += frame.data.size();
-
-    auto encode_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-        last_encode_end_ - last_encode_start_);
-    stats_.avg_encode_ms = encode_duration.count() / 1000.0f;
-    stats_.avg_size_kb = frame.data.size() / 1024.0f;
-
-    return true;
-}
-
-void PNGStream::request_keyframe() {
-    // PNG frames are always keyframes (no inter-frame compression)
-    // WebRTC layer handles first frame via png_peer_needs_first_frame()
-}
-
-bool PNGStream::has_peers() const {
-    return webrtc_->has_codec_peer(CodecType::PNG);
-}
-
-StreamStats PNGStream::get_stats() const {
-    StreamStats s = stats_;
-    s.peers = webrtc_->has_codec_peer(CodecType::PNG) ? 1 : 0;
-    return s;
-}
-
-void PNGStream::reset_stats() {
-    stats_.frames_sent = 0;
-    stats_.bytes_sent = 0;
-    stats_.avg_encode_ms = 0.0f;
-    stats_.avg_size_kb = 0.0f;
-}
-
-// Helper: Extract dirty rect from SHM
-DirtyRect PNGStream::extract_dirty_rect(const MacEmuIPCBuffer* shm, int width, int height) {
-    DirtyRect rect;
-
-    // Read dirty rect from SHM (plain reads - synchronized by eventfd)
-    rect.x = shm->dirty_x;
-    rect.y = shm->dirty_y;
-    rect.w = shm->dirty_width;
-    rect.h = shm->dirty_height;
-
-    // Validate bounds
-    if (rect.x >= (uint32_t)width || rect.y >= (uint32_t)height) {
-        rect.w = 0;
-        rect.h = 0;
-    }
-
-    return rect;
-}
-
-// Helper: Extract ping echo from SHM
-PingEcho PNGStream::extract_ping_echo(const MacEmuIPCBuffer* shm) {
-    PingEcho ping;
-
-    // OPTIMIZED: Only ping_sequence is atomic - acts as "ready" flag
-    // Read-acquire on ping_sequence ensures all timestamp writes are visible
-    ping.sequence = ATOMIC_LOAD(shm->ping_sequence);
-
-    // If ping available, read timestamp struct (no atomics needed - seq acts as guard)
-    if (ping.sequence > 0) {
-        ping.t1_browser_ms = shm->ping_timestamps.t1_browser_ms;
-        ping.t2_server_us = shm->ping_timestamps.t2_server_us;
-        ping.t3_emulator_us = shm->ping_timestamps.t3_emulator_us;
-        ping.t4_frame_us = shm->ping_timestamps.t4_frame_us;
-
-        // t5 is calculated at send time in WebRTCServer::send_png_frame()
-        ping.t5_server_send_us = 0;
-    }
-
-    return ping;
-}
-
-// Helper: Check if there's a pending ping echo
-bool PNGStream::has_pending_ping(const MacEmuIPCBuffer* shm) {
-    uint32_t ping_seq = ATOMIC_LOAD(shm->ping_sequence);
-    return ping_seq > 0;
-}
-
-// Helper: Check if we should send a heartbeat
-bool PNGStream::should_send_heartbeat() {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat_);
-
-    // Send heartbeat at most once per second to avoid spam
-    return elapsed.count() >= 1000;
-}
-
-
 /*
  * Main video processing loop
  */
 
-static void video_loop(WebRTCServer& webrtc) {
-    // Create video streams
-    H264Stream h264_stream(&webrtc);
-    AV1Stream av1_stream(&webrtc);
-    PNGStream png_stream(&webrtc);
-
-    // Initialize streams with default resolution (will reinit on resolution change)
-    h264_stream.init(800, 600);
-    av1_stream.init(800, 600);
-    png_stream.init(800, 600);
-
+static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, PNGEncoder& png_encoder) {
     auto last_stats_time = std::chrono::steady_clock::now();
     auto last_emu_check = std::chrono::steady_clock::now();
     auto last_scan_time = std::chrono::steady_clock::now();
@@ -2269,27 +2386,116 @@ static void video_loop(WebRTCServer& webrtc) {
         // Check if keyframe requested (new peer connected)
         bool keyframe_requested = g_request_keyframe.exchange(false);
         if (keyframe_requested) {
-            h264_stream.request_keyframe();
-            av1_stream.request_keyframe();
-            png_stream.request_keyframe();
+            h264_encoder.request_keyframe();
+            av1_encoder.request_keyframe();
         }
 
-        // Process frame through all streams (each decides if it has peers)
+        // Encode and send to H.264 peers
         auto encode_start = std::chrono::steady_clock::now();
-        int frames_sent = 0;
-        if (h264_stream.process_frame(frame_data, width, height, stride, g_video_shm, server_now_us)) {
-            frames_sent++;
+        if (webrtc.has_codec_peer(CodecType::H264)) {
+            EncodedFrame frame = h264_encoder.encode_bgra(frame_data, width, height, stride);
+            if (!frame.data.empty()) {
+                webrtc.send_h264_frame(frame.data, frame.is_keyframe);
+                frames_encoded++;
+            }
         }
-        if (av1_stream.process_frame(frame_data, width, height, stride, g_video_shm, server_now_us)) {
-            frames_sent++;
+
+        // Encode and send to AV1 peers
+        if (webrtc.has_codec_peer(CodecType::AV1)) {
+            EncodedFrame frame = av1_encoder.encode_bgra(frame_data, width, height, stride);
+            if (!frame.data.empty()) {
+                webrtc.send_av1_frame(frame.data, frame.is_keyframe);
+                frames_encoded++;
+            }
         }
-        if (png_stream.process_frame(frame_data, width, height, stride, g_video_shm, server_now_us)) {
-            frames_sent++;
+
+        // Encode and send to PNG peers using dirty rects from emulator
+        if (webrtc.has_codec_peer(CodecType::PNG)) {
+            // Read dirty rect from SHM (plain reads - synchronized by eventfd)
+            uint32_t dirty_x = g_video_shm->dirty_x;
+            uint32_t dirty_y = g_video_shm->dirty_y;
+            uint32_t dirty_width = g_video_shm->dirty_width;
+            uint32_t dirty_height = g_video_shm->dirty_height;
+
+            // Debug logging for dirty rects
+            static int dirty_log_counter = 0;
+            if (++dirty_log_counter % 30 == 0) {
+                fprintf(stderr, "PNG: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %ux%u)\n",
+                        dirty_x, dirty_y, dirty_width, dirty_height, width, height);
+            }
+
+            // Force full frame if any PNG peer needs their first frame
+            // PNG peers need a full first frame to initialize the canvas
+            bool needs_first = webrtc.png_peer_needs_first_frame();
+            if (needs_first) {
+                dirty_x = 0;
+                dirty_y = 0;
+                dirty_width = width;
+                dirty_height = height;
+            }
+
+            // Heartbeat mechanism: Send tiny frame to carry ping echoes even when screen is static
+            // This prevents ping responses from being delayed indefinitely on idle screens
+            static auto last_heartbeat = std::chrono::steady_clock::now();
+            if (dirty_width == 0 || dirty_height == 0) {
+                // Check if there's a pending ping echo
+                uint32_t ping_seq = ATOMIC_LOAD(g_video_shm->ping_sequence);
+                if (ping_seq > 0) {
+                    auto heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat);
+                    // Send heartbeat at most once per second to avoid spam
+                    if (heartbeat_elapsed.count() >= 1000) {
+                        // Send a tiny 1x1 pixel frame just to carry the ping echo
+                        dirty_x = 0;
+                        dirty_y = 0;
+                        dirty_width = 1;
+                        dirty_height = 1;
+                        last_heartbeat = now;
+                        // Note: This encodes/sends 1 pixel which is ~100 bytes - negligible overhead
+                    }
+                }
+            } else {
+                // Screen is updating, reset heartbeat timer
+                last_heartbeat = now;
+            }
+
+            // Only encode if there are changes (dirty_width > 0) or heartbeat triggered
+            // Ping echoes are carried in the frame metadata header of any frame being sent
+            if (dirty_width > 0 && dirty_height > 0) {
+                EncodedFrame frame;
+
+                // Check if this is a full frame or dirty rect
+                bool is_full_frame = (dirty_x == 0 && dirty_y == 0 && dirty_width == width && dirty_height == height);
+
+                static int encode_log_counter = 0;
+                if (++encode_log_counter % 30 == 0) {
+                    fprintf(stderr, "PNG: Encoding %s (x=%u y=%u w=%u h=%u)\n",
+                            is_full_frame ? "FULL FRAME" : "dirty rect",
+                            dirty_x, dirty_y, dirty_width, dirty_height);
+                }
+
+                if (is_full_frame) {
+                    // Full frame
+                    frame = png_encoder.encode_bgra(frame_data, width, height, stride);
+                } else {
+                    // Dirty rectangle only
+                    frame = png_encoder.encode_bgra_rect(frame_data, width, height, stride,
+                                                         dirty_x, dirty_y, dirty_width, dirty_height);
+                }
+
+                if (!frame.data.empty()) {
+                    // T1: Frame ready time from emulator (convert from microseconds to milliseconds)
+                    uint64_t t1_frame_ready_ms = frame_timestamp_us / 1000;
+
+                    // Send PNG with dirty rect metadata, full frame resolution, and timestamps
+                    webrtc.send_png_frame(frame.data, t1_frame_ready_ms,
+                                          dirty_x, dirty_y, dirty_width, dirty_height,
+                                          width, height);
+                    frames_encoded++;
+                }
+            }
+            // else: no changes (dirty_width == 0), skip encoding
         }
         auto encode_end = std::chrono::steady_clock::now();
-
-        // Update frames_encoded counter for stats
-        frames_encoded += frames_sent;
 
         // Track latency stats
         static uint64_t total_shm_latency_us = 0;
@@ -2685,7 +2891,10 @@ int main(int argc, char* argv[]) {
 
     fprintf(stderr, "\nOpen http://localhost:%d in your browser\n", g_http_port);
 
-    // Create audio encoder (video encoders are now created inside video_loop as part of stream objects)
+    // Create encoders
+    H264Encoder h264_encoder;
+    AV1Encoder av1_encoder;
+    PNGEncoder png_encoder;
     g_audio_encoder = std::make_unique<OpusAudioEncoder>();
 
     // Auto-start emulator if enabled
@@ -2721,8 +2930,8 @@ int main(int argc, char* argv[]) {
     // Launch audio thread
     std::thread audio_thread(audio_loop, std::ref(webrtc));
 
-    // Run video loop in main thread (video streams created inside loop)
-    video_loop(webrtc);
+    // Run video loop in main thread
+    video_loop(webrtc, h264_encoder, av1_encoder, png_encoder);
 
     // Wait for audio thread to finish
     audio_thread.join();
