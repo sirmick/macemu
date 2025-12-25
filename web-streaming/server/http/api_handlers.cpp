@@ -48,6 +48,12 @@ Response APIRouter::handle(const Request& req, bool* handled) {
     if (req.path == "/api/status" && req.method == "GET") {
         return handle_status(req);
     }
+    if (req.path == "/api/codec" && req.method == "GET") {
+        return handle_codec_get(req);
+    }
+    if (req.path == "/api/codec" && req.method == "POST") {
+        return handle_codec_post(req);
+    }
     if (req.path == "/api/emulator/start" && req.method == "POST") {
         return handle_emulator_start(req);
     }
@@ -258,6 +264,62 @@ Response APIRouter::handle_error(const Request& req) {
         }
     } else {
         fprintf(stderr, "\n");
+    }
+
+    return Response::json("{\"ok\": true}");
+}
+
+Response APIRouter::handle_codec_get(const Request& req) {
+    (void)req;  // Unused parameter
+
+    if (!ctx_->server_codec) {
+        return Response::json("{\"error\": \"Codec not available\"}");
+    }
+
+    const char* codec_name = "";
+    switch (*ctx_->server_codec) {
+        case CodecType::H264: codec_name = "h264"; break;
+        case CodecType::AV1: codec_name = "av1"; break;
+        case CodecType::PNG: codec_name = "png"; break;
+        case CodecType::RAW: codec_name = "raw"; break;
+    }
+
+    std::string json_body = "{\"codec\": \"";
+    json_body += codec_name;
+    json_body += "\"}";
+    return Response::json(json_body);
+}
+
+Response APIRouter::handle_codec_post(const Request& req) {
+    if (!ctx_->server_codec || !ctx_->notify_codec_change_fn) {
+        return Response::json("{\"error\": \"Codec change not available\"}");
+    }
+
+    auto j = json_utils::parse(req.body);
+    std::string codec_str = json_utils::get_string(j, "codec");
+
+    CodecType new_codec;
+    if (codec_str == "h264" || codec_str == "H264") {
+        new_codec = CodecType::H264;
+    } else if (codec_str == "av1" || codec_str == "AV1") {
+        new_codec = CodecType::AV1;
+    } else if (codec_str == "png" || codec_str == "PNG") {
+        new_codec = CodecType::PNG;
+    } else if (codec_str == "raw" || codec_str == "RAW") {
+        new_codec = CodecType::RAW;
+    } else {
+        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, png, or raw\"}");
+    }
+
+    // Update codec
+    CodecType old_codec = *ctx_->server_codec;
+    *ctx_->server_codec = new_codec;
+
+    fprintf(stderr, "Config: Codec changed from %d to %d via API\n", (int)old_codec, (int)new_codec);
+
+    // Notify all clients (will send reconnect message via WebSocket)
+    if (new_codec != old_codec) {
+        ctx_->notify_codec_change_fn(new_codec);
     }
 
     return Response::json("{\"ok\": true}");

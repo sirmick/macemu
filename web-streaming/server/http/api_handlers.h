@@ -9,6 +9,7 @@
 
 #include "http_server.h"
 #include "../../BasiliskII/src/IPC/ipc_protocol.h"
+#include "../config/server_config.h"  // For CodecType
 #include <string>
 #include <functional>
 
@@ -34,6 +35,10 @@ struct APIContext {
     int emulator_pid;
     int started_emulator_pid;
     MacEmuIPCBuffer* video_shm;
+
+    // Codec state
+    CodecType* server_codec;  // Pointer to g_server_codec
+    std::function<void(CodecType)> notify_codec_change_fn;  // Notify clients of codec change
 
     // Command callbacks
     std::function<void(uint8_t)> send_command_fn;
@@ -62,6 +67,8 @@ private:
     Response handle_prefs_post(const Request& req);
     Response handle_restart(const Request& req);
     Response handle_status(const Request& req);
+    Response handle_codec_get(const Request& req);
+    Response handle_codec_post(const Request& req);
     Response handle_emulator_start(const Request& req);
     Response handle_emulator_stop(const Request& req);
     Response handle_emulator_restart(const Request& req);

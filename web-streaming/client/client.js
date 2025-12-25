@@ -944,6 +944,22 @@ class BasiliskWebRTC {
                 await this.handleOffer(msg.sdp);
                 break;
 
+            case 'reconnect':
+                // Server is requesting reconnection (e.g., codec change)
+                logger.info('Server requested reconnection', { reason: msg.reason, codec: msg.codec });
+                if (msg.reason === 'codec_change' && msg.codec) {
+                    // Update codec type
+                    const newCodec = msg.codec === 'h264' ? CodecType.H264 :
+                                    msg.codec === 'av1' ? CodecType.AV1 :
+                                    msg.codec === 'png' ? CodecType.PNG :
+                                    msg.codec === 'raw' ? CodecType.RAW : CodecType.PNG;
+                    this.codecType = newCodec;
+                    this.stats.codec = msg.codec;
+                }
+                // Reconnect the PeerConnection with new codec
+                this.reconnectPeerConnection();
+                break;
+
             case 'candidate':
                 logger.debug('Received ICE candidate', { mid: msg.mid });
                 if (this.pc) {
@@ -1359,13 +1375,49 @@ class BasiliskWebRTC {
         }
         this.updateWebRTCState('pc', state);
 
-        if (state === 'failed') {
-            this.updateStatus('Connection failed', 'error');
+        if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+            this.updateStatus('Connection ' + state, 'error');
             this.connected = false;
-        } else if (state === 'disconnected') {
-            this.updateStatus('Disconnected', 'error');
-            this.connected = false;
+
+            // If WebSocket is still open, just reconnect the PeerConnection
+            // Otherwise do a full reconnect
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                logger.info(`Connection ${state}, reconnecting PeerConnection via existing WebSocket`);
+                this.reconnectPeerConnection();
+            } else {
+                logger.info(`Connection ${state}, WebSocket also closed, full reconnect needed`);
+                this.scheduleReconnect();
+            }
         }
+    }
+
+    // Reconnect just the PeerConnection without closing WebSocket
+    reconnectPeerConnection() {
+        // Clean up old PeerConnection
+        if (this.pc) {
+            this.pc.close();
+            this.pc = null;
+        }
+        if (this.dataChannel) {
+            this.dataChannel = null;
+        }
+
+        // Reset state
+        this.connected = false;
+        connectionSteps.reset();
+        connectionSteps.setDone('ws');  // WebSocket still connected
+
+        // Reinitialize decoder (codec may have changed)
+        if (!this.initDecoder()) {
+            logger.error('Failed to reinitialize decoder');
+            this.scheduleReconnect();
+            return;
+        }
+
+        // Send new connect request on existing WebSocket
+        logger.info('Sending new connect request');
+        this.ws.send(JSON.stringify({ type: 'connect' }));
+        this.updateStatus('Reconnecting...', 'connecting');
     }
 
     onSignalingStateChange() {

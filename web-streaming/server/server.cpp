@@ -97,6 +97,7 @@ static std::atomic<bool> g_running(true);
 static std::atomic<bool> g_emulator_connected(false);
 static std::atomic<bool> g_restart_emulator_requested(false);
 static pid_t g_emulator_pid = -1;
+static CodecType g_previous_codec = CodecType::PNG;  // Track codec changes for peer disconnection
 
 // IPC connection (replaces individual global handles)
 static ipc::IPCConnection g_ipc;
@@ -189,7 +190,7 @@ static bool try_connect_to_emulator(pid_t pid) {
 }
 
 // Forward declaration - implementation after WebRTCServer class
-static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr);
+static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr, bool disconnect_peers = false);
 
 
 /*
@@ -254,9 +255,7 @@ static bool start_emulator() {
         g_started_emulator_pid = -1;
     }
 
-    // Read codec preference from prefs file (fresh on each emulator start)
-    // This allows users to change codec via prefs dialog and restart
-    read_webcodec_pref();
+    // Note: Codec is now set via /api/codec endpoint, not prefs file
 
     std::string emu_path = find_emulator();
     if (emu_path.empty()) {
@@ -412,6 +411,7 @@ public:
         // Initialize API context (will be populated before start())
         api_ctx_.debug_connection = false;
         api_ctx_.debug_mode_switch = false;
+        api_ctx_.server_codec = &g_server_codec;  // Point to global codec
         api_ctx_.debug_perf = false;
         api_ctx_.emulator_connected = false;
         api_ctx_.emulator_pid = -1;
@@ -455,6 +455,10 @@ public:
         server_.stop();
     }
 
+    // Set WebRTC server reference for codec change notifications
+    // Implementation after WebRTCServer class definition
+    void set_webrtc_server(WebRTCServer* webrtc);
+
 private:
     // Populate API context with current state (called before handling requests)
     void update_api_context() {
@@ -468,6 +472,9 @@ private:
         api_ctx_.emulator_pid = g_emulator_pid;
         api_ctx_.started_emulator_pid = g_started_emulator_pid;
         api_ctx_.video_shm = g_video_shm;
+
+        // Codec state (set once in constructor)
+        // api_ctx_.server_codec and notify_codec_change_fn are already set
 
         // Set command callbacks
         api_ctx_.send_command_fn = [](uint8_t cmd) { send_command(cmd); };
@@ -521,6 +528,12 @@ public:
             ws_server_ = std::make_unique<rtc::WebSocketServer>(config);
 
             ws_server_->onClient([this](std::shared_ptr<rtc::WebSocket> ws) {
+                // Store WebSocket shared_ptr so we can send messages to it later
+                {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    ws_connections_[ws.get()] = ws;
+                }
+
                 ws->onOpen([ws]() {
                     std::string welcome = "{\"type\":\"welcome\",\"peerId\":\"server\"}";
                     ws->send(welcome);
@@ -545,6 +558,8 @@ public:
                         peer_count_--;
                         fprintf(stderr, "[WebRTC] Peer disconnected, %d remaining\n", peer_count_.load());
                     }
+                    // Remove from WebSocket connections map
+                    ws_connections_.erase(ws.get());
                 });
             });
 
@@ -863,6 +878,36 @@ public:
         peers_.clear();
         ws_to_peer_id_.clear();
         peer_count_.store(0);
+    }
+
+    // Send "reconnect" message to all clients (for codec changes)
+    void notify_codec_change(CodecType new_codec) {
+        const char* codec_name = (new_codec == CodecType::H264) ? "h264" :
+                                 (new_codec == CodecType::AV1) ? "av1" :
+                                 (new_codec == CodecType::PNG) ? "png" : "raw";
+
+        json msg = {
+            {"type", "reconnect"},
+            {"reason", "codec_change"},
+            {"codec", codec_name}
+        };
+        std::string msg_str = msg.dump();
+
+        fprintf(stderr, "[WebRTC] Notifying %d clients of codec change to %s\n",
+                (int)ws_connections_.size(), codec_name);
+
+        // Send to all connected WebSocket clients
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        for (auto& pair : ws_connections_) {
+            auto& ws = pair.second;
+            if (ws) {
+                try {
+                    ws->send(msg_str);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[WebRTC] Failed to send reconnect message: %s\n", e.what());
+                }
+            }
+        }
     }
 
 private:
@@ -1360,21 +1405,32 @@ private:
     std::mutex peers_mutex_;
     std::map<std::string, std::shared_ptr<PeerConnection>> peers_;
     std::map<rtc::WebSocket*, std::string> ws_to_peer_id_;
+    std::map<rtc::WebSocket*, std::shared_ptr<rtc::WebSocket>> ws_connections_;  // Keep WebSocket alive
 
     uint32_t ssrc_ = 1;
 };
 
 // Implementation of disconnect_from_emulator (needs WebRTCServer definition)
-static void disconnect_from_emulator(WebRTCServer* webrtc) {
-    (void)webrtc;  // Keep parameter for future use, suppress unused warning
+static void disconnect_from_emulator(WebRTCServer* webrtc, bool disconnect_peers) {
     g_ipc.disconnect();
     g_emulator_connected = false;
     g_emulator_pid = -1;
 
-    // NOTE: We do NOT disconnect WebRTC peers here!
-    // The encoder auto-reinitializes when resolution changes,
-    // and the browser canvas auto-resizes. The video stream
-    // should continue seamlessly across emulator restarts.
+    // Disconnect WebRTC peers if requested (e.g., when codec changes)
+    // Otherwise, keep peers connected for seamless restarts (resolution changes)
+    if (disconnect_peers && webrtc) {
+        fprintf(stderr, "Video: Disconnecting all WebRTC peers for codec change\n");
+        webrtc->disconnect_all_peers();
+    }
+}
+
+// Implementation of HTTPServer::set_webrtc_server (needs WebRTCServer definition)
+void HTTPServer::set_webrtc_server(WebRTCServer* webrtc) {
+    if (webrtc) {
+        api_ctx_.notify_codec_change_fn = [webrtc](CodecType codec) {
+            webrtc->notify_codec_change(codec);
+        };
+    }
 }
 
 /*
@@ -1442,18 +1498,23 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                     disconnect_from_emulator(&webrtc);
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     start_emulator();
+                    g_previous_codec = g_server_codec;  // Update codec after restart
                 }
             }
 
             // Handle restart request from web UI
             if (g_restart_emulator_requested.exchange(false)) {
                 fprintf(stderr, "Video: Restart requested from web UI\n");
+
+                // Note: Codec change is now independent of emulator restart
+                // Peers are kept connected for seamless restart
+
                 if (g_started_emulator_pid > 0) {
                     stop_emulator();
                 } else {
                     send_command(MACEMU_CMD_RESET);
                 }
-                disconnect_from_emulator(&webrtc);
+                disconnect_from_emulator(&webrtc, false);  // Don't disconnect peers
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 if (g_auto_start_emulator) {
                     start_emulator();
@@ -1947,6 +2008,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Connect HTTP server to WebRTC server for codec change notifications
+    http_server.set_webrtc_server(&webrtc);
+
     fprintf(stderr, "\nOpen http://localhost:%d in your browser\n", g_http_port);
 
     // Create encoders
@@ -1962,6 +2026,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Found emulator: %s\n", emu.c_str());
             if (start_emulator()) {
                 fprintf(stderr, "Emulator started, waiting for IPC resources...\n\n");
+                g_previous_codec = g_server_codec;  // Initialize codec tracking
             }
         } else {
             fprintf(stderr, "\n");
