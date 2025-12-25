@@ -510,13 +510,10 @@ static void audio_thread_func()
 							}
 							data_len = sample_count * channels * 2;
 						} else {
-							// Convert S16MSB (big-endian) to S16LE (little-endian)
-							int16_t* src_s16 = (int16_t*)src;
-							int16_t* dst_s16 = (int16_t*)audio_mix_buffer;
-							for (uint32 i = 0; i < sample_count * channels; i++) {
-								uint16_t sample = src_s16[i];
-								dst_s16[i] = (sample >> 8) | (sample << 8);
-							}
+							// S16 data - direct copy like SDL does (Mac provides S16MSB format)
+							// SDL uses AUDIO_S16MSB and does direct memcpy - we do the same
+							// The server/Opus encoder will handle any needed byte swapping
+							memcpy(audio_mix_buffer, src, data_len);
 						}
 
 						// Write to SHM
