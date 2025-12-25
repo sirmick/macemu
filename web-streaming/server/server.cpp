@@ -236,6 +236,9 @@ static std::string find_emulator() {
     return "";
 }
 
+// Forward declarations
+static void read_webcodec_pref();
+
 static pid_t g_started_emulator_pid = -1;  // PID of emulator we started
 
 static bool start_emulator() {
@@ -250,6 +253,10 @@ static bool start_emulator() {
         // Exited
         g_started_emulator_pid = -1;
     }
+
+    // Read codec preference from prefs file (fresh on each emulator start)
+    // This allows users to change codec via prefs dialog and restart
+    read_webcodec_pref();
 
     std::string emu_path = find_emulator();
     if (emu_path.empty()) {
@@ -1919,8 +1926,8 @@ int main(int argc, char* argv[]) {
     // Create minimal prefs file if it doesn't exist (for cold boot)
     create_minimal_prefs_if_needed();
 
-    // Read codec preference from prefs file
-    read_webcodec_pref();
+    // Note: Codec preference is read when emulator starts (not at server boot)
+    // This allows users to change codec via prefs dialog and restart
 
     // Print configuration summary
     g_config.print_summary();
