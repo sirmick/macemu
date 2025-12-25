@@ -33,6 +33,8 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/utils/keyboard_map.cpp \
               $(SERVER_DIR)/utils/json_utils.cpp \
               $(SERVER_DIR)/ipc/ipc_connection.cpp \
+              $(SERVER_DIR)/storage/file_scanner.cpp \
+              $(SERVER_DIR)/storage/prefs_manager.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
               $(SERVER_DIR)/av1_encoder.cpp \
               $(SERVER_DIR)/opus_encoder.cpp \
@@ -45,6 +47,8 @@ SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/keyboard_map.o \
               $(BUILD_DIR)/json_utils.o \
               $(BUILD_DIR)/ipc_connection.o \
+              $(BUILD_DIR)/file_scanner.o \
+              $(BUILD_DIR)/prefs_manager.o \
               $(BUILD_DIR)/h264_encoder.o \
               $(BUILD_DIR)/av1_encoder.o \
               $(BUILD_DIR)/opus_encoder.o \
@@ -99,6 +103,16 @@ $(BUILD_DIR)/json_utils.o: $(SERVER_DIR)/utils/json_utils.cpp \
 $(BUILD_DIR)/ipc_connection.o: $(SERVER_DIR)/ipc/ipc_connection.cpp \
                                 $(SERVER_DIR)/ipc/ipc_connection.h \
                                 ../BasiliskII/src/IPC/ipc_protocol.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile storage
+$(BUILD_DIR)/file_scanner.o: $(SERVER_DIR)/storage/file_scanner.cpp \
+                              $(SERVER_DIR)/storage/file_scanner.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/prefs_manager.o: $(SERVER_DIR)/storage/prefs_manager.cpp \
+                               $(SERVER_DIR)/storage/prefs_manager.h \
+                               $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile server
