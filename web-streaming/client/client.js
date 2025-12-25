@@ -923,6 +923,13 @@ class BasiliskWebRTC {
                         // Reinitialize decoder for server's codec
                         this.initDecoder();
                     }
+
+                    // Update codec selector UI and enable it
+                    const codecSelect = document.getElementById('codec-select');
+                    if (codecSelect) {
+                        codecSelect.value = msg.codec;
+                        codecSelect.disabled = false;
+                    }
                 }
                 if (debugConfig.debug_connection) {
                     logger.info('Server acknowledged connection', { codec: msg.codec, peer_id: msg.peer_id });
@@ -2235,9 +2242,6 @@ fpu {{FPU}}
 jit {{JIT}}
 nosound {{NOSOUND}}
 
-# Video codec for web streaming (png or h264)
-webcodec {{WEBCODEC}}
-
 # JIT settings
 jitfpu true
 jitcachesize 8192
@@ -2303,7 +2307,6 @@ function parsePrefsFile(content) {
         cdroms: [],
         ram: 32,
         screen: '800x600',
-        webcodec: 'png',
         cpu: 4,
         model: 14,
         fpu: true,
@@ -2364,15 +2367,6 @@ function parsePrefsFile(content) {
             case 'nosound':
                 config.sound = value !== 'true';
                 break;
-            case 'webcodec':
-                if (value === 'h264') {
-                    config.webcodec = 'h264';
-                } else if (value === 'av1') {
-                    config.webcodec = 'av1';
-                } else {
-                    config.webcodec = 'png';
-                }
-                break;
         }
     }
 
@@ -2403,8 +2397,7 @@ function generatePrefsFile(config, romsPath, imagesPath) {
         .replace('{{MODEL}}', config.model.toString())
         .replace('{{FPU}}', config.fpu ? 'true' : 'false')
         .replace('{{JIT}}', config.jit ? 'true' : 'false')
-        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true')
-        .replace('{{WEBCODEC}}', config.webcodec || 'png');
+        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true');
 
     return prefs;
 }
@@ -2418,7 +2411,6 @@ let currentConfig = {
     disks: [],
     ram: 32,
     screen: '800x600',
-    webcodec: 'png',
     cpu: 4,
     model: 14,
     fpu: true,
@@ -2640,7 +2632,6 @@ function updateConfigUI() {
     const romEl = document.getElementById('cfg-rom');
     const ramEl = document.getElementById('cfg-ram');
     const screenEl = document.getElementById('cfg-screen');
-    const webcodecEl = document.getElementById('cfg-webcodec');
     const cpuEl = document.getElementById('cfg-cpu');
     const modelEl = document.getElementById('cfg-model');
     const fpuEl = document.getElementById('cfg-fpu');
@@ -2650,7 +2641,6 @@ function updateConfigUI() {
     if (romEl) romEl.value = currentConfig.rom;
     if (ramEl) ramEl.value = currentConfig.ram;
     if (screenEl) screenEl.value = currentConfig.screen;
-    if (webcodecEl) webcodecEl.value = currentConfig.webcodec || 'png';
     if (cpuEl) cpuEl.value = currentConfig.cpu;
     if (modelEl) modelEl.value = currentConfig.model;
     if (fpuEl) fpuEl.checked = currentConfig.fpu;
@@ -2673,7 +2663,6 @@ async function saveConfig() {
     currentConfig.rom = document.getElementById('cfg-rom')?.value || '';
     currentConfig.ram = parseInt(document.getElementById('cfg-ram')?.value || 32);
     currentConfig.screen = document.getElementById('cfg-screen')?.value || '800x600';
-    currentConfig.webcodec = document.getElementById('cfg-webcodec')?.value || 'png';
     currentConfig.cpu = parseInt(document.getElementById('cfg-cpu')?.value || 4);
     currentConfig.model = parseInt(document.getElementById('cfg-model')?.value || 14);
     currentConfig.fpu = document.getElementById('cfg-fpu')?.checked ?? true;
@@ -2740,6 +2729,32 @@ async function restartEmulator() {
         logger.info('Restart emulator', { message: data.message });
     } catch (e) {
         logger.error('Failed to restart emulator', { error: e.message });
+    }
+}
+
+// Codec management
+async function changeCodec() {
+    const select = document.getElementById('codec-select');
+    if (!select) return;
+
+    const newCodec = select.value;
+    logger.info('Changing codec', { codec: newCodec });
+
+    try {
+        const res = await fetch(getApiUrl('codec'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ codec: newCodec })
+        });
+        const data = await res.json();
+        if (data.ok) {
+            logger.info('Codec changed successfully', { codec: newCodec });
+            // Server will send "reconnect" message to trigger client reconnection
+        } else if (data.error) {
+            logger.error('Failed to change codec', { error: data.error });
+        }
+    } catch (e) {
+        logger.error('Failed to change codec', { error: e.message });
     }
 }
 

@@ -32,6 +32,14 @@
         </div>
 
         <div class="controls">
+            <div class="codec-selector">
+                <label for="codec-select">Codec:</label>
+                <select id="codec-select" onchange="changeCodec()" disabled>
+                    <option value="png">PNG</option>
+                    <option value="h264">H.264</option>
+                    <option value="av1">AV1</option>
+                </select>
+            </div>
             <button class="btn" id="config-btn" onclick="openConfig()">Settings</button>
             <button class="btn success" id="start-btn" onclick="startEmulator()">Start</button>
             <button class="btn danger" id="stop-btn" onclick="stopEmulator()">Stop</button>

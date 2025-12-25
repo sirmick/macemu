@@ -48,9 +48,6 @@ Response APIRouter::handle(const Request& req, bool* handled) {
     if (req.path == "/api/status" && req.method == "GET") {
         return handle_status(req);
     }
-    if (req.path == "/api/codec" && req.method == "GET") {
-        return handle_codec_get(req);
-    }
     if (req.path == "/api/codec" && req.method == "POST") {
         return handle_codec_post(req);
     }
@@ -267,27 +264,6 @@ Response APIRouter::handle_error(const Request& req) {
     }
 
     return Response::json("{\"ok\": true}");
-}
-
-Response APIRouter::handle_codec_get(const Request& req) {
-    (void)req;  // Unused parameter
-
-    if (!ctx_->server_codec) {
-        return Response::json("{\"error\": \"Codec not available\"}");
-    }
-
-    const char* codec_name = "";
-    switch (*ctx_->server_codec) {
-        case CodecType::H264: codec_name = "h264"; break;
-        case CodecType::AV1: codec_name = "av1"; break;
-        case CodecType::PNG: codec_name = "png"; break;
-        case CodecType::RAW: codec_name = "raw"; break;
-    }
-
-    std::string json_body = "{\"codec\": \"";
-    json_body += codec_name;
-    json_body += "\"}";
-    return Response::json(json_body);
 }
 
 Response APIRouter::handle_codec_post(const Request& req) {
