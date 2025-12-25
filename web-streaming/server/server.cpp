@@ -490,8 +490,7 @@ struct PeerConnection {
     CodecType codec = CodecType::H264;  // Codec type for this peer
     bool ready = false;
     bool needs_first_frame = true;  // PNG/RAW peers need full first frame
-    bool has_remote_description = false;
-    std::vector<std::pair<std::string, std::string>> pending_candidates;  // candidate, mid
+    // Note: pending_candidates removed - libdatachannel queues candidates internally
 };
 
 
@@ -1011,18 +1010,30 @@ private:
                               "\",\"codec\":\"" + codec_name + "\"}";
             ws->send(ack);
 
-            std::weak_ptr<rtc::PeerConnection> wpc = peer->pc;
-            peer->pc->onGatheringStateChange([ws, peer_id, wpc](rtc::PeerConnection::GatheringState state) {
-                if (state == rtc::PeerConnection::GatheringState::Complete) {
-                    if (auto pc = wpc.lock()) {
-                        auto description = pc->localDescription();
-                        if (description) {
-                            std::string sdp = std::string(description.value());
-                            std::string type_str = description->typeString();
-                            std::string response = "{\"type\":\"" + type_str + "\",\"sdp\":\"" + json_escape(sdp) + "\"}";
-                            ws->send(response);
-                        }
-                    }
+            // onLocalDescription: Called when SDP is ready (replaces manual gathering state check)
+            peer->pc->onLocalDescription([ws, peer_id](rtc::Description desc) {
+                json msg = {
+                    {"type", desc.typeString()},
+                    {"sdp", std::string(desc)}
+                };
+                ws->send(msg.dump());
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Sent %s to %s (sdp length=%zu)\n",
+                            desc.typeString().c_str(), peer_id.c_str(), std::string(desc).size());
+                }
+            });
+
+            // onLocalCandidate: Automatic trickle ICE (sends candidates as they're gathered)
+            peer->pc->onLocalCandidate([ws, peer_id](rtc::Candidate cand) {
+                json msg = {
+                    {"type", "candidate"},
+                    {"candidate", std::string(cand)},
+                    {"mid", cand.mid()}
+                };
+                ws->send(msg.dump());
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Sent ICE candidate to %s (mid=%s)\n",
+                            peer_id.c_str(), cand.mid().c_str());
                 }
             });
 
@@ -1137,32 +1148,15 @@ private:
                             peer->id.c_str(), sdp.size());
                 }
 
-                // Set remote description
+                // Set remote description - libdatachannel handles pending candidates internally
                 try {
                     peer->pc->setRemoteDescription(rtc::Description(sdp, "answer"));
-                    peer->has_remote_description = true;
                     if (g_debug_connection) {
                         fprintf(stderr, "[WebRTC] Remote description set for %s\n", peer->id.c_str());
                     }
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] ERROR setting remote description for %s: %s\n",
                             peer->id.c_str(), e.what());
-                    return;
-                }
-
-                // Now add any pending ICE candidates
-                if (!peer->pending_candidates.empty()) {
-                    fprintf(stderr, "[WebRTC] Adding %zu pending ICE candidates\n",
-                            peer->pending_candidates.size());
-                    for (const auto& [candidate, mid] : peer->pending_candidates) {
-                        try {
-                            peer->pc->addRemoteCandidate(rtc::Candidate(candidate, mid));
-                            fprintf(stderr, "[WebRTC] Added pending candidate: %s\n", mid.c_str());
-                        } catch (const std::exception& e) {
-                            fprintf(stderr, "[WebRTC] Failed to add pending candidate: %s\n", e.what());
-                        }
-                    }
-                    peer->pending_candidates.clear();
                 }
             }
         }
@@ -1174,20 +1168,15 @@ private:
                 std::string candidate = json_get_string(msg, "candidate");
                 std::string mid = json_get_string(msg, "mid");
                 if (!candidate.empty()) {
-                    if (peer->has_remote_description) {
-                        // Remote description is set, add candidate immediately
+                    // libdatachannel handles candidate queuing if remote description not set yet
+                    if (g_debug_connection) {
                         fprintf(stderr, "[WebRTC] Adding ICE candidate from %s (mid=%s)\n",
                                 peer->id.c_str(), mid.c_str());
-                        try {
-                            peer->pc->addRemoteCandidate(rtc::Candidate(candidate, mid));
-                        } catch (const std::exception& e) {
-                            fprintf(stderr, "[WebRTC] Failed to add candidate: %s\n", e.what());
-                        }
-                    } else {
-                        // Queue candidate - remote description not set yet
-                        fprintf(stderr, "[WebRTC] Queuing ICE candidate from %s (mid=%s)\n",
-                                peer->id.c_str(), mid.c_str());
-                        peer->pending_candidates.emplace_back(candidate, mid);
+                    }
+                    try {
+                        peer->pc->addRemoteCandidate(rtc::Candidate(candidate, mid));
+                    } catch (const std::exception& e) {
+                        fprintf(stderr, "[WebRTC] Failed to add candidate: %s\n", e.what());
                     }
                 }
             }
