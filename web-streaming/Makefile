@@ -29,6 +29,7 @@ FPNG_CFLAGS = -msse4.1 -mpclmul
 
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp \
+              $(SERVER_DIR)/config/server_config.cpp \
               $(SERVER_DIR)/utils/keyboard_map.cpp \
               $(SERVER_DIR)/utils/json_utils.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
@@ -39,6 +40,7 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
 
 # Object files
 SERVER_OBJS = $(BUILD_DIR)/server.o \
+              $(BUILD_DIR)/server_config.o \
               $(BUILD_DIR)/keyboard_map.o \
               $(BUILD_DIR)/json_utils.o \
               $(BUILD_DIR)/h264_encoder.o \
@@ -75,6 +77,12 @@ $(LIBDATACHANNEL_LIB):
 	@echo "ERROR: libdatachannel not found."
 	@echo "This should have been caught by configure. Please re-run ./configure"
 	@exit 1
+
+# Compile configuration
+$(BUILD_DIR)/server_config.o: $(SERVER_DIR)/config/server_config.cpp \
+                               $(SERVER_DIR)/config/server_config.h \
+                               $(SERVER_DIR)/codec.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile utilities
 $(BUILD_DIR)/keyboard_map.o: $(SERVER_DIR)/utils/keyboard_map.cpp \

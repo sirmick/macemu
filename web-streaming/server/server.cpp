@@ -19,6 +19,7 @@
 // Utility modules
 #include "utils/keyboard_map.h"
 #include "utils/json_utils.h"
+#include "config/server_config.h"
 
 #include <rtc/rtc.hpp>
 #include <rtc/rtppacketizer.hpp>
@@ -61,25 +62,29 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
-// Configuration
-static int g_http_port = 8000;
-static int g_signaling_port = 8090;
-static std::string g_roms_path = "storage/roms";
-static std::string g_images_path = "storage/images";
-static std::string g_prefs_path = "basilisk_ii.prefs";
-static std::string g_emulator_path;    // Path to BasiliskII/SheepShaver executable
-static bool g_auto_start_emulator = true;
-static pid_t g_target_emulator_pid = 0;  // If specified, connect to this PID
-static CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG)
-static bool g_enable_stun = false;  // STUN disabled by default (for localhost/LAN)
-static std::string g_stun_server = "stun:stun.l.google.com:19302";  // Default STUN server
+// Configuration (centralized in ServerConfig)
+static server_config::ServerConfig g_config;
 
-// Debug/verbosity flags (extern in encoders for cross-module access)
-static bool g_debug_connection = false;  // WebRTC, ICE, signaling logs
-bool g_debug_mode_switch = false;        // Mode/resolution/color depth changes (non-static for encoders)
-static bool g_debug_perf = false;        // Performance stats, ping logs
-static bool g_debug_frames = false;      // Save frame dumps to disk (.ppm files)
-static bool g_debug_audio = false;       // Audio processing logs (server + emulator)
+// Legacy accessors for gradual migration
+// TODO: Phase 7 - Pass ServerConfig reference instead of using globals
+#define g_http_port         (g_config.http_port)
+#define g_signaling_port    (g_config.signaling_port)
+#define g_roms_path         (g_config.roms_path)
+#define g_images_path       (g_config.images_path)
+#define g_prefs_path        (g_config.prefs_path)
+#define g_emulator_path     (g_config.emulator_path)
+#define g_auto_start_emulator (g_config.auto_start_emulator)
+#define g_target_emulator_pid (g_config.target_emulator_pid)
+#define g_server_codec      (g_config.server_codec)
+#define g_enable_stun       (g_config.enable_stun)
+#define g_stun_server       (g_config.stun_server)
+#define g_debug_connection  (g_config.debug_connection)
+#define g_debug_perf        (g_config.debug_perf)
+#define g_debug_frames      (g_config.debug_frames)
+#define g_debug_audio       (g_config.debug_audio)
+
+// g_debug_mode_switch needs to be non-static for encoders
+bool g_debug_mode_switch = false;
 
 // Global state
 static std::atomic<bool> g_running(true);
@@ -2721,37 +2726,7 @@ static void audio_loop(WebRTCServer& webrtc) {
  * Print usage
  */
 
-static void print_usage(const char* program) {
-    fprintf(stderr, "Usage: %s [options]\n", program);
-    fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -h, --help              Show this help\n");
-    fprintf(stderr, "  -p, --http-port PORT    HTTP server port (default: 8000)\n");
-    fprintf(stderr, "  -s, --signaling PORT    WebSocket signaling port (default: 8090)\n");
-    fprintf(stderr, "  -e, --emulator PATH     Path to BasiliskII/SheepShaver executable\n");
-    fprintf(stderr, "  -P, --prefs FILE        Emulator prefs file (default: basilisk_ii.prefs)\n");
-    fprintf(stderr, "  -n, --no-auto-start     Don't auto-start emulator (wait for external)\n");
-    fprintf(stderr, "  --pid PID               Connect to specific emulator PID\n");
-    fprintf(stderr, "  --roms PATH             ROMs directory (default: storage/roms)\n");
-    fprintf(stderr, "  --images PATH           Disk images directory (default: storage/images)\n");
-    fprintf(stderr, "\nNetwork Options:\n");
-    fprintf(stderr, "  --stun                  Enable STUN for NAT traversal (default: off)\n");
-    fprintf(stderr, "  --stun-server URL       STUN server URL (default: stun:stun.l.google.com:19302)\n");
-    fprintf(stderr, "\nDebug Options:\n");
-    fprintf(stderr, "  --debug-connection      Show WebRTC/ICE/signaling logs\n");
-    fprintf(stderr, "  --debug-mode-switch     Show mode/resolution/color depth changes\n");
-    fprintf(stderr, "  --debug-perf            Show performance stats and ping logs\n");
-    fprintf(stderr, "  --debug-frames          Save frame dumps to disk (.ppm files)\n");
-    fprintf(stderr, "  --debug-audio           Show audio processing logs (server + emulator)\n");
-    fprintf(stderr, "\nArchitecture:\n");
-    fprintf(stderr, "  - Emulator creates SHM at /macemu-video-{PID}\n");
-    fprintf(stderr, "  - Emulator creates socket at /tmp/macemu-{PID}.sock\n");
-    fprintf(stderr, "  - Server connects to emulator resources by PID\n");
-    fprintf(stderr, "  - Use --pid to connect to a specific running emulator\n");
-    fprintf(stderr, "\nEmulator Discovery:\n");
-    fprintf(stderr, "  Server looks for ./bin/BasiliskII or ./bin/SheepShaver.\n");
-    fprintf(stderr, "  Create a symlink if needed:\n");
-    fprintf(stderr, "    mkdir -p bin && ln -s ../../BasiliskII/src/Unix/BasiliskII ./bin/BasiliskII\n");
-}
+// print_usage() moved to config/server_config.cpp
 
 
 /*
@@ -2759,88 +2734,12 @@ static void print_usage(const char* program) {
  */
 
 int main(int argc, char* argv[]) {
-    // Parse command line
-    static struct option long_options[] = {
-        {"help",             no_argument,       0, 'h'},
-        {"http-port",        required_argument, 0, 'p'},
-        {"signaling",        required_argument, 0, 's'},
-        {"roms",             required_argument, 0, 'r'},
-        {"images",           required_argument, 0, 'i'},
-        {"emulator",         required_argument, 0, 'e'},
-        {"prefs",            required_argument, 0, 'P'},
-        {"no-auto-start",    no_argument,       0, 'n'},
-        {"pid",              required_argument, 0, 1000},
-        {"debug-connection", no_argument,       0, 1001},
-        {"debug-mode-switch", no_argument,      0, 1002},
-        {"debug-perf",       no_argument,       0, 1003},
-        {"debug-frames",     no_argument,       0, 1004},
-        {"debug-audio",      no_argument,       0, 1007},
-        {"stun",             no_argument,       0, 1005},
-        {"stun-server",      required_argument, 0, 1006},
-        {0, 0, 0, 0}
-    };
+    // Parse configuration from command line and environment
+    g_config.parse_command_line(argc, argv);
+    g_config.load_from_env();
 
-    int opt;
-    while ((opt = getopt_long(argc, argv, "hp:s:e:nP:", long_options, nullptr)) != -1) {
-        switch (opt) {
-            case 'h':
-                print_usage(argv[0]);
-                return 0;
-            case 'p':
-                g_http_port = atoi(optarg);
-                break;
-            case 's':
-                g_signaling_port = atoi(optarg);
-                break;
-            case 'r':
-                g_roms_path = optarg;
-                break;
-            case 'i':
-                g_images_path = optarg;
-                break;
-            case 'e':
-                g_emulator_path = optarg;
-                break;
-            case 'P':
-                g_prefs_path = optarg;
-                break;
-            case 'n':
-                g_auto_start_emulator = false;
-                break;
-            case 1000:
-                g_target_emulator_pid = atoi(optarg);
-                break;
-            case 1001:
-                g_debug_connection = true;
-                break;
-            case 1002:
-                g_debug_mode_switch = true;
-                break;
-            case 1003:
-                g_debug_perf = true;
-                break;
-            case 1004:
-                g_debug_frames = true;
-                break;
-            case 1007:
-                g_debug_audio = true;
-                break;
-            case 1005:
-                g_enable_stun = true;
-                break;
-            case 1006:
-                g_enable_stun = true;
-                g_stun_server = optarg;
-                break;
-            default:
-                print_usage(argv[0]);
-                return 1;
-        }
-    }
-
-    // Check environment variables
-    if (const char* env = getenv("BASILISK_ROMS")) g_roms_path = env;
-    if (const char* env = getenv("BASILISK_IMAGES")) g_images_path = env;
+    // Sync g_debug_mode_switch (needed by encoders)
+    g_debug_mode_switch = g_config.debug_mode_switch;
 
     // Set MACEMU_DEBUG_AUDIO environment variable if --debug-audio enabled
     // This will be inherited by the emulator process
@@ -2859,20 +2758,8 @@ int main(int argc, char* argv[]) {
     // Read codec preference from prefs file
     read_webcodec_pref();
 
-    fprintf(stderr, "=== macemu WebRTC Server (v3 - emulator-owned resources) ===\n");
-    fprintf(stderr, "HTTP port:      %d\n", g_http_port);
-    fprintf(stderr, "Signaling port: %d\n", g_signaling_port);
-    fprintf(stderr, "Prefs file:     %s\n", g_prefs_path.c_str());
-    const char* codec_str = (g_server_codec == CodecType::H264) ? "H.264" :
-                            (g_server_codec == CodecType::AV1) ? "AV1" :
-                            (g_server_codec == CodecType::PNG) ? "PNG" : "RAW";
-    fprintf(stderr, "Video codec:    %s\n", codec_str);
-    fprintf(stderr, "ROMs path:      %s\n", g_roms_path.c_str());
-    fprintf(stderr, "Images path:    %s\n", g_images_path.c_str());
-    if (g_target_emulator_pid > 0) {
-        fprintf(stderr, "Target PID:     %d\n", g_target_emulator_pid);
-    }
-    fprintf(stderr, "\n");
+    // Print configuration summary
+    g_config.print_summary();
 
     // Start HTTP server
     HTTPServer http_server;
