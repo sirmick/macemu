@@ -1,6 +1,6 @@
 # Server.cpp Refactoring Progress
 
-## Current Status: Phase 4 Complete (57% Done)
+## Current Status: Phase 5 Complete (71% Done)
 
 **Branch**: `refactor/server-modularization`
 **Last Updated**: 2024-12-24
@@ -10,13 +10,13 @@
 
 ## Executive Summary
 
-Successfully extracted **1,079+ lines** of code from monolithic `server.cpp` into focused, testable modules.
+Successfully extracted **1,736+ lines** of code from monolithic `server.cpp` into focused, testable modules.
 
 | Metric | Before | After | Change |
 |--------|--------|-------|--------|
-| **server.cpp size** | 3,023 lines | 2,306 lines | **-717 lines (-24%)** |
-| **Module files** | 0 | 17 files | +1,079 lines |
-| **Average module size** | - | ~180 lines | ✅ LLM-friendly |
+| **server.cpp size** | 3,023 lines | 2,013 lines | **-1,010 lines (-33%)** |
+| **Module files** | 0 | 23 files | +1,736 lines |
+| **Average module size** | - | ~170 lines | ✅ LLM-friendly |
 | **Build status** | ✅ | ✅ | Zero regressions |
 
 ---
@@ -152,21 +152,46 @@ Successfully extracted **1,079+ lines** of code from monolithic `server.cpp` int
 
 ---
 
-## Pending Phases
+### ✅ Phase 5: Extract HTTP Server Modules (COMPLETE)
 
-### 📋 Phase 5: Split HTTP Server (NOT STARTED)
+**Commit**: `9ff2ee13` - "Phase 5: Extract HTTP server modules (http_server, api_handlers, static_files)"
 
-**Planned Modules**:
-- `server/http/http_server.{h,cpp}` - HTTP infrastructure (~250 lines)
-- `server/http/api_handlers.{h,cpp}` - API endpoint implementations (~300 lines)
-- `server/http/static_files.{h,cpp}` - Static file serving (~150 lines)
+**Created Modules**:
+- `server/http/http_server.{h,cpp}` - 289 lines
+  - HTTP/1.1 server infrastructure
+  - Request parsing and response building
+  - Non-blocking socket with polling
+  - Clean Request/Response abstractions
 
-**Estimated Impact**:
-- Lines to remove: ~400
-- Lines to add: ~700 (in modules)
-- Target server.cpp: ~1,790 lines
+- `server/http/api_handlers.{h,cpp}` - 339 lines
+  - All /api/ endpoint handlers
+  - API context for dependency injection bridge
+  - Status, config, storage, prefs, emulator control endpoints
+  - Client logging and error reporting endpoints
+
+- `server/http/static_files.{h,cpp}` - 98 lines
+  - Static file serving (HTML, JS, CSS)
+  - Content type detection
+  - Clean file path mapping
+
+**Impact**:
+- **Lines removed**: 293
+- **Lines added**: 726 (in modules)
+- **server.cpp**: 2,306 → 2,013 lines
+- **Total extracted so far**: 1,010 lines (33% of original 3,023 lines)
+
+**Key Changes**:
+- HTTPServer wrapper class uses new http:: modules internally
+- API context struct bridges global state (temporary)
+- Lambda callbacks for emulator commands
+- Fixed json_get_string to use json_utils::parse + get_string
+- Separated routing (API) from serving (static files)
 
 ---
+
+## Pending Phases
+
+###
 
 ### 📋 Phase 6: Split WebRTC Server (NOT STARTED)
 
@@ -226,10 +251,16 @@ web-streaming/server/
 │   ├── file_scanner.cpp              ✅ Phase 4 (146 lines)
 │   ├── prefs_manager.h               ✅ Phase 4 (44 lines)
 │   └── prefs_manager.cpp             ✅ Phase 4 (119 lines)
-├── http/                             (pending Phase 5)
-├── webrtc/                           (pending Phase 6)
+├── http/
+│   ├── http_server.h                 ✅ Phase 5 (96 lines)
+│   ├── http_server.cpp               ✅ Phase 5 (193 lines)
+│   ├── api_handlers.h                ✅ Phase 5 (111 lines)
+│   ├── api_handlers.cpp              ✅ Phase 5 (228 lines)
+│   ├── static_files.h                ✅ Phase 5 (38 lines)
+│   └── static_files.cpp              ✅ Phase 5 (60 lines)
+├── webrtc/                           (pending Phase 6 - ~870 lines)
 ├── processing/                       (pending Phase 7)
-├── server.cpp                        2,306 lines (from 3,023)
+├── server.cpp                        2,013 lines (from 3,023)
 ├── codec.h                           ✅ Already extracted
 ├── h264_encoder.{h,cpp}              ✅ Already extracted
 ├── av1_encoder.{h,cpp}               ✅ Already extracted
@@ -261,11 +292,18 @@ web-streaming/server/
 - Added build rules for `file_scanner.o` and `prefs_manager.o`
 - Added storage/ dependency tracking
 
+**Phase 5**:
+- Added build rules for `http_server.o`, `api_handlers.o`, and `static_files.o`
+- Added http/ dependency tracking
+- Updated api_handlers dependencies to include storage, utils, and IPC protocol
+
 ---
 
 ## Git Commit History
 
 ```
+9ff2ee13 Phase 5: Extract HTTP server modules (http_server, api_handlers, static_files)
+6c73980b Update REFACTOR_PROGRESS.md for Phase 4 completion
 f1729dee Phase 4: Extract storage modules (file_scanner, prefs_manager)
 fe951f0a Phase 3: Extract IPC layer (ipc_connection module)
 f32c0b9c Phase 2: Extract configuration module (server_config)
@@ -283,6 +321,7 @@ f9cc5ac0 Phase 1: Extract utility modules (keyboard_map, json_utils)
 - ✅ Phase 2: Compiles successfully
 - ✅ Phase 3: Compiles successfully
 - ✅ Phase 4: Compiles successfully
+- ✅ Phase 5: Compiles successfully
 
 ### Runtime Tests
 - ⏳ Pending: End-to-end functionality verification
@@ -454,9 +493,9 @@ This allows:
 ## Contact / Notes
 
 **Branch**: `refactor/server-modularization`
-**Safe to merge**: Not yet (phases 5-7 remaining)
+**Safe to merge**: Not yet (phases 6-7 remaining)
 **Risk level**: Low (all changes tested, reversible)
-**Estimated completion**: 3-4 more sessions at current pace
+**Estimated completion**: 2 more sessions at current pace
 
 ---
 
@@ -470,12 +509,13 @@ git checkout refactor/server-modularization
 cd web-streaming
 make clean && make -j4
 
-# Continue with Phase 5
-# Next: Extract HTTP server infrastructure and API handlers
+# Continue with Phase 6
+# Next: Extract WebRTC server (signaling, peers, media sending)
+# This is the largest remaining module (~870 lines)
 ```
 
 ---
 
 **Last Updated**: 2024-12-24
-**Status**: ✅ Ready to start Phase 5 (HTTP Server Split)
-**Overall Progress**: 57% complete (4 of 7 phases done)
+**Status**: ✅ Ready to start Phase 6 (WebRTC Server Split)
+**Overall Progress**: 71% complete (5 of 7 phases done)
