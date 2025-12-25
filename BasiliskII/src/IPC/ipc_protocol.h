@@ -234,6 +234,7 @@ typedef struct {
 #define MACEMU_INPUT_MOUSE     2   // Mouse move/button
 #define MACEMU_INPUT_COMMAND   3   // Emulator command (start/stop/reset)
 #define MACEMU_INPUT_PING      4   // Latency measurement ping (echoed in frame metadata)
+#define MACEMU_INPUT_AUDIO_REQUEST  5   // Server requests audio data (pull model)
 
 // Key event flags
 #define MACEMU_KEY_DOWN        0x01
@@ -294,6 +295,13 @@ typedef struct {
     uint64_t t3_emulator_recv_us;    // Emulator receive time (CLOCK_REALTIME microseconds)
 } MacEmuPingInput;
 
+// Audio request input (server pull model - 8 bytes total)
+// Server sends this when Opus encoder needs more audio data
+typedef struct {
+    MacEmuInputHeader hdr;       // type = MACEMU_INPUT_AUDIO_REQUEST
+    uint32_t requested_samples;  // Number of samples requested (usually 960 for 20ms @ 48kHz)
+} MacEmuAudioRequestInput;
+
 // Union for receiving any input type
 typedef union {
     MacEmuInputHeader hdr;
@@ -301,6 +309,7 @@ typedef union {
     MacEmuMouseInput mouse;
     MacEmuCommandInput cmd;
     MacEmuPingInput ping;
+    MacEmuAudioRequestInput audio_req;
 } MacEmuInput;
 
 /*

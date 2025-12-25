@@ -401,6 +401,13 @@ static void process_binary_input(const uint8_t* data, size_t len) {
             }
             break;
         }
+        case MACEMU_INPUT_AUDIO_REQUEST: {
+            if (len < sizeof(MacEmuAudioRequestInput)) return;
+            // Server requests audio data (pull model, like SDL callback)
+            // Wake up audio thread to generate audio
+            audio_request_data();
+            break;
+        }
     }
 }
 

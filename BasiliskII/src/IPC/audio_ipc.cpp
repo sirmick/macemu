@@ -74,9 +74,10 @@ static std::mutex audio_irq_mutex;
 static std::condition_variable audio_irq_done_cv;
 static bool audio_irq_done = false;
 
-// Wake-up mechanism for audio thread
-static std::mutex audio_wakeup_mutex;
-static std::condition_variable audio_wakeup_cv;
+// Wake-up mechanism for audio thread (triggered by server AUDIO_REQUEST)
+static std::mutex audio_request_mutex;
+static std::condition_variable audio_request_cv;
+static bool audio_requested = false;
 
 // Timing for 20ms audio frames
 static auto last_audio_frame_time = std::chrono::steady_clock::now();
@@ -214,10 +215,22 @@ void audio_enter_stream()
 	fprintf(stderr, "Audio IPC: *** STREAM STARTED *** (num_sources 0→1)\n");
 	D(bug("Audio IPC: Stream started\n"));
 	last_audio_frame_time = std::chrono::steady_clock::now();
+}
 
-	// Wake up audio thread immediately (instead of waiting for next 20ms timeout)
-	audio_wakeup_cv.notify_one();
-	fprintf(stderr, "Audio IPC: Woke up audio thread\n");
+/*
+ *  Server requested audio data (pull model)
+ *  Called from control socket thread when AUDIO_REQUEST message arrives
+ */
+
+void audio_request_data()
+{
+	std::lock_guard<std::mutex> lock(audio_request_mutex);
+	audio_requested = true;
+	audio_request_cv.notify_one();
+
+	if (g_debug_audio) {
+		fprintf(stderr, "Audio IPC: Server requested audio data\n");
+	}
 }
 
 
@@ -406,25 +419,32 @@ bool audio_set_channels(int index)
 
 
 /*
- *  Audio streaming thread
- *  Periodically triggers audio interrupt to get new data from Mac
- *  Uses condition_variable for efficient wake-up (no polling overhead)
+ *  Audio streaming thread - PULL MODEL (server-driven)
+ *  Waits for server AUDIO_REQUEST messages, then triggers interrupt
+ *  This matches SDL's callback architecture for perfect timing sync
  */
 
 static void audio_thread_func()
 {
 	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Streaming thread running\n");
+		fprintf(stderr, "Audio IPC: Streaming thread running (PULL MODEL - server-driven)\n");
 	}
-
-	// Frame timing: 20ms for audio processing
-	const auto frame_interval = std::chrono::milliseconds(20);
 
 	int loop_count = 0;
 	int zero_sources_count = 0;
 	int no_data_count = 0;
 
 	while (!audio_thread_cancel) {
+		// Wait for server to request audio data (blocks until AUDIO_REQUEST arrives)
+		{
+			std::unique_lock<std::mutex> lock(audio_request_mutex);
+			audio_request_cv.wait(lock, []{ return audio_requested || audio_thread_cancel; });
+
+			if (audio_thread_cancel) break;
+
+			audio_requested = false;  // Reset for next request
+		}
+
 		if (AudioStatus.num_sources) {
 			// Trigger audio interrupt to signal Mac we're ready for data
 			loop_count++;
@@ -540,20 +560,16 @@ static void audio_thread_func()
 				}
 			}
 		} else {
-			// No sources, reset counters
+			// No sources - still send silence or do nothing
 			zero_sources_count++;
 			if (g_debug_audio && zero_sources_count == 1) {
-				fprintf(stderr, "Audio IPC: Thread loop with num_sources=0 (audio not active yet)\n");
+				fprintf(stderr, "Audio IPC: Thread received request but num_sources=0 (audio not active)\n");
 			}
 			loop_count = 0;
 			no_data_count = 0;
 		}
 
-		// Sleep with timeout - wakes immediately on notify OR after 20ms
-		// When audio active: maintains 20ms frame timing
-		// When idle: waits for audio_enter_stream() to wake us
-		std::unique_lock<std::mutex> lock(audio_wakeup_mutex);
-		audio_wakeup_cv.wait_for(lock, frame_interval);
+		// No sleep needed - we block waiting for next AUDIO_REQUEST at top of loop
 	}
 
 	if (g_debug_audio) {
