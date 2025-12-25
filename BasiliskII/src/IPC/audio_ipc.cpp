@@ -210,14 +210,14 @@ void AudioExit(void)
 
 void audio_enter_stream()
 {
-	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Stream started (num_sources 0→1)\n");
-	}
+	// ALWAYS log this - it's critical for debugging
+	fprintf(stderr, "Audio IPC: *** STREAM STARTED *** (num_sources 0→1)\n");
 	D(bug("Audio IPC: Stream started\n"));
 	last_audio_frame_time = std::chrono::steady_clock::now();
 
 	// Wake up audio thread immediately (instead of waiting for next 20ms timeout)
 	audio_wakeup_cv.notify_one();
+	fprintf(stderr, "Audio IPC: Woke up audio thread\n");
 }
 
 
@@ -228,9 +228,8 @@ void audio_enter_stream()
 
 void audio_exit_stream()
 {
-	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Stream stopped (num_sources 1→0)\n");
-	}
+	// ALWAYS log this - it's critical for debugging
+	fprintf(stderr, "Audio IPC: *** STREAM STOPPED *** (num_sources 1→0)\n");
 	D(bug("Audio IPC: Stream stopped\n"));
 
 	// Thread continues running, will automatically stop processing

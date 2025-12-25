@@ -15,6 +15,7 @@
 #include "av1_encoder.h"
 #include "png_encoder.h"
 #include "opus_encoder.h"
+#include "tone_generator.h"
 
 // Utility modules
 #include "utils/keyboard_map.h"
@@ -648,7 +649,22 @@ public:
 
     // Send Opus audio frame via RTP audio track
     void send_audio_to_all_peers(const std::vector<uint8_t>& opus_data) {
-        if (opus_data.empty() || peer_count_ == 0) return;
+        if (opus_data.empty()) {
+            if (g_debug_audio) {
+                fprintf(stderr, "[WebRTC] Audio: Skipping empty opus_data\n");
+            }
+            return;
+        }
+
+        if (peer_count_ == 0) {
+            if (g_debug_audio) {
+                static int warn_count = 0;
+                if (warn_count++ % 50 == 0) {
+                    fprintf(stderr, "[WebRTC] Audio: No peers connected (%zu bytes Opus ready)\n", opus_data.size());
+                }
+            }
+            return;
+        }
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
@@ -658,16 +674,37 @@ public:
         auto elapsed = std::chrono::duration<double>(now - audio_start_time_);
         rtc::FrameInfo frameInfo(elapsed);
 
+        int sent_count = 0;
+        int track_closed = 0;
+        int track_missing = 0;
+
         for (auto& [id, peer] : peers_) {
-            if (peer->audio_track && peer->audio_track->isOpen()) {
-                try {
-                    peer->audio_track->sendFrame(
-                        reinterpret_cast<const std::byte*>(opus_data.data()),
-                        opus_data.size(),
-                        frameInfo);
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "[WebRTC] Audio send error to %s: %s\n", id.c_str(), e.what());
-                }
+            if (!peer->audio_track) {
+                track_missing++;
+                continue;
+            }
+
+            if (!peer->audio_track->isOpen()) {
+                track_closed++;
+                continue;
+            }
+
+            try {
+                peer->audio_track->sendFrame(
+                    reinterpret_cast<const std::byte*>(opus_data.data()),
+                    opus_data.size(),
+                    frameInfo);
+                sent_count++;
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[WebRTC] Audio send error to %s: %s\n", id.c_str(), e.what());
+            }
+        }
+
+        if (g_debug_audio) {
+            static int frame_count = 0;
+            if (frame_count++ % 50 == 0) {
+                fprintf(stderr, "[WebRTC] Audio sent: %zu bytes to %d peers (%d track_missing, %d track_closed)\n",
+                        opus_data.size(), sent_count, track_missing, track_closed);
             }
         }
     }
@@ -1821,10 +1858,64 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
 
 
 /*
- * Main audio processing loop
+ * Audio processing loop - Tone generator only (for testing)
  */
 
-static void audio_loop(WebRTCServer& webrtc) {
+static void audio_loop_tone_only(WebRTCServer& webrtc) {
+    // Create tone generator for testing (440Hz A4 note, 48kHz stereo)
+    ToneGenerator tone_gen(48000, 2);
+    tone_gen.set_frequency(440.0);
+
+    auto last_tone_time = std::chrono::steady_clock::now();
+
+    fprintf(stderr, "Audio: Starting audio processing loop (TONE ONLY MODE - Mac audio disabled)\n");
+
+    while (g_running) {
+        // Generate test tone at 20ms intervals
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tone_time);
+
+        if (elapsed.count() >= 20) {  // 20ms frame
+            last_tone_time = now;
+
+            // Generate tone frame
+            std::vector<int16_t> tone_samples = tone_gen.generate_frame();
+
+            if (g_audio_encoder && !tone_samples.empty()) {
+                // Encode tone to Opus
+                std::vector<uint8_t> opus_data = g_audio_encoder->encode_dynamic(
+                    tone_samples.data(),
+                    tone_samples.size() / tone_gen.get_channels(),
+                    tone_gen.get_sample_rate(),
+                    tone_gen.get_channels()
+                );
+
+                if (!opus_data.empty()) {
+                    if (g_debug_audio) {
+                        static int frame_count = 0;
+                        if (frame_count % 50 == 0) {  // Log every second
+                            fprintf(stderr, "Audio: Tone generator - encoded %zu bytes Opus\n", opus_data.size());
+                        }
+                        frame_count++;
+                    }
+                    webrtc.send_audio_to_all_peers(opus_data);
+                }
+            }
+        } else {
+            // Sleep for remaining time
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    fprintf(stderr, "Audio: Exiting audio processing loop\n");
+}
+
+
+/*
+ * Audio processing loop - Mac emulator audio (IPC)
+ */
+
+static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
     // Create epoll instance for low-latency event notification
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
@@ -1834,7 +1925,7 @@ static void audio_loop(WebRTCServer& webrtc) {
     int current_eventfd = -1;  // Track which eventfd is registered
 
     if (g_debug_audio) {
-        fprintf(stderr, "Audio: Starting audio processing loop\n");
+        fprintf(stderr, "Audio: Starting audio processing loop (Mac IPC mode)\n");
     }
 
     while (g_running) {
@@ -1955,6 +2046,16 @@ static void audio_loop(WebRTCServer& webrtc) {
 
 
 /*
+ * Main audio processing loop - dispatches to tone or Mac IPC mode
+ */
+
+static void audio_loop(WebRTCServer& webrtc) {
+    // Use Mac IPC audio (tone generator available via audio_loop_tone_only if needed)
+    audio_loop_mac_ipc(webrtc);
+}
+
+
+/*
  * Print usage
  */
 
@@ -2018,6 +2119,11 @@ int main(int argc, char* argv[]) {
     AV1Encoder av1_encoder;
     PNGEncoder png_encoder;
     g_audio_encoder = std::make_unique<OpusAudioEncoder>();
+
+    // Initialize audio encoder (48kHz stereo is default for WebRTC)
+    if (!g_audio_encoder->init(48000, 2, 128000)) {
+        fprintf(stderr, "WARNING: Failed to initialize Opus audio encoder\n");
+    }
 
     // Auto-start emulator if enabled
     if (g_auto_start_emulator && g_target_emulator_pid == 0) {
