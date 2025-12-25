@@ -23,6 +23,9 @@
 #include "ipc/ipc_connection.h"
 #include "storage/file_scanner.h"
 #include "storage/prefs_manager.h"
+#include "http/http_server.h"
+#include "http/api_handlers.h"
+#include "http/static_files.h"
 
 #include <rtc/rtc.hpp>
 #include <rtc/rtppacketizer.hpp>
@@ -391,382 +394,86 @@ static void read_webcodec_pref() {
 
 
 /*
- * HTTP Server
+ * HTTP Server (wrapper for http:: modules)
+ *
+ * TODO: Phase 7 - Remove wrapper and use http:: modules directly
  */
 
 class HTTPServer {
 public:
+    HTTPServer() {
+        // Initialize API context (will be populated before start())
+        api_ctx_.debug_connection = false;
+        api_ctx_.debug_mode_switch = false;
+        api_ctx_.debug_perf = false;
+        api_ctx_.emulator_connected = false;
+        api_ctx_.emulator_pid = -1;
+        api_ctx_.started_emulator_pid = -1;
+        api_ctx_.video_shm = nullptr;
+    }
+
     bool start(int port) {
-        port_ = port;
+        // Populate API context with current state
+        update_api_context();
 
-        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd_ < 0) {
-            fprintf(stderr, "HTTP: Failed to create socket\n");
-            return false;
-        }
+        // Create API router and static file handler
+        api_router_ = std::make_unique<http::APIRouter>(&api_ctx_);
+        static_handler_ = std::make_unique<http::StaticFileHandler>("client");
 
-        int opt = 1;
-        if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-            fprintf(stderr, "HTTP: Warning: Failed to set SO_REUSEADDR: %s\n", strerror(errno));
-        }
+        // Start HTTP server with combined request handler
+        auto handler = [this](const http::Request& req) -> http::Response {
+            // Update context before each request (for dynamic state)
+            update_api_context();
 
-        int flags = fcntl(server_fd_, F_GETFL, 0);
-        if (flags < 0) {
-            fprintf(stderr, "HTTP: Failed to get socket flags: %s\n", strerror(errno));
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
-        if (fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-            fprintf(stderr, "HTTP: Failed to set non-blocking mode: %s\n", strerror(errno));
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
+            // Try API routes first
+            bool handled = false;
+            http::Response resp = api_router_->handle(req, &handled);
+            if (handled) {
+                return resp;
+            }
 
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
+            // Try static files
+            if (static_handler_->handles(req.path)) {
+                return static_handler_->serve(req.path);
+            }
 
-        if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            fprintf(stderr, "HTTP: Failed to bind port %d\n", port);
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
+            // Not found
+            return http::Response::not_found();
+        };
 
-        if (listen(server_fd_, 10) < 0) {
-            fprintf(stderr, "HTTP: Failed to listen\n");
-            close(server_fd_);
-            server_fd_ = -1;
-            return false;
-        }
-
-        running_ = true;
-        thread_ = std::thread(&HTTPServer::run, this);
-
-        fprintf(stderr, "HTTP: Server on port %d\n", port);
-        return true;
+        return server_.start(port, handler);
     }
 
     void stop() {
-        running_ = false;
-        if (server_fd_ >= 0) {
-            close(server_fd_);
-            server_fd_ = -1;
-        }
-        if (thread_.joinable()) {
-            thread_.join();
-        }
+        server_.stop();
     }
 
 private:
-    void run() {
-        while (running_ && g_running) {
-            struct pollfd pfd;
-            pfd.fd = server_fd_;
-            pfd.events = POLLIN;
+    // Populate API context with current state (called before handling requests)
+    void update_api_context() {
+        api_ctx_.debug_connection = g_debug_connection;
+        api_ctx_.debug_mode_switch = g_debug_mode_switch;
+        api_ctx_.debug_perf = g_debug_perf;
+        api_ctx_.prefs_path = g_prefs_path;
+        api_ctx_.roms_path = g_roms_path;
+        api_ctx_.images_path = g_images_path;
+        api_ctx_.emulator_connected = g_emulator_connected;
+        api_ctx_.emulator_pid = g_emulator_pid;
+        api_ctx_.started_emulator_pid = g_started_emulator_pid;
+        api_ctx_.video_shm = g_video_shm;
 
-            int ret = poll(&pfd, 1, 100);
-            if (ret <= 0) continue;
-
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
-            if (client_fd < 0) continue;
-
-            handle_client(client_fd);
-            close(client_fd);
-        }
+        // Set command callbacks
+        api_ctx_.send_command_fn = [](uint8_t cmd) { send_command(cmd); };
+        api_ctx_.start_emulator_fn = []() { return start_emulator(); };
+        api_ctx_.stop_emulator_fn = []() { stop_emulator(); };
+        api_ctx_.disconnect_emulator_fn = []() { disconnect_from_emulator(); };
+        api_ctx_.request_restart_fn = [](bool val) { g_restart_emulator_requested = val; };
     }
 
-    void handle_client(int fd) {
-        char buffer[8192];
-        ssize_t n = recv(fd, buffer, sizeof(buffer) - 1, 0);
-        if (n <= 0) return;
-        buffer[n] = '\0';
-
-        std::string request(buffer);
-        std::string method;
-        std::string path = "/";
-
-        size_t method_end = request.find(' ');
-        if (method_end != std::string::npos) {
-            method = request.substr(0, method_end);
-            size_t path_end = request.find(' ', method_end + 1);
-            if (path_end != std::string::npos) {
-                path = request.substr(method_end + 1, path_end - method_end - 1);
-            }
-        }
-
-        // Strip query string from path
-        size_t query_pos = path.find('?');
-        if (query_pos != std::string::npos) {
-            path = path.substr(0, query_pos);
-        }
-
-        // Extract request body for POST requests
-        std::string body;
-        size_t body_start = request.find("\r\n\r\n");
-        if (body_start != std::string::npos) {
-            body = request.substr(body_start + 4);
-        }
-
-        // API endpoints
-        if (path == "/api/config" && method == "GET") {
-            // Return debug configuration flags
-            std::ostringstream json;
-            json << "{";
-            json << "\"debug_connection\": " << (g_debug_connection ? "true" : "false");
-            json << ", \"debug_mode_switch\": " << (g_debug_mode_switch ? "true" : "false");
-            json << ", \"debug_perf\": " << (g_debug_perf ? "true" : "false");
-            json << "}";
-            send_json_response(fd, json.str());
-            return;
-        }
-
-        if (path == "/api/storage" && method == "GET") {
-            std::string json_body = get_storage_json();
-            send_json_response(fd, json_body);
-            return;
-        }
-
-        if (path == "/api/prefs" && method == "GET") {
-            // Return raw prefs file content
-            std::string prefs_content = read_prefs_file();
-            std::string json_body = "{\"content\": \"" + json_escape(prefs_content) + "\", ";
-            json_body += "\"path\": \"" + json_escape(g_prefs_path) + "\", ";
-            json_body += "\"romsPath\": \"" + json_escape(g_roms_path) + "\", ";
-            json_body += "\"imagesPath\": \"" + json_escape(g_images_path) + "\"}";
-            send_json_response(fd, json_body);
-            return;
-        }
-
-        if (path == "/api/prefs" && method == "POST") {
-            // Write raw prefs file content from JSON body
-            fprintf(stderr, "Config: Received prefs POST (body length=%zu)\n", body.size());
-            std::string content = json_get_string(body, "content");
-            fprintf(stderr, "Config: Extracted content length=%zu\n", content.size());
-            if (content.empty()) {
-                fprintf(stderr, "Config: WARNING - extracted content is empty! Body: %s\n",
-                        body.substr(0, 200).c_str());
-            }
-            if (write_prefs_file(content)) {
-                send_json_response(fd, "{\"success\": true}");
-            } else {
-                send_json_response(fd, "{\"success\": false, \"error\": \"Failed to write prefs file\"}");
-            }
-            return;
-        }
-
-        if (path == "/api/restart" && method == "POST") {
-            fprintf(stderr, "Server: Restart requested via API\n");
-            send_command(MACEMU_CMD_RESET);
-            std::string json_body = "{\"success\": true, \"message\": \"Restart sent to emulator\"}";
-            send_json_response(fd, json_body);
-            return;
-        }
-
-        if (path == "/api/status" && method == "GET") {
-            std::ostringstream json;
-            json << "{";
-            json << "\"emulator_connected\": " << (g_emulator_connected ? "true" : "false");
-            json << ", \"emulator_running\": " << (g_started_emulator_pid > 0 ? "true" : "false");
-            json << ", \"emulator_pid\": " << g_emulator_pid;
-            if (g_video_shm) {
-                json << ", \"video\": {\"width\": " << g_video_shm->width;
-                json << ", \"height\": " << g_video_shm->height;
-                json << ", \"frame_count\": " << g_video_shm->frame_count;  // Plain read, stats only
-                json << ", \"state\": " << g_video_shm->state << "}";
-
-                // Mouse latency from emulator (atomic - can be updated by stats thread)
-                uint32_t latency_x10 = ATOMIC_LOAD(g_video_shm->mouse_latency_avg_ms);
-                uint32_t latency_samples = ATOMIC_LOAD(g_video_shm->mouse_latency_samples);
-                json << ", \"mouse_latency_ms\": " << std::fixed << std::setprecision(1) << (latency_x10 / 10.0);
-                json << ", \"mouse_latency_samples\": " << latency_samples;
-            }
-            json << "}";
-            send_json_response(fd, json.str());
-            return;
-        }
-
-        if (path == "/api/emulator/start" && method == "POST") {
-            std::string json_body;
-            if (g_started_emulator_pid > 0) {
-                json_body = "{\"success\": false, \"message\": \"Emulator already running\", \"pid\": " + std::to_string(g_started_emulator_pid) + "}";
-            } else if (start_emulator()) {
-                json_body = "{\"success\": true, \"message\": \"Emulator started\", \"pid\": " + std::to_string(g_started_emulator_pid) + "}";
-            } else {
-                json_body = "{\"success\": false, \"message\": \"Failed to start emulator\"}";
-            }
-            send_json_response(fd, json_body);
-            return;
-        }
-
-        if (path == "/api/emulator/stop" && method == "POST") {
-            std::string json_body;
-            if (g_started_emulator_pid <= 0 && g_emulator_pid <= 0) {
-                json_body = "{\"success\": false, \"message\": \"Emulator not running\"}";
-            } else {
-                if (g_started_emulator_pid > 0) {
-                    stop_emulator();
-                } else {
-                    // Just disconnect from external emulator
-                    send_command(MACEMU_CMD_STOP);
-                    disconnect_from_emulator();
-                }
-                json_body = "{\"success\": true, \"message\": \"Emulator stopped\"}";
-            }
-            send_json_response(fd, json_body);
-            return;
-        }
-
-        if (path == "/api/emulator/restart" && method == "POST") {
-            g_restart_emulator_requested = true;
-            std::string json_body = "{\"success\": true, \"message\": \"Restart requested\"}";
-            send_json_response(fd, json_body);
-            return;
-        }
-
-        if (path == "/api/log" && method == "POST") {
-            // Client logging endpoint - parse and display browser logs
-            std::string level = json_get_string(body, "level");
-            std::string msg = json_get_string(body, "message");
-            std::string data = json_get_string(body, "data");
-
-            // Format: [Browser] level: message
-            const char* prefix = "[Browser]";
-            if (level == "error") {
-                fprintf(stderr, "\033[31m%s ERROR: %s%s%s\033[0m\n", prefix, msg.c_str(),
-                        data.empty() ? "" : " | ", data.c_str());
-            } else if (level == "warn") {
-                fprintf(stderr, "\033[33m%s WARN: %s%s%s\033[0m\n", prefix, msg.c_str(),
-                        data.empty() ? "" : " | ", data.c_str());
-            } else {
-                fprintf(stderr, "%s %s: %s%s%s\n", prefix, level.c_str(), msg.c_str(),
-                        data.empty() ? "" : " | ", data.c_str());
-            }
-
-            send_json_response(fd, "{\"ok\": true}");
-            return;
-        }
-
-        if (path == "/api/error" && method == "POST") {
-            // Client error reporting endpoint - capture JavaScript errors, exceptions, and crashes
-            std::string message = json_get_string(body, "message");
-            std::string stack = json_get_string(body, "stack");
-            std::string url = json_get_string(body, "url");
-            std::string line = json_get_string(body, "line");
-            std::string col = json_get_string(body, "col");
-            std::string type = json_get_string(body, "type");
-
-            // Format: [Browser ERROR] with red color for visibility
-            fprintf(stderr, "\033[1;31m[Browser ERROR]\033[0m ");
-
-            if (!type.empty()) {
-                fprintf(stderr, "%s: ", type.c_str());
-            }
-
-            fprintf(stderr, "%s", message.c_str());
-
-            if (!url.empty()) {
-                fprintf(stderr, "\n  at %s", url.c_str());
-                if (!line.empty()) {
-                    fprintf(stderr, ":%s", line.c_str());
-                    if (!col.empty()) {
-                        fprintf(stderr, ":%s", col.c_str());
-                    }
-                }
-            }
-
-            if (!stack.empty()) {
-                // Print stack trace with indentation
-                fprintf(stderr, "\n  Stack trace:\n");
-                // Split by newlines and indent each line
-                size_t pos = 0;
-                std::string stack_copy = stack;
-                while ((pos = stack_copy.find('\n')) != std::string::npos) {
-                    std::string line = stack_copy.substr(0, pos);
-                    if (!line.empty()) {
-                        fprintf(stderr, "    %s\n", line.c_str());
-                    }
-                    stack_copy.erase(0, pos + 1);
-                }
-                if (!stack_copy.empty()) {
-                    fprintf(stderr, "    %s\n", stack_copy.c_str());
-                }
-            } else {
-                fprintf(stderr, "\n");
-            }
-
-            send_json_response(fd, "{\"ok\": true}");
-            return;
-        }
-
-        // Static files
-        std::string content_type = "text/html";
-        std::string disk_path;
-
-        // Map paths to files and content types
-        if (path == "/" || path == "/index.html") {
-            disk_path = client_dir_ + "/index.html";
-            content_type = "text/html";
-        } else if (path == "/client.js") {
-            disk_path = client_dir_ + "/client.js";
-            content_type = "application/javascript";
-        } else if (path == "/styles.css") {
-            disk_path = client_dir_ + "/styles.css";
-            content_type = "text/css";
-        }
-
-        // Read file from disk
-        std::string file_content;
-        if (!disk_path.empty()) {
-            std::ifstream file(disk_path);
-            if (file.is_open()) {
-                std::stringstream buffer;
-                buffer << file.rdbuf();
-                file_content = buffer.str();
-            }
-        }
-
-        if (!file_content.empty()) {
-            size_t content_len = file_content.size();
-
-            std::string response = "HTTP/1.1 200 OK\r\n";
-            response += "Content-Type: " + content_type + "\r\n";
-            response += "Content-Length: " + std::to_string(content_len) + "\r\n";
-            response += "Connection: close\r\n";
-            response += "\r\n";
-            send(fd, response.c_str(), response.size(), 0);
-            send(fd, file_content.c_str(), content_len, 0);
-        } else {
-            std::string response = "HTTP/1.1 404 Not Found\r\n";
-            response += "Content-Type: text/plain\r\n";
-            response += "Content-Length: 9\r\n";
-            response += "Connection: close\r\n";
-            response += "\r\n";
-            response += "Not Found";
-            send(fd, response.c_str(), response.size(), 0);
-        }
-    }
-
-    void send_json_response(int fd, const std::string& json_body) {
-        std::string response = "HTTP/1.1 200 OK\r\n";
-        response += "Content-Type: application/json\r\n";
-        response += "Content-Length: " + std::to_string(json_body.size()) + "\r\n";
-        response += "Connection: close\r\n";
-        response += "\r\n";
-        response += json_body;
-        send(fd, response.c_str(), response.size(), 0);
-    }
-
-    int port_ = 8000;
-    int server_fd_ = -1;
-    std::atomic<bool> running_{false};
-    std::thread thread_;
-    std::string client_dir_ = "client";  // Directory for client files
+    http::Server server_;
+    http::APIContext api_ctx_;
+    std::unique_ptr<http::APIRouter> api_router_;
+    std::unique_ptr<http::StaticFileHandler> static_handler_;
 };
 
 
