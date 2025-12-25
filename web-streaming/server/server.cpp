@@ -20,6 +20,7 @@
 #include "utils/keyboard_map.h"
 #include "utils/json_utils.h"
 #include "config/server_config.h"
+#include "ipc/ipc_connection.h"
 
 #include <rtc/rtc.hpp>
 #include <rtc/rtppacketizer.hpp>
@@ -92,14 +93,17 @@ static std::atomic<bool> g_emulator_connected(false);
 static std::atomic<bool> g_restart_emulator_requested(false);
 static pid_t g_emulator_pid = -1;
 
-// IPC handles - server connects to emulator's resources
-static MacEmuIPCBuffer* g_video_shm = nullptr;
-static int g_video_shm_fd = -1;
-static int g_control_socket = -1;
-static int g_frame_ready_eventfd = -1;  // Server's copy of eventfd for video frame notifications
-static int g_audio_ready_eventfd = -1;  // Server's copy of eventfd for audio frame notifications
-static std::string g_connected_shm_name;
-static std::string g_connected_socket_path;
+// IPC connection (replaces individual global handles)
+static ipc::IPCConnection g_ipc;
+
+// Legacy accessors for gradual migration
+// TODO: Phase 7 - Pass IPCConnection reference instead of using globals
+#define g_video_shm         (g_ipc.get_shm())
+#define g_control_socket    (g_ipc.get_control_socket())
+#define g_frame_ready_eventfd (g_ipc.get_frame_eventfd())
+#define g_audio_ready_eventfd (g_ipc.get_audio_eventfd())
+#define g_connected_shm_name  (g_ipc.get_shm_name())
+#define g_connected_socket_path (g_ipc.get_socket_path())
 
 // Input event counters (for stats)
 static std::atomic<uint64_t> g_mouse_move_count(0);
@@ -151,260 +155,32 @@ static std::string json_get_string(const std::string& json_str, const std::strin
 }
 
 
-/*
- * IPC: Connect to emulator's shared memory by PID
- */
+// IPC functions moved to ipc/ipc_connection.cpp
 
-static bool connect_to_video_shm(pid_t pid) {
-    std::string shm_name = std::string(MACEMU_VIDEO_SHM_PREFIX) + std::to_string(pid);
-
-    g_video_shm_fd = shm_open(shm_name.c_str(), O_RDONLY, 0);
-    if (g_video_shm_fd < 0) {
-        // Not an error during scanning - emulator may not exist yet
-        return false;
-    }
-
-    // Map shared memory (read-only for server)
-    g_video_shm = (MacEmuIPCBuffer*)mmap(nullptr, sizeof(MacEmuIPCBuffer),
-                                          PROT_READ, MAP_SHARED,
-                                          g_video_shm_fd, 0);
-    if (g_video_shm == MAP_FAILED) {
-        fprintf(stderr, "IPC: Failed to map video SHM for PID %d: %s\n", pid, strerror(errno));
-        close(g_video_shm_fd);
-        g_video_shm_fd = -1;
-        g_video_shm = nullptr;
-        return false;
-    }
-
-    // Validate
-    int result = macemu_validate_ipc_buffer(g_video_shm, pid);
-    if (result != 0) {
-        fprintf(stderr, "IPC: SHM validation failed for PID %d (error %d)\n", pid, result);
-        munmap(g_video_shm, sizeof(MacEmuIPCBuffer));
-        close(g_video_shm_fd);
-        g_video_shm_fd = -1;
-        g_video_shm = nullptr;
-        return false;
-    }
-
-    g_connected_shm_name = shm_name;
-    g_emulator_pid = pid;
-    fprintf(stderr, "IPC: Connected to video SHM '%s' (%dx%d)\n",
-            shm_name.c_str(), g_video_shm->width, g_video_shm->height);
-    return true;
-}
-
-static void disconnect_video_shm() {
-    if (g_video_shm && g_video_shm != MAP_FAILED) {
-        munmap(g_video_shm, sizeof(MacEmuIPCBuffer));
-        g_video_shm = nullptr;
-    }
-    if (g_video_shm_fd >= 0) {
-        close(g_video_shm_fd);
-        g_video_shm_fd = -1;
-    }
-    g_connected_shm_name.clear();
-}
-
-
-/*
- * IPC: Connect to emulator's control socket by PID
- */
-
-static bool connect_to_control_socket(pid_t pid) {
-    std::string socket_path = std::string(MACEMU_CONTROL_SOCK_PREFIX) + std::to_string(pid) +
-                              std::string(MACEMU_CONTROL_SOCK_SUFFIX);
-
-    g_control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (g_control_socket < 0) {
-        fprintf(stderr, "IPC: Failed to create socket: %s\n", strerror(errno));
-        return false;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (connect(g_control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(g_control_socket);
-        g_control_socket = -1;
-        return false;
-    }
-
-    // Set non-blocking
-    int flags = fcntl(g_control_socket, F_GETFL, 0);
-    if (flags < 0) {
-        fprintf(stderr, "IPC: Failed to get socket flags: %s\n", strerror(errno));
-        close(g_control_socket);
-        g_control_socket = -1;
-        return false;
-    }
-    if (fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-        fprintf(stderr, "IPC: Failed to set non-blocking mode: %s\n", strerror(errno));
-        close(g_control_socket);
-        g_control_socket = -1;
-        return false;
-    }
-
-    g_connected_socket_path = socket_path;
-    g_emulator_connected = true;
-    fprintf(stderr, "IPC: Connected to control socket '%s'\n", socket_path.c_str());
-
-    // Receive eventfds from emulator via SCM_RIGHTS for low-latency notifications
-    // The emulator sends video and audio eventfds immediately after accepting the connection
-    struct msghdr msg = {};
-    struct cmsghdr *cmsg;
-    char buf[CMSG_SPACE(sizeof(int) * 2)];  // Space for 2 file descriptors
-    char data;
-    struct iovec iov = { &data, 1 };
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    // Try to receive the eventfds (with short timeout since it's sent immediately)
-    if (fcntl(g_control_socket, F_SETFL, flags & ~O_NONBLOCK) < 0) {
-        fprintf(stderr, "IPC: Warning: Failed to set blocking mode: %s\n", strerror(errno));
-    }
-    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-    if (setsockopt(g_control_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        fprintf(stderr, "IPC: Warning: Failed to set socket timeout: %s\n", strerror(errno));
-    }
-
-    ssize_t n = recvmsg(g_control_socket, &msg, 0);
-    if (n > 0 && data == 'E') {
-        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-                // Receive 1 or 2 eventfds (video, and optionally audio)
-                size_t num_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-                int* fds = (int*)CMSG_DATA(cmsg);
-
-                if (num_fds >= 1) {
-                    g_frame_ready_eventfd = fds[0];
-                    fprintf(stderr, "IPC: Received eventfd %d from emulator for low-latency sync\n", g_frame_ready_eventfd);
-                }
-                if (num_fds >= 2) {
-                    g_audio_ready_eventfd = fds[1];
-                    fprintf(stderr, "IPC: Received audio eventfd %d from emulator\n", g_audio_ready_eventfd);
-                }
-                break;
-            }
-        }
-    }
-
-    // Restore non-blocking mode
-    if (fcntl(g_control_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-        fprintf(stderr, "IPC: Warning: Failed to restore non-blocking mode: %s\n", strerror(errno));
-    }
-
-    return true;
-}
-
-static void disconnect_control_socket() {
-    if (g_control_socket >= 0) {
-        close(g_control_socket);
-        g_control_socket = -1;
-    }
-    if (g_frame_ready_eventfd >= 0) {
-        close(g_frame_ready_eventfd);
-        g_frame_ready_eventfd = -1;
-    }
-    if (g_audio_ready_eventfd >= 0) {
-        close(g_audio_ready_eventfd);
-        g_audio_ready_eventfd = -1;
-    }
-    g_emulator_connected = false;
-    g_connected_socket_path.clear();
-}
-
-
-/*
- * Send binary input to emulator
- */
-
+// Wrapper functions for compatibility during migration
 static bool send_key_input(int mac_keycode, bool down) {
-    if (g_control_socket < 0) return false;
-
-    MacEmuKeyInput msg;
-    msg.hdr.type = MACEMU_INPUT_KEY;
-    msg.hdr.flags = down ? MACEMU_KEY_DOWN : MACEMU_KEY_UP;
-    msg.hdr._reserved = 0;
-    msg.mac_keycode = mac_keycode;
-    msg.modifiers = 0;  // TODO: track modifier state
-    msg._reserved = 0;
-
-    return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
+    return g_ipc.send_key_input(mac_keycode, down);
 }
 
 static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms) {
-    if (g_control_socket < 0) return false;
-
-    MacEmuMouseInput msg;
-    msg.hdr.type = MACEMU_INPUT_MOUSE;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.x = dx;
-    msg.y = dy;
-    msg.buttons = buttons;
-    memset(msg._reserved, 0, sizeof(msg._reserved));
-    msg.timestamp_ms = browser_timestamp_ms;
-
-    return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
+    return g_ipc.send_mouse_input(dx, dy, buttons, browser_timestamp_ms);
 }
 
 static bool send_command(uint8_t command) {
-    if (g_control_socket < 0) return false;
-
-    MacEmuCommandInput msg;
-    msg.hdr.type = MACEMU_INPUT_COMMAND;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.command = command;
-    memset(msg._reserved, 0, sizeof(msg._reserved));
-
-    return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
+    return g_ipc.send_command(command);
 }
 
 static bool send_ping_input(uint32_t sequence, uint64_t t1_browser_send_ms) {
-    if (g_control_socket < 0) return false;
-
-    // Add server receive timestamp (t2)
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t t2_server_recv_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-
-    MacEmuPingInput msg;
-    msg.hdr.type = MACEMU_INPUT_PING;
-    msg.hdr.flags = 0;
-    msg.hdr._reserved = 0;
-    msg.sequence = sequence;
-    msg.t1_browser_send_ms = t1_browser_send_ms;
-    msg.t2_server_recv_us = t2_server_recv_us;
-    msg.t3_emulator_recv_us = 0;  // Will be filled by emulator
-
-    return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
+    return g_ipc.send_ping_input(sequence, t1_browser_send_ms);
 }
 
-
-/*
- * Try to connect to a running emulator
- */
-
 static bool try_connect_to_emulator(pid_t pid) {
-    // First try to connect to SHM
-    if (!connect_to_video_shm(pid)) {
-        return false;
+    bool success = g_ipc.connect_to_emulator(pid);
+    if (success) {
+        g_emulator_pid = pid;
+        g_emulator_connected = true;
     }
-
-    // Then try to connect to control socket
-    if (!connect_to_control_socket(pid)) {
-        disconnect_video_shm();
-        return false;
-    }
-
-    return true;
+    return success;
 }
 
 // Forward declaration - implementation after WebRTCServer class
@@ -412,33 +188,11 @@ static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr);
 
 
 /*
- * Scan for running emulators (look for SHM files)
+ * Scan for running emulators (wrapper for ipc::scan_for_emulators)
  */
 
 static std::vector<pid_t> scan_for_emulators() {
-    std::vector<pid_t> pids;
-
-    DIR* dir = opendir("/dev/shm");
-    if (!dir) return pids;
-
-    struct dirent* entry;
-    const char* prefix = "macemu-video-";
-    size_t prefix_len = strlen(prefix);
-
-    while ((entry = readdir(dir)) != nullptr) {
-        if (strncmp(entry->d_name, prefix, prefix_len) == 0) {
-            pid_t pid = atoi(entry->d_name + prefix_len);
-            if (pid > 0) {
-                // Check if process still exists
-                if (kill(pid, 0) == 0) {
-                    pids.push_back(pid);
-                }
-            }
-        }
-    }
-    closedir(dir);
-
-    return pids;
+    return ipc::scan_for_emulators();
 }
 
 
@@ -2196,8 +1950,8 @@ private:
 // Implementation of disconnect_from_emulator (needs WebRTCServer definition)
 static void disconnect_from_emulator(WebRTCServer* webrtc) {
     (void)webrtc;  // Keep parameter for future use, suppress unused warning
-    disconnect_control_socket();
-    disconnect_video_shm();
+    g_ipc.disconnect();
+    g_emulator_connected = false;
     g_emulator_pid = -1;
 
     // NOTE: We do NOT disconnect WebRTC peers here!

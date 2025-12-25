@@ -32,6 +32,7 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/config/server_config.cpp \
               $(SERVER_DIR)/utils/keyboard_map.cpp \
               $(SERVER_DIR)/utils/json_utils.cpp \
+              $(SERVER_DIR)/ipc/ipc_connection.cpp \
               $(SERVER_DIR)/h264_encoder.cpp \
               $(SERVER_DIR)/av1_encoder.cpp \
               $(SERVER_DIR)/opus_encoder.cpp \
@@ -43,6 +44,7 @@ SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/server_config.o \
               $(BUILD_DIR)/keyboard_map.o \
               $(BUILD_DIR)/json_utils.o \
+              $(BUILD_DIR)/ipc_connection.o \
               $(BUILD_DIR)/h264_encoder.o \
               $(BUILD_DIR)/av1_encoder.o \
               $(BUILD_DIR)/opus_encoder.o \
@@ -91,6 +93,12 @@ $(BUILD_DIR)/keyboard_map.o: $(SERVER_DIR)/utils/keyboard_map.cpp \
 
 $(BUILD_DIR)/json_utils.o: $(SERVER_DIR)/utils/json_utils.cpp \
                             $(SERVER_DIR)/utils/json_utils.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile IPC
+$(BUILD_DIR)/ipc_connection.o: $(SERVER_DIR)/ipc/ipc_connection.cpp \
+                                $(SERVER_DIR)/ipc/ipc_connection.h \
+                                ../BasiliskII/src/IPC/ipc_protocol.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile server
