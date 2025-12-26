@@ -46,7 +46,6 @@ extern void AudioInterrupt(void);
 
 extern void audio_enter_stream(void);
 extern void audio_exit_stream(void);
-extern void audio_request_data(void);  // Server requests audio (pull model)
 
 extern bool audio_set_sample_rate(int index);
 extern bool audio_set_sample_size(int index);

@@ -49,14 +49,16 @@ public:
     // Get encoder channels
     int get_channels() const { return channels_; }
 
-private:
     // Simple linear resampler for audio (good enough for speech/music)
     // More sophisticated would use libswresample, but adds dependency
+    // Made public for use by server audio loop
     std::vector<int16_t> resample_linear(const int16_t* input,
                                           int input_samples,
                                           int input_rate,
                                           int output_rate,
                                           int channels);
+
+private:
 
     OpusEncoder* encoder_ = nullptr;
     int sample_rate_ = 48000;  // Output rate (fixed for Opus)

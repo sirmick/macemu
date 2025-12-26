@@ -73,6 +73,9 @@
 
 // Audio subsystem (for pull model requests)
 #include "audio.h"
+#ifdef ENABLE_IPC_AUDIO
+#include "audio_ipc.h"
+#endif
 
 #define DEBUG 0
 #include "debug.h"
@@ -405,10 +408,12 @@ static void process_binary_input(const uint8_t* data, size_t len) {
             break;
         }
         case MACEMU_INPUT_AUDIO_REQUEST: {
+            // Pull model: Server requests audio data
             if (len < sizeof(MacEmuAudioRequestInput)) return;
-            // Server requests audio data (pull model, like SDL callback)
-            // Wake up audio thread to generate audio
-            audio_request_data();
+            const MacEmuAudioRequestInput* audio_req = (const MacEmuAudioRequestInput*)data;
+#ifdef ENABLE_IPC_AUDIO
+            audio_request_data(audio_req->requested_samples);
+#endif
             break;
         }
     }

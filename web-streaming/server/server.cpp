@@ -2067,278 +2067,169 @@ static void audio_loop_tone_only(WebRTCServer& webrtc) {
  */
 
 static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
-    // Create epoll instance for low-latency event notification
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        fprintf(stderr, "Audio: FATAL: Failed to create epoll: %s\n", strerror(errno));
-        return;
-    }
-    int current_eventfd = -1;  // Track which eventfd is registered
+    uint64_t frames_consumed = 0;
+    uint64_t frames_underrun = 0;
 
-    // Opus frame timing (20ms @ 48kHz = 960 samples)
+    // Fixed 20ms timing for Opus
+    // Server controls timing, Mac responds to requests
     const auto frame_duration = std::chrono::milliseconds(20);
 
-    uint64_t frames_requested = 0;
-    uint64_t frames_received = 0;
-    uint64_t frames_timeout = 0;
-
     if (g_debug_audio) {
-        fprintf(stderr, "Audio: Starting audio processing loop (PULL MODEL - server-driven)\n");
+        fprintf(stderr, "Audio: Starting frame-based audio loop (PULL MODEL - server controls timing)\n");
     }
 
     while (g_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
-        // Step 1: Send AUDIO_REQUEST to emulator (if connected)
-        if (g_control_socket >= 0 && g_ipc_shm) {
-            MacEmuAudioRequestInput req;
-            memset(&req, 0, sizeof(req));
-            req.hdr.type = MACEMU_INPUT_AUDIO_REQUEST;
-            req.hdr.flags = 0;
-            req.hdr._reserved = 0;
-            req.requested_samples = 960;  // 20ms @ 48kHz
-
-            ssize_t sent = send(g_control_socket, &req, sizeof(req), MSG_NOSIGNAL);
-            if (sent != sizeof(req)) {
-                if (g_debug_audio && frames_requested % 50 == 0) {
-                    fprintf(stderr, "Audio: Failed to send request: %s\n", strerror(errno));
-                }
-                // Sleep and retry
-                std::this_thread::sleep_for(frame_duration);
-                continue;
-            }
-
-            frames_requested++;
-
-            if (g_debug_audio && frames_requested <= 5) {
-                fprintf(stderr, "Audio: Sent AUDIO_REQUEST #%lu (%u samples)\n",
-                        frames_requested, req.requested_samples);
-            }
-        } else {
-            // No connection - sleep and retry
+        // Cache SHM pointer locally to avoid race conditions with disconnect
+        MacEmuIPCBuffer* shm = g_ipc_shm;
+        if (!shm) {
             std::this_thread::sleep_for(frame_duration);
             continue;
         }
 
-        // Step 2: Setup epoll for audio_ready_eventfd (if needed)
-        if (g_audio_ready_eventfd >= 0 && g_audio_ready_eventfd != current_eventfd) {
-            // Unregister old eventfd if any
-            if (current_eventfd >= 0) {
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
-            }
+        // PULL MODEL: Request audio from Mac before reading
+        // This wakes up Mac's audio thread to produce a frame
+        if (g_control_socket >= 0) {
+            MacEmuAudioRequestInput audio_req;
+            audio_req.hdr.type = MACEMU_INPUT_AUDIO_REQUEST;
+            audio_req.hdr.flags = 0;
+            audio_req.hdr._reserved = 0;
+            audio_req.requested_samples = 960;  // Opus frame size @ 48kHz
 
-            // Register new eventfd
-            struct epoll_event ev;
-            ev.events = EPOLLIN;
-            ev.data.fd = g_audio_ready_eventfd;
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_audio_ready_eventfd, &ev) == 0) {
+            ssize_t sent = send(g_control_socket, &audio_req, sizeof(audio_req), MSG_NOSIGNAL);
+            if (sent != sizeof(audio_req)) {
                 if (g_debug_audio) {
-                    fprintf(stderr, "Audio: Registered audio eventfd %d with epoll\n", g_audio_ready_eventfd);
+                    static int err_count = 0;
+                    if (++err_count <= 10) {
+                        fprintf(stderr, "Audio: Failed to send request to Mac (count=%d)\n", err_count);
+                    }
                 }
-                current_eventfd = g_audio_ready_eventfd;
-            } else {
-                fprintf(stderr, "Audio: WARNING: Failed to register eventfd with epoll: %s\n", strerror(errno));
             }
         }
 
-        // Step 3: Wait for emulator response (with timeout)
-        struct epoll_event events[1];
-        int nfds = epoll_wait(epoll_fd, events, 1, 100);  // 100ms timeout
+        // Give Mac time to respond to interrupt and produce frame
+        // Mac needs to: wake thread, trigger interrupt, execute 68k audio code, write frame
+        // During startup, Mac audio init can be slow, so give extra margin
+        // 8ms is conservative but still leaves 12ms for resampling/encoding in 20ms budget
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
 
-        if (nfds < 0) {
-            if (errno == EINTR) continue;
-            fprintf(stderr, "Audio: epoll_wait error: %s\n", strerror(errno));
-            break;
-        }
+        // Read frame ring buffer indices
+        uint32_t read_idx = ATOMIC_LOAD(shm->audio_frame_read_idx);
+        uint32_t write_idx = ATOMIC_LOAD(shm->audio_frame_write_idx);
 
-        if (nfds == 0) {
-            // Timeout - emulator didn't respond
-            frames_timeout++;
-            if (g_debug_audio && frames_timeout <= 10) {
-                fprintf(stderr, "Audio: Timeout waiting for response (request #%lu)\n", frames_requested);
-            }
+        // Select frame to consume
+        const MacEmuAudioFrame* frame;
+        bool is_silence = false;
 
-            // Check if emulator disconnected
-            if (current_eventfd >= 0 && g_audio_ready_eventfd < 0) {
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
-                current_eventfd = -1;
-                if (g_debug_audio) {
-                    fprintf(stderr, "Audio: Emulator disconnected\n");
-                }
-            }
+        if (read_idx == write_idx) {
+            // Ring buffer empty - underrun! Use silence frame
+            frame = &shm->audio_silence_frame;
+            is_silence = true;
+            frames_underrun++;
 
-            // Maintain timing even on timeout
-            auto elapsed = std::chrono::steady_clock::now() - frame_start;
-            auto remaining = frame_duration - elapsed;
-            if (remaining > std::chrono::milliseconds(0)) {
-                std::this_thread::sleep_for(remaining);
-            }
-            continue;
-        }
-
-        // Step 4: Read eventfd (audio ready)
-        uint64_t event_count;
-        if (read(g_audio_ready_eventfd, &event_count, sizeof(event_count)) != sizeof(event_count)) {
-            if (g_debug_audio) {
-                fprintf(stderr, "Audio: Failed to read eventfd: %s\n", strerror(errno));
-            }
-            continue;
-        }
-
-        frames_received++;
-
-        // Step 5: Read audio from SHM ring buffer (zero-copy)
-        // Cache SHM pointer locally to avoid race conditions with disconnect
-        MacEmuIPCBuffer* shm = g_ipc_shm;
-        if (!shm) continue;
-
-        // Read exactly 960 samples from ring buffer
-        const int requested_samples = 960;
-        const int channels = 2;  // Stereo
-        const int bytes_per_sample = 2;  // S16
-        const int requested_bytes = requested_samples * channels * bytes_per_sample;  // 3840 bytes
-
-        // Read ring buffer indices atomically
-        uint32_t write_pos = ATOMIC_LOAD(shm->audio_ring_write_pos);
-        uint32_t read_pos = ATOMIC_LOAD(shm->audio_ring_read_pos);
-        uint32_t ring_size = shm->audio_ring_size;
-
-        if (ring_size == 0) {
-            if (g_debug_audio && frames_received <= 5) {
-                fprintf(stderr, "Audio: Ring buffer not initialized yet\n");
-            }
-            continue;
-        }
-
-        // Calculate available data
-        uint32_t available = (write_pos >= read_pos) ?
-            (write_pos - read_pos) :
-            (ring_size - read_pos + write_pos);
-
-        // Read data from ring buffer (handle wrap-around and partial reads)
-        uint8_t audio_buffer[requested_bytes];
-
-        if (available < (uint32_t)requested_bytes) {
-            // Partial or complete underrun - read what we have, pad with silence
-            if (available > 0) {
-                // Read partial data from ring buffer
-                uint32_t first_chunk = std::min(available, ring_size - read_pos);
-                memcpy(audio_buffer, &shm->audio_ring_buffer[read_pos], first_chunk);
-
-                if (first_chunk < available) {
-                    // Wrap around to beginning
-                    memcpy(audio_buffer + first_chunk, &shm->audio_ring_buffer[0],
-                           available - first_chunk);
-                }
-
-                // Pad remainder with silence
-                uint32_t silence_bytes = requested_bytes - available;
-                memset(audio_buffer + available, 0, silence_bytes);
-
-                // Advance read position by what we consumed
-                // Do this AFTER padding so if emulator disconnects mid-operation, we don't crash
-                read_pos = (read_pos + available) % ring_size;
-                // Use cached shm pointer - g_ipc_shm might have been cleared by disconnect
-                ATOMIC_STORE(shm->audio_ring_read_pos, read_pos);
-
-                if (g_debug_audio && frames_received <= 10) {
-                    fprintf(stderr, "Audio: Partial read - got %u bytes, padded %u bytes silence\n",
-                        available, silence_bytes);
-                }
-            } else {
-                // Complete underrun - no data available, send full silence
-                memset(audio_buffer, 0, requested_bytes);
-                if (g_debug_audio && frames_received <= 10) {
-                    fprintf(stderr, "Audio: Complete underrun - sending %d bytes silence\n",
-                        requested_bytes);
-                }
+            if (g_debug_audio && frames_underrun <= 10) {
+                fprintf(stderr, "Audio: Underrun - no frames available, using silence (count=%lu)\n",
+                        frames_underrun);
             }
         } else {
-            // Normal case - enough data available, read full frame
-            uint32_t first_chunk = std::min((uint32_t)requested_bytes, ring_size - read_pos);
-            memcpy(audio_buffer, &shm->audio_ring_buffer[read_pos], first_chunk);
+            // Normal case - consume frame from ring buffer
+            frame = &shm->audio_frame_ring[read_idx];
+            is_silence = false;
+        }
 
-            if (first_chunk < (uint32_t)requested_bytes) {
-                // Wrap around to beginning
-                memcpy(audio_buffer + first_chunk, &shm->audio_ring_buffer[0],
-                       requested_bytes - first_chunk);
+        // Prepare buffer for resampling/byte-swapping (max 960 samples stereo S16)
+        int16_t opus_buffer[960 * 2];
+        const int16_t* samples_to_encode = nullptr;
+
+        // Check if resampling is needed
+        if (frame->sample_rate != 48000) {
+            // Resample using existing linear resampler in opus_encoder
+            // First byte-swap from big-endian to little-endian
+            std::vector<int16_t> byte_swapped(frame->samples * frame->channels);
+            const int16_t* src = reinterpret_cast<const int16_t*>(frame->data);
+            for (uint32_t i = 0; i < frame->samples * frame->channels; i++) {
+                uint16_t val = static_cast<uint16_t>(src[i]);
+                byte_swapped[i] = static_cast<int16_t>((val >> 8) | (val << 8));
             }
 
-            // Advance read position atomically
-            read_pos = (read_pos + requested_bytes) % ring_size;
-            // Use cached shm pointer - g_ipc_shm might have been cleared by disconnect
-            ATOMIC_STORE(shm->audio_ring_read_pos, read_pos);
-        }
-
-        // Convert from big-endian (Mac S16MSB) to little-endian (host/Opus expects S16LE)
-        // Use safer byte swap with proper types
-        int16_t* samples_ptr = reinterpret_cast<int16_t*>(audio_buffer);
-        int total_samples = requested_bytes / sizeof(int16_t);
-        for (int i = 0; i < total_samples; i++) {
-            uint16_t val = static_cast<uint16_t>(samples_ptr[i]);
-            samples_ptr[i] = static_cast<int16_t>((val >> 8) | (val << 8));
-        }
-
-        if (g_debug_audio && frames_received <= 20) {
-            fprintf(stderr, "Audio: Read %d bytes from ring buffer (available was %u), byte-swapped\n",
-                requested_bytes, available);
-        }
-
-        // Use the byte-swapped data from buffer
-        const uint8_t* audio_data = audio_buffer;
-        int sample_rate = 48000;  // Fixed for now
-        int samples = requested_samples;
-        int input_size = requested_bytes;
-
-        if (input_size > MACEMU_AUDIO_MAX_FRAME_SIZE) {
-            input_size = MACEMU_AUDIO_MAX_FRAME_SIZE;
-        }
-
-        // Step 6: Encode to Opus
-        if (g_audio_encoder) {
-            if (g_debug_audio && frames_received <= 10) {
-                fprintf(stderr, "Audio: Processing frame #%lu: %d samples @ %dHz, %dch, %d bytes PCM\n",
-                        frames_received, samples, sample_rate, channels, input_size);
-            }
-
-            std::vector<uint8_t> opus_data = g_audio_encoder->encode_dynamic(
-                reinterpret_cast<const int16_t*>(audio_data),
-                samples,
-                sample_rate,
-                channels
+            // Resample (uses opus_encoder's built-in linear resampler)
+            auto resampled = g_audio_encoder->resample_linear(
+                byte_swapped.data(),
+                frame->samples,
+                frame->sample_rate,
+                48000,
+                frame->channels
             );
 
-            // Step 7: Send to peers
+            // Copy to opus_buffer (may need padding if less than 960 samples)
+            int resampled_samples = resampled.size() / frame->channels;
+            if (resampled_samples >= 960) {
+                memcpy(opus_buffer, resampled.data(), 960 * frame->channels * sizeof(int16_t));
+            } else {
+                // Undersized after resampling - copy what we have and pad with silence
+                memcpy(opus_buffer, resampled.data(), resampled_samples * frame->channels * sizeof(int16_t));
+                memset(&opus_buffer[resampled_samples * frame->channels], 0,
+                       (960 - resampled_samples) * frame->channels * sizeof(int16_t));
+            }
+            samples_to_encode = opus_buffer;
+
+        } else {
+            // No resampling needed (48kHz already) - just byte-swap
+            const int16_t* src = reinterpret_cast<const int16_t*>(frame->data);
+            uint32_t total_samples = std::min(frame->samples, (uint32_t)960) * frame->channels;
+
+            for (uint32_t i = 0; i < total_samples; i++) {
+                uint16_t val = static_cast<uint16_t>(src[i]);
+                opus_buffer[i] = static_cast<int16_t>((val >> 8) | (val << 8));
+            }
+
+            // Pad if needed
+            if (frame->samples < 960) {
+                memset(&opus_buffer[frame->samples * frame->channels], 0,
+                       (960 - frame->samples) * frame->channels * sizeof(int16_t));
+            }
+
+            samples_to_encode = opus_buffer;
+        }
+
+        // Encode to Opus (always 960 samples @ 48kHz stereo)
+        if (g_audio_encoder) {
+            std::vector<uint8_t> opus_data = g_audio_encoder->encode(
+                samples_to_encode,
+                960  // Opus frame size
+            );
+
+            // Send to peers
             if (!opus_data.empty()) {
-                if (g_debug_audio && frames_received <= 10) {
-                    fprintf(stderr, "Audio: Encoded to Opus: %zu bytes\n", opus_data.size());
-                }
                 webrtc.send_audio_to_all_peers(opus_data);
             }
         }
 
-        // Step 8: Maintain frame timing (sleep remainder of 20ms)
+        // Advance read index (only if we didn't use silence frame)
+        if (!is_silence) {
+            uint32_t next_read_idx = (read_idx + 1) % MACEMU_AUDIO_FRAME_RING_SIZE;
+            ATOMIC_STORE(shm->audio_frame_read_idx, next_read_idx);
+            frames_consumed++;
+        }
+
+        // Periodic stats
+        if (g_debug_audio && frames_consumed > 0 && frames_consumed % 100 == 0) {
+            fprintf(stderr, "Audio: Stats - consumed=%lu underruns=%lu\n",
+                    frames_consumed, frames_underrun);
+        }
+
+        // Maintain 20ms frame timing
         auto elapsed = std::chrono::steady_clock::now() - frame_start;
         auto remaining = frame_duration - elapsed;
         if (remaining > std::chrono::milliseconds(0)) {
             std::this_thread::sleep_for(remaining);
         }
-
-        // Periodic stats
-        if (g_debug_audio && frames_received > 0 && frames_received % 100 == 0) {
-            fprintf(stderr, "Audio: Stats - requested=%lu received=%lu timeout=%lu\n",
-                    frames_requested, frames_received, frames_timeout);
-        }
-    }
-
-    // Clean up epoll
-    if (epoll_fd >= 0) {
-        close(epoll_fd);
     }
 
     if (g_debug_audio) {
-        fprintf(stderr, "Audio: Exiting audio processing loop (requested=%lu, received=%lu, timeout=%lu)\n",
-                frames_requested, frames_received, frames_timeout);
+        fprintf(stderr, "Audio: Exiting frame-based audio loop (consumed=%lu, underruns=%lu)\n",
+                frames_consumed, frames_underrun);
     }
 }
 
