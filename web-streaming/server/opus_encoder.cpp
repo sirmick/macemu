@@ -36,6 +36,7 @@ bool OpusAudioEncoder::init(int output_sample_rate, int channels, int bitrate) {
     opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));  // Optimize for music
     opus_encoder_ctl(encoder_, OPUS_SET_VBR(1));  // Variable bitrate
     opus_encoder_ctl(encoder_, OPUS_SET_VBR_CONSTRAINT(0));  // Unconstrained VBR
+    opus_encoder_ctl(encoder_, OPUS_SET_DTX(1));  // Enable DTX (discontinuous transmission) for silence
 
     fprintf(stderr, "[Opus] Encoder initialized: %dHz, %d ch, %d bps, frame=%d samples\n",
             sample_rate_, channels_, bitrate, frame_size_);

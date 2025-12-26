@@ -105,6 +105,9 @@ void ServerConfig::load_from_env() {
     if (getenv("MACEMU_DEBUG_AUDIO")) {
         debug_audio = true;
     }
+    if (getenv("MACEMU_DEBUG_PNG")) {
+        debug_png = true;
+    }
 }
 
 void ServerConfig::print_summary() const {
@@ -130,7 +133,7 @@ void ServerConfig::print_summary() const {
 
     // Show active debug flags
     bool any_debug = debug_connection || debug_mode_switch || debug_perf ||
-                     debug_frames || debug_audio;
+                     debug_frames || debug_audio || debug_png;
     if (any_debug) {
         fprintf(stderr, "\nDebug flags:\n");
         if (debug_connection)   fprintf(stderr, "  - Connection (WebRTC/ICE/signaling)\n");
@@ -138,6 +141,7 @@ void ServerConfig::print_summary() const {
         if (debug_perf)         fprintf(stderr, "  - Performance (stats/ping)\n");
         if (debug_frames)       fprintf(stderr, "  - Frames (save to disk)\n");
         if (debug_audio)        fprintf(stderr, "  - Audio processing\n");
+        if (debug_png)          fprintf(stderr, "  - PNG encoding/dirty rects\n");
     }
 
     fprintf(stderr, "\n");
@@ -163,6 +167,7 @@ void ServerConfig::print_usage(const char* program_name) const {
     fprintf(stderr, "  MACEMU_DEBUG_PERF          Enable performance/ping logs\n");
     fprintf(stderr, "  MACEMU_DEBUG_FRAMES        Save frame dumps to disk\n");
     fprintf(stderr, "  MACEMU_DEBUG_AUDIO         Enable audio processing logs\n");
+    fprintf(stderr, "  MACEMU_DEBUG_PNG           Enable PNG encoding/dirty rect logs\n");
     fprintf(stderr, "\n");
 }
 

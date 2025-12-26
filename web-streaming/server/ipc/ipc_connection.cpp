@@ -36,15 +36,15 @@ IPCConnection::~IPCConnection() {
 bool IPCConnection::connect_video_shm(pid_t pid) {
     shm_name_ = std::string(MACEMU_VIDEO_SHM_PREFIX) + std::to_string(pid);
 
-    video_shm_fd_ = shm_open(shm_name_.c_str(), O_RDONLY, 0);
+    video_shm_fd_ = shm_open(shm_name_.c_str(), O_RDWR, 0);
     if (video_shm_fd_ < 0) {
         // Not an error during scanning - emulator may not exist yet
         return false;
     }
 
-    // Map shared memory (read-only for server)
+    // Map shared memory (read-write for server - needs to update audio_ring_read_pos)
     video_shm_ = (MacEmuIPCBuffer*)mmap(nullptr, sizeof(MacEmuIPCBuffer),
-                                         PROT_READ, MAP_SHARED,
+                                         PROT_READ | PROT_WRITE, MAP_SHARED,
                                          video_shm_fd_, 0);
     if (video_shm_ == MAP_FAILED) {
         fprintf(stderr, "IPC: Failed to map video SHM for PID %d: %s\n", pid, strerror(errno));
@@ -52,6 +52,10 @@ bool IPCConnection::connect_video_shm(pid_t pid) {
         video_shm_fd_ = -1;
         video_shm_ = nullptr;
         return false;
+    }
+
+    if (getenv("MACEMU_DEBUG_CONNECTION")) {
+        fprintf(stderr, "IPC: Mapped SHM at %p (size %zu bytes)\n", (void*)video_shm_, sizeof(MacEmuIPCBuffer));
     }
 
     // Validate
@@ -72,6 +76,10 @@ bool IPCConnection::connect_video_shm(pid_t pid) {
 
 void IPCConnection::disconnect_video_shm() {
     if (video_shm_ && video_shm_ != MAP_FAILED) {
+        if (getenv("MACEMU_DEBUG_CONNECTION")) {
+            fprintf(stderr, "IPC: Unmapping SHM at %p\n", (void*)video_shm_);
+        }
+
         munmap(video_shm_, sizeof(MacEmuIPCBuffer));
         video_shm_ = nullptr;
     }

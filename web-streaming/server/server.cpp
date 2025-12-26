@@ -48,6 +48,8 @@
 #include <fstream>
 #include <csignal>
 #include <iomanip>
+#include <execinfo.h>
+#include <ucontext.h>
 
 // POSIX IPC and process management
 #include <fcntl.h>
@@ -90,8 +92,9 @@ static server_config::ServerConfig g_config;
 #define g_debug_frames      (g_config.debug_frames)
 #define g_debug_audio       (g_config.debug_audio)
 
-// g_debug_mode_switch needs to be non-static for encoders
+// g_debug_mode_switch and g_debug_png need to be non-static for encoders
 bool g_debug_mode_switch = false;
+bool g_debug_png = false;
 
 // Global state
 static std::atomic<bool> g_running(true);
@@ -105,7 +108,7 @@ static ipc::IPCConnection g_ipc;
 
 // Legacy accessors for gradual migration
 // TODO: Phase 7 - Pass IPCConnection reference instead of using globals
-#define g_video_shm         (g_ipc.get_shm())
+#define g_ipc_shm           (g_ipc.get_shm())  // Shared memory for both video and audio
 #define g_control_socket    (g_ipc.get_control_socket())
 #define g_frame_ready_eventfd (g_ipc.get_frame_eventfd())
 #define g_audio_ready_eventfd (g_ipc.get_audio_eventfd())
@@ -127,10 +130,151 @@ static std::unique_ptr<OpusAudioEncoder> g_audio_encoder;
 // Forward declarations
 class WebRTCServer;
 
-// Signal handler
+// Signal handler for graceful shutdown
 static void signal_handler(int sig) {
     fprintf(stderr, "\nServer: Received signal %d, shutting down...\n", sig);
     g_running = false;
+}
+
+// Crash handler for fatal signals with full backtrace
+static void crash_handler(int sig, siginfo_t *info, void *context) {
+    // Use async-signal-safe functions only
+    const char *signame = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: signame = "SIGSEGV (Segmentation Fault)"; break;
+        case SIGBUS:  signame = "SIGBUS (Bus Error)"; break;
+        case SIGABRT: signame = "SIGABRT (Abort)"; break;
+        case SIGILL:  signame = "SIGILL (Illegal Instruction)"; break;
+        case SIGFPE:  signame = "SIGFPE (Floating Point Exception)"; break;
+    }
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "╔════════════════════════════════════════════════════════════════╗\n");
+    fprintf(stderr, "║              FATAL CRASH IN WEBRTC SERVER                      ║\n");
+    fprintf(stderr, "╚════════════════════════════════════════════════════════════════╝\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Signal:  %d (%s)\n", sig, signame);
+
+    if (info) {
+        fprintf(stderr, "Code:    %d\n", info->si_code);
+        if (sig == SIGSEGV || sig == SIGBUS) {
+            fprintf(stderr, "Address: %p (invalid memory access)\n", info->si_addr);
+        }
+    }
+
+    // Print register state (x86-64 specific)
+#if defined(__x86_64__)
+    if (context) {
+        ucontext_t *uctx = (ucontext_t *)context;
+        mcontext_t *mctx = &uctx->uc_mcontext;
+
+        fprintf(stderr, "\n=== REGISTER STATE ===\n");
+        fprintf(stderr, "  RIP: 0x%016llx  (instruction pointer)\n", (unsigned long long)mctx->gregs[REG_RIP]);
+        fprintf(stderr, "  RSP: 0x%016llx  (stack pointer)\n", (unsigned long long)mctx->gregs[REG_RSP]);
+        fprintf(stderr, "  RBP: 0x%016llx  (base pointer)\n", (unsigned long long)mctx->gregs[REG_RBP]);
+        fprintf(stderr, "  RAX: 0x%016llx  RBX: 0x%016llx\n",
+            (unsigned long long)mctx->gregs[REG_RAX],
+            (unsigned long long)mctx->gregs[REG_RBX]);
+        fprintf(stderr, "  RCX: 0x%016llx  RDX: 0x%016llx\n",
+            (unsigned long long)mctx->gregs[REG_RCX],
+            (unsigned long long)mctx->gregs[REG_RDX]);
+        fprintf(stderr, "=== END REGISTER STATE ===\n");
+    }
+#endif
+
+    // Print backtrace with source locations using addr2line
+    fprintf(stderr, "\n=== BACKTRACE ===\n");
+    void *array[64];
+    size_t size = backtrace(array, 64);
+    char **strings = backtrace_symbols(array, size);
+
+    // Get binary base address from /proc/self/maps
+    FILE *maps = fopen("/proc/self/maps", "r");
+    unsigned long base_addr = 0;
+    if (maps) {
+        char line[512];
+        if (fgets(line, sizeof(line), maps)) {
+            // First line is the base mapping
+            sscanf(line, "%lx-", &base_addr);
+        }
+        fclose(maps);
+    }
+
+    fprintf(stderr, "Binary base address: 0x%lx\n\n", base_addr);
+
+    // Print with symbols and calculate offsets
+    for (size_t i = 0; i < size; i++) {
+        unsigned long offset = (unsigned long)array[i] - base_addr;
+        fprintf(stderr, "  [%2zu] %p (offset 0x%lx)", i, array[i], offset);
+        if (strings && strings[i]) {
+            fprintf(stderr, " %s", strings[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "\nDecoded (using addr2line via fork/exec):\n");
+    fflush(stderr);
+
+    // Fork and use addr2line to decode with offsets (signal-safe)
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child process - run addr2line
+        char exe_path[256];
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len == -1) {
+            _exit(1);
+        }
+        exe_path[len] = '\0';
+
+        // Build argv for addr2line using offsets from base
+        char *argv[size + 10];
+        argv[0] = (char*)"addr2line";
+        argv[1] = (char*)"-e";
+        argv[2] = exe_path;
+        argv[3] = (char*)"-f";
+        argv[4] = (char*)"-C";
+        argv[5] = (char*)"-i";
+        argv[6] = (char*)"-p";
+
+        char addr_strs[64][32];
+        for (size_t i = 0; i < size; i++) {
+            unsigned long offset = (unsigned long)array[i] - base_addr;
+            snprintf(addr_strs[i], sizeof(addr_strs[i]), "0x%lx", offset);
+            argv[7 + i] = addr_strs[i];
+        }
+        argv[7 + size] = NULL;
+
+        execvp("addr2line", argv);
+        _exit(1);  // If execvp fails
+    } else if (pid > 0) {
+        // Parent - wait for addr2line to finish
+        int status;
+        waitpid(pid, &status, 0);
+    }
+
+    if (strings) {
+        free(strings);
+    }
+
+    fprintf(stderr, "=== END BACKTRACE ===\n\n");
+
+    // Print server state information
+    fprintf(stderr, "=== SERVER STATE ===\n");
+    fprintf(stderr, "  Emulator connected: %s\n", g_emulator_connected.load() ? "YES" : "NO");
+    if (g_emulator_pid > 0) {
+        fprintf(stderr, "  Emulator PID:       %d\n", g_emulator_pid);
+    }
+    fprintf(stderr, "  Codec:              %s\n",
+        g_server_codec == CodecType::H264 ? "H.264" :
+        g_server_codec == CodecType::AV1 ? "AV1" : "PNG");
+    fprintf(stderr, "=== END SERVER STATE ===\n\n");
+
+    fprintf(stderr, "Crash report complete. Generating core dump...\n");
+    fflush(stderr);
+
+    // Re-raise signal with default handler to generate core dump
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 
@@ -417,7 +561,7 @@ public:
         api_ctx_.emulator_connected = false;
         api_ctx_.emulator_pid = -1;
         api_ctx_.started_emulator_pid = -1;
-        api_ctx_.video_shm = nullptr;
+        api_ctx_.ipc_shm = nullptr;
     }
 
     bool start(int port) {
@@ -472,7 +616,7 @@ private:
         api_ctx_.emulator_connected = g_emulator_connected;
         api_ctx_.emulator_pid = g_emulator_pid;
         api_ctx_.started_emulator_pid = g_started_emulator_pid;
-        api_ctx_.video_shm = g_video_shm;
+        api_ctx_.ipc_shm = g_ipc_shm;
 
         // Codec state (set once in constructor)
         // api_ctx_.server_codec and notify_codec_change_fn are already set
@@ -745,16 +889,16 @@ public:
         uint64_t ping_t2_server_us = 0;
         uint64_t ping_t3_emulator_us = 0;
         uint64_t ping_t4_frame_ready_us = 0;
-        if (g_video_shm) {
+        if (g_ipc_shm) {
             // Atomic read-acquire: ensures visibility of all previous writes to ping_timestamps
-            ping_seq = ATOMIC_LOAD(g_video_shm->ping_sequence);
+            ping_seq = ATOMIC_LOAD(g_ipc_shm->ping_sequence);
 
             // If ping available, read timestamp struct (no atomics needed - seq acts as guard)
             if (ping_seq > 0) {
-                ping_t1_browser_ms = g_video_shm->ping_timestamps.t1_browser_ms;
-                ping_t2_server_us = g_video_shm->ping_timestamps.t2_server_us;
-                ping_t3_emulator_us = g_video_shm->ping_timestamps.t3_emulator_us;
-                ping_t4_frame_ready_us = g_video_shm->ping_timestamps.t4_frame_us;
+                ping_t1_browser_ms = g_ipc_shm->ping_timestamps.t1_browser_ms;
+                ping_t2_server_us = g_ipc_shm->ping_timestamps.t2_server_us;
+                ping_t3_emulator_us = g_ipc_shm->ping_timestamps.t3_emulator_us;
+                ping_t4_frame_ready_us = g_ipc_shm->ping_timestamps.t4_frame_us;
                 // Note: Ping echo logging happens in browser when it receives the echo
             }
         }
@@ -1571,7 +1715,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         }
 
         // Wait for frames
-        if (!g_video_shm) {
+        if (!g_ipc_shm) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
@@ -1637,7 +1781,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
 
         // Latency measurement: time from emulator frame completion to now
         // Plain read - synchronized by eventfd read above
-        uint64_t frame_timestamp_us = g_video_shm->timestamp_us;
+        uint64_t frame_timestamp_us = g_ipc_shm->timestamp_us;
 
         // Use CLOCK_REALTIME to match the emulator's timestamp (both in same clock domain)
         struct timespec ts;
@@ -1645,8 +1789,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         uint64_t server_now_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
         // Read frame dimensions (plain reads - synchronized by eventfd)
-        uint32_t width = g_video_shm->width;
-        uint32_t height = g_video_shm->height;
+        uint32_t width = g_ipc_shm->width;
+        uint32_t height = g_ipc_shm->height;
 
         if (width == 0 || height == 0 || width > MACEMU_MAX_WIDTH || height > MACEMU_MAX_HEIGHT) {
             continue;
@@ -1654,7 +1798,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
 
         // Get BGRA frame from ready buffer
         // Emulator always outputs BGRA (B,G,R,A bytes), which is libyuv "ARGB"
-        uint8_t* frame_data = macemu_get_ready_bgra(g_video_shm);
+        uint8_t* frame_data = macemu_get_ready_bgra(g_ipc_shm);
         int stride = macemu_get_bgra_stride();
 
         // Check if keyframe requested (new peer connected)
@@ -1686,16 +1830,18 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         // Encode and send to PNG peers using dirty rects from emulator
         if (webrtc.has_codec_peer(CodecType::PNG)) {
             // Read dirty rect from SHM (plain reads - synchronized by eventfd)
-            uint32_t dirty_x = g_video_shm->dirty_x;
-            uint32_t dirty_y = g_video_shm->dirty_y;
-            uint32_t dirty_width = g_video_shm->dirty_width;
-            uint32_t dirty_height = g_video_shm->dirty_height;
+            uint32_t dirty_x = g_ipc_shm->dirty_x;
+            uint32_t dirty_y = g_ipc_shm->dirty_y;
+            uint32_t dirty_width = g_ipc_shm->dirty_width;
+            uint32_t dirty_height = g_ipc_shm->dirty_height;
 
-            // Debug logging for dirty rects
-            static int dirty_log_counter = 0;
-            if (++dirty_log_counter % 30 == 0) {
-                fprintf(stderr, "PNG: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %ux%u)\n",
-                        dirty_x, dirty_y, dirty_width, dirty_height, width, height);
+            // Debug logging for dirty rects (only if MACEMU_DEBUG_PNG is set)
+            if (g_debug_png) {
+                static int dirty_log_counter = 0;
+                if (++dirty_log_counter % 30 == 0) {
+                    fprintf(stderr, "PNG: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %ux%u)\n",
+                            dirty_x, dirty_y, dirty_width, dirty_height, width, height);
+                }
             }
 
             // Force full frame if any PNG peer needs their first frame
@@ -1713,7 +1859,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             static auto last_heartbeat = std::chrono::steady_clock::now();
             if (dirty_width == 0 || dirty_height == 0) {
                 // Check if there's a pending ping echo
-                uint32_t ping_seq = ATOMIC_LOAD(g_video_shm->ping_sequence);
+                uint32_t ping_seq = ATOMIC_LOAD(g_ipc_shm->ping_sequence);
                 if (ping_seq > 0) {
                     auto heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat);
                     // Send heartbeat at most once per second to avoid spam
@@ -1740,11 +1886,13 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                 // Check if this is a full frame or dirty rect
                 bool is_full_frame = (dirty_x == 0 && dirty_y == 0 && dirty_width == width && dirty_height == height);
 
-                static int encode_log_counter = 0;
-                if (++encode_log_counter % 30 == 0) {
-                    fprintf(stderr, "PNG: Encoding %s (x=%u y=%u w=%u h=%u)\n",
-                            is_full_frame ? "FULL FRAME" : "dirty rect",
-                            dirty_x, dirty_y, dirty_width, dirty_height);
+                if (g_debug_png) {
+                    static int encode_log_counter = 0;
+                    if (++encode_log_counter % 30 == 0) {
+                        fprintf(stderr, "PNG: Encoding %s (x=%u y=%u w=%u h=%u)\n",
+                                is_full_frame ? "FULL FRAME" : "dirty rect",
+                                dirty_x, dirty_y, dirty_width, dirty_height);
+                    }
                 }
 
                 if (is_full_frame) {
@@ -1912,7 +2060,10 @@ static void audio_loop_tone_only(WebRTCServer& webrtc) {
 
 
 /*
- * Audio processing loop - Mac emulator audio (IPC)
+ * Audio processing loop - PULL MODEL (server-driven, like SDL)
+ *
+ * Server requests audio at fixed Opus frame intervals (20ms @ 48kHz = 960 samples).
+ * This matches SDL's callback architecture for perfect timing synchronization.
  */
 
 static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
@@ -1924,12 +2075,52 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
     }
     int current_eventfd = -1;  // Track which eventfd is registered
 
+    // Opus frame timing (20ms @ 48kHz = 960 samples)
+    const auto frame_duration = std::chrono::milliseconds(20);
+
+    uint64_t frames_requested = 0;
+    uint64_t frames_received = 0;
+    uint64_t frames_timeout = 0;
+
     if (g_debug_audio) {
-        fprintf(stderr, "Audio: Starting audio processing loop (Mac IPC mode)\n");
+        fprintf(stderr, "Audio: Starting audio processing loop (PULL MODEL - server-driven)\n");
     }
 
     while (g_running) {
-        // Check if we need to update epoll registration
+        auto frame_start = std::chrono::steady_clock::now();
+
+        // Step 1: Send AUDIO_REQUEST to emulator (if connected)
+        if (g_control_socket >= 0 && g_ipc_shm) {
+            MacEmuAudioRequestInput req;
+            memset(&req, 0, sizeof(req));
+            req.hdr.type = MACEMU_INPUT_AUDIO_REQUEST;
+            req.hdr.flags = 0;
+            req.hdr._reserved = 0;
+            req.requested_samples = 960;  // 20ms @ 48kHz
+
+            ssize_t sent = send(g_control_socket, &req, sizeof(req), MSG_NOSIGNAL);
+            if (sent != sizeof(req)) {
+                if (g_debug_audio && frames_requested % 50 == 0) {
+                    fprintf(stderr, "Audio: Failed to send request: %s\n", strerror(errno));
+                }
+                // Sleep and retry
+                std::this_thread::sleep_for(frame_duration);
+                continue;
+            }
+
+            frames_requested++;
+
+            if (g_debug_audio && frames_requested <= 5) {
+                fprintf(stderr, "Audio: Sent AUDIO_REQUEST #%lu (%u samples)\n",
+                        frames_requested, req.requested_samples);
+            }
+        } else {
+            // No connection - sleep and retry
+            std::this_thread::sleep_for(frame_duration);
+            continue;
+        }
+
+        // Step 2: Setup epoll for audio_ready_eventfd (if needed)
         if (g_audio_ready_eventfd >= 0 && g_audio_ready_eventfd != current_eventfd) {
             // Unregister old eventfd if any
             if (current_eventfd >= 0) {
@@ -1950,9 +2141,9 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
             }
         }
 
-        // Wait for audio ready event (100ms timeout)
+        // Step 3: Wait for emulator response (with timeout)
         struct epoll_event events[1];
-        int nfds = epoll_wait(epoll_fd, events, 1, 100);
+        int nfds = epoll_wait(epoll_fd, events, 1, 100);  // 100ms timeout
 
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -1961,7 +2152,13 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
         }
 
         if (nfds == 0) {
-            // Timeout - check if emulator disconnected
+            // Timeout - emulator didn't respond
+            frames_timeout++;
+            if (g_debug_audio && frames_timeout <= 10) {
+                fprintf(stderr, "Audio: Timeout waiting for response (request #%lu)\n", frames_requested);
+            }
+
+            // Check if emulator disconnected
             if (current_eventfd >= 0 && g_audio_ready_eventfd < 0) {
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
                 current_eventfd = -1;
@@ -1969,10 +2166,17 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
                     fprintf(stderr, "Audio: Emulator disconnected\n");
                 }
             }
+
+            // Maintain timing even on timeout
+            auto elapsed = std::chrono::steady_clock::now() - frame_start;
+            auto remaining = frame_duration - elapsed;
+            if (remaining > std::chrono::milliseconds(0)) {
+                std::this_thread::sleep_for(remaining);
+            }
             continue;
         }
 
-        // Audio ready event received
+        // Step 4: Read eventfd (audio ready)
         uint64_t event_count;
         if (read(g_audio_ready_eventfd, &event_count, sizeof(event_count)) != sizeof(event_count)) {
             if (g_debug_audio) {
@@ -1981,41 +2185,120 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
             continue;
         }
 
-        if (!g_video_shm) continue;
+        frames_received++;
 
-        // Read audio buffer index (plain field, synchronized by eventfd)
-        int ready_index = g_video_shm->audio_ready_index;
-        if (ready_index < 0 || ready_index >= MACEMU_AUDIO_NUM_BUFFERS) continue;
+        // Step 5: Read audio from SHM ring buffer (zero-copy)
+        // Cache SHM pointer locally to avoid race conditions with disconnect
+        MacEmuIPCBuffer* shm = g_ipc_shm;
+        if (!shm) continue;
 
-        // Get audio format (dynamic per-frame like video width/height)
-        int audio_format = g_video_shm->audio_format;
-        if (audio_format == MACEMU_AUDIO_FORMAT_NONE) continue;
+        // Read exactly 960 samples from ring buffer
+        const int requested_samples = 960;
+        const int channels = 2;  // Stereo
+        const int bytes_per_sample = 2;  // S16
+        const int requested_bytes = requested_samples * channels * bytes_per_sample;  // 3840 bytes
 
-        // Read audio metadata (all synchronized by eventfd read above)
-        int sample_rate = g_video_shm->audio_sample_rate;
-        int channels = g_video_shm->audio_channels;
-        int samples = g_video_shm->audio_samples_in_frame;
+        // Read ring buffer indices atomically
+        uint32_t write_pos = ATOMIC_LOAD(shm->audio_ring_write_pos);
+        uint32_t read_pos = ATOMIC_LOAD(shm->audio_ring_read_pos);
+        uint32_t ring_size = shm->audio_ring_size;
 
-        if (samples <= 0 || samples > MACEMU_AUDIO_MAX_SAMPLES_PER_FRAME) {
+        if (ring_size == 0) {
+            if (g_debug_audio && frames_received <= 5) {
+                fprintf(stderr, "Audio: Ring buffer not initialized yet\n");
+            }
             continue;
         }
 
-        // Get pointer to ready audio frame
-        const uint8_t* audio_data = macemu_get_ready_audio(g_video_shm);
+        // Calculate available data
+        uint32_t available = (write_pos >= read_pos) ?
+            (write_pos - read_pos) :
+            (ring_size - read_pos + write_pos);
 
-        // Calculate input size in bytes (16-bit PCM)
-        int bytes_per_sample = 2 * channels;  // S16 = 2 bytes per sample
-        int input_size = samples * bytes_per_sample;
+        // Read data from ring buffer (handle wrap-around and partial reads)
+        uint8_t audio_buffer[requested_bytes];
+
+        if (available < (uint32_t)requested_bytes) {
+            // Partial or complete underrun - read what we have, pad with silence
+            if (available > 0) {
+                // Read partial data from ring buffer
+                uint32_t first_chunk = std::min(available, ring_size - read_pos);
+                memcpy(audio_buffer, &shm->audio_ring_buffer[read_pos], first_chunk);
+
+                if (first_chunk < available) {
+                    // Wrap around to beginning
+                    memcpy(audio_buffer + first_chunk, &shm->audio_ring_buffer[0],
+                           available - first_chunk);
+                }
+
+                // Pad remainder with silence
+                uint32_t silence_bytes = requested_bytes - available;
+                memset(audio_buffer + available, 0, silence_bytes);
+
+                // Advance read position by what we consumed
+                // Do this AFTER padding so if emulator disconnects mid-operation, we don't crash
+                read_pos = (read_pos + available) % ring_size;
+                // Use cached shm pointer - g_ipc_shm might have been cleared by disconnect
+                ATOMIC_STORE(shm->audio_ring_read_pos, read_pos);
+
+                if (g_debug_audio && frames_received <= 10) {
+                    fprintf(stderr, "Audio: Partial read - got %u bytes, padded %u bytes silence\n",
+                        available, silence_bytes);
+                }
+            } else {
+                // Complete underrun - no data available, send full silence
+                memset(audio_buffer, 0, requested_bytes);
+                if (g_debug_audio && frames_received <= 10) {
+                    fprintf(stderr, "Audio: Complete underrun - sending %d bytes silence\n",
+                        requested_bytes);
+                }
+            }
+        } else {
+            // Normal case - enough data available, read full frame
+            uint32_t first_chunk = std::min((uint32_t)requested_bytes, ring_size - read_pos);
+            memcpy(audio_buffer, &shm->audio_ring_buffer[read_pos], first_chunk);
+
+            if (first_chunk < (uint32_t)requested_bytes) {
+                // Wrap around to beginning
+                memcpy(audio_buffer + first_chunk, &shm->audio_ring_buffer[0],
+                       requested_bytes - first_chunk);
+            }
+
+            // Advance read position atomically
+            read_pos = (read_pos + requested_bytes) % ring_size;
+            // Use cached shm pointer - g_ipc_shm might have been cleared by disconnect
+            ATOMIC_STORE(shm->audio_ring_read_pos, read_pos);
+        }
+
+        // Convert from big-endian (Mac S16MSB) to little-endian (host/Opus expects S16LE)
+        // Use safer byte swap with proper types
+        int16_t* samples_ptr = reinterpret_cast<int16_t*>(audio_buffer);
+        int total_samples = requested_bytes / sizeof(int16_t);
+        for (int i = 0; i < total_samples; i++) {
+            uint16_t val = static_cast<uint16_t>(samples_ptr[i]);
+            samples_ptr[i] = static_cast<int16_t>((val >> 8) | (val << 8));
+        }
+
+        if (g_debug_audio && frames_received <= 20) {
+            fprintf(stderr, "Audio: Read %d bytes from ring buffer (available was %u), byte-swapped\n",
+                requested_bytes, available);
+        }
+
+        // Use the byte-swapped data from buffer
+        const uint8_t* audio_data = audio_buffer;
+        int sample_rate = 48000;  // Fixed for now
+        int samples = requested_samples;
+        int input_size = requested_bytes;
 
         if (input_size > MACEMU_AUDIO_MAX_FRAME_SIZE) {
             input_size = MACEMU_AUDIO_MAX_FRAME_SIZE;
         }
 
-        // Encode to Opus (handles dynamic sample rate/channel changes)
+        // Step 6: Encode to Opus
         if (g_audio_encoder) {
-            if (g_debug_audio) {
-                fprintf(stderr, "Audio: Processing frame: %d samples @ %dHz, %dch, %d bytes PCM\n",
-                        samples, sample_rate, channels, input_size);
+            if (g_debug_audio && frames_received <= 10) {
+                fprintf(stderr, "Audio: Processing frame #%lu: %d samples @ %dHz, %dch, %d bytes PCM\n",
+                        frames_received, samples, sample_rate, channels, input_size);
             }
 
             std::vector<uint8_t> opus_data = g_audio_encoder->encode_dynamic(
@@ -2025,12 +2308,26 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
                 channels
             );
 
+            // Step 7: Send to peers
             if (!opus_data.empty()) {
-                if (g_debug_audio) {
+                if (g_debug_audio && frames_received <= 10) {
                     fprintf(stderr, "Audio: Encoded to Opus: %zu bytes\n", opus_data.size());
                 }
                 webrtc.send_audio_to_all_peers(opus_data);
             }
+        }
+
+        // Step 8: Maintain frame timing (sleep remainder of 20ms)
+        auto elapsed = std::chrono::steady_clock::now() - frame_start;
+        auto remaining = frame_duration - elapsed;
+        if (remaining > std::chrono::milliseconds(0)) {
+            std::this_thread::sleep_for(remaining);
+        }
+
+        // Periodic stats
+        if (g_debug_audio && frames_received > 0 && frames_received % 100 == 0) {
+            fprintf(stderr, "Audio: Stats - requested=%lu received=%lu timeout=%lu\n",
+                    frames_requested, frames_received, frames_timeout);
         }
     }
 
@@ -2040,7 +2337,8 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
     }
 
     if (g_debug_audio) {
-        fprintf(stderr, "Audio: Exiting audio processing loop\n");
+        fprintf(stderr, "Audio: Exiting audio processing loop (requested=%lu, received=%lu, timeout=%lu)\n",
+                frames_requested, frames_received, frames_timeout);
     }
 }
 
@@ -2071,8 +2369,9 @@ int main(int argc, char* argv[]) {
     g_config.parse_command_line(argc, argv);
     g_config.load_from_env();
 
-    // Sync g_debug_mode_switch (needed by encoders)
+    // Sync debug flags (needed by encoders)
     g_debug_mode_switch = g_config.debug_mode_switch;
+    g_debug_png = g_config.debug_png;
 
     // Set MACEMU_DEBUG_AUDIO environment variable if --debug-audio enabled
     // This will be inherited by the emulator process
@@ -2080,10 +2379,23 @@ int main(int argc, char* argv[]) {
         setenv("MACEMU_DEBUG_AUDIO", "1", 1);
     }
 
-    // Set up signal handlers
+    // Set up signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    // Set up crash handlers with full context
+    struct sigaction sa_crash;
+    memset(&sa_crash, 0, sizeof(sa_crash));
+    sa_crash.sa_sigaction = crash_handler;
+    sa_crash.sa_flags = SA_SIGINFO | SA_RESETHAND;  // Get siginfo_t, reset after first call
+    sigemptyset(&sa_crash.sa_mask);
+
+    sigaction(SIGSEGV, &sa_crash, NULL);  // Segmentation fault
+    sigaction(SIGBUS, &sa_crash, NULL);   // Bus error
+    sigaction(SIGABRT, &sa_crash, NULL);  // Abort
+    sigaction(SIGILL, &sa_crash, NULL);   // Illegal instruction
+    sigaction(SIGFPE, &sa_crash, NULL);   // Floating point exception
 
     // Create minimal prefs file if it doesn't exist (for cold boot)
     create_minimal_prefs_if_needed();

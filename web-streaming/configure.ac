@@ -90,7 +90,7 @@ dnl Check for libdatachannel (hard requirement - user must build it)
 LIBDATACHANNEL_DIR="libdatachannel"
 LIBDATACHANNEL_BUILD="${LIBDATACHANNEL_DIR}/build"
 LIBDATACHANNEL_LIB="${LIBDATACHANNEL_BUILD}/libdatachannel.a"
-LIBDATACHANNEL_INCLUDES="-I${LIBDATACHANNEL_DIR}/include"
+LIBDATACHANNEL_INCLUDES="-I${LIBDATACHANNEL_DIR}/include -I${LIBDATACHANNEL_DIR}/deps/json/include -Iserver"
 
 AC_MSG_CHECKING([for libdatachannel])
 if test -f "$LIBDATACHANNEL_LIB"; then
@@ -124,8 +124,8 @@ LIBJUICE="${LIBDATACHANNEL_BUILD}/deps/libjuice/libjuice.a"
 LIBSRTP="${LIBDATACHANNEL_BUILD}/deps/libsrtp/libsrtp2.a"
 USRSCTP="${LIBDATACHANNEL_BUILD}/deps/usrsctp/usrsctplib/libusrsctp.a"
 
-dnl Compiler flags
-CXXFLAGS="$CXXFLAGS -Wall -Wextra -O2 -g -fPIC"
+dnl Compiler flags for debugging (full debug symbols, no optimization)
+CXXFLAGS="$CXXFLAGS -Wall -Wextra -g3 -O0 -fPIC -fno-omit-frame-pointer -rdynamic"
 
 dnl fpng flags (SSE4.1 and pclmul for fast CRC32)
 FPNG_CFLAGS="-msse4.1 -mpclmul"

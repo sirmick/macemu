@@ -210,12 +210,24 @@ typedef struct {
     uint64_t audio_timestamp_us;     // Timestamp of last audio frame
 
     int32_t audio_ready_eventfd;     // Separate eventfd for audio frames (-1 if not supported)
-    uint32_t _audio_padding[3];      // Future expansion, alignment
 
-    // Audio buffers (fixed size for max format: 48kHz stereo)
-    // Actual usage varies: 11025 Hz mono uses ~440 bytes, 48000 Hz stereo uses ~3840 bytes
-    // Total: 3840 × 2 = 7680 bytes (~7.5 KB, 0.03% of total SHM)
+    // Audio ring buffer (zero-copy, pull model)
+    // Emulator writes Mac audio chunks (typically 4096 samples) to ring buffer
+    // Server reads exactly requested samples (typically 960 for 20ms Opus frames)
+    // Size: 2 seconds @ 48kHz stereo S16 = 384,000 bytes
+    ATOMIC_UINT32 audio_ring_write_pos;  // Write position (emulator advances)
+    ATOMIC_UINT32 audio_ring_read_pos;   // Read position (server advances)
+    uint32_t audio_ring_size;            // Total ring buffer size (constant)
+    uint32_t _audio_ring_padding;        // Alignment
+
+    // Audio buffers (DEPRECATED - kept for backwards compatibility, may be removed)
+    // Ring buffer below is now used for zero-copy audio transfer
     uint8_t audio_frames[MACEMU_AUDIO_NUM_BUFFERS][MACEMU_AUDIO_MAX_FRAME_SIZE];
+
+    // Audio ring buffer data (2 seconds @ 48kHz stereo S16)
+    // This is the actual circular buffer - emulator writes, server reads via indices above
+    #define MACEMU_AUDIO_RING_SIZE (48000 * 2 * 2 * 2)  // 384,000 bytes
+    uint8_t audio_ring_buffer[MACEMU_AUDIO_RING_SIZE];
 
     // BGRA frame buffers - fixed size for max resolution
     // Each frame: width * height * 4 bytes (B, G, R, A per pixel)
@@ -419,7 +431,13 @@ static inline void macemu_init_ipc_buffer(MacEmuIPCBuffer* buf, uint32_t pid,
         fprintf(stderr, "IPC: WARNING: Failed to create audio eventfd: %s (audio disabled)\n", strerror(errno));
     }
 
-    // Zero audio buffers
+    // Initialize audio ring buffer (zero-copy architecture)
+    buf->audio_ring_size = MACEMU_AUDIO_RING_SIZE;
+    ATOMIC_STORE(buf->audio_ring_write_pos, 0);
+    ATOMIC_STORE(buf->audio_ring_read_pos, 0);
+    memset(buf->audio_ring_buffer, 0, MACEMU_AUDIO_RING_SIZE);
+
+    // Zero legacy audio buffers (deprecated, kept for compatibility)
     memset(buf->audio_frames, 0, sizeof(buf->audio_frames));
 }
 

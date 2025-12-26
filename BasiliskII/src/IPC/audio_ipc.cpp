@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -60,24 +61,24 @@ extern MacEmuIPCBuffer* IPC_GetVideoSHM();
 #define DEBUG 0
 #include "debug.h"
 
-// Audio buffer for mixing/conversion before writing to SHM
+// Audio buffer for mixing/conversion before writing to SHM ring buffer
 static uint8_t* audio_mix_buffer = nullptr;
 static size_t audio_mix_buffer_size = 0;
 
-// Streaming thread (C++11 style, consistent with video_ipc.cpp)
-static std::thread audio_thread;
-static std::atomic<bool> audio_thread_running(false);
-static std::atomic<bool> audio_thread_cancel(false);
+// Ring buffer is now in SHM (MacEmuIPCBuffer::audio_ring_buffer)
+// Indices are atomic fields in SHM (audio_ring_write_pos, audio_ring_read_pos)
+// No local copy needed - zero-copy architecture!
 
-// Synchronization for AudioInterrupt
+// No dedicated audio thread - audio processing happens inline when server requests data
+// This matches the autonomous ring buffer model:
+// - Mac side: Fills ring buffer with 4096 samples per interrupt (~85 Hz)
+// - Server side: Pulls 960 samples when needed (50 Hz)
+// - Ring buffer decouples the timing
+
+// Synchronization for AudioInterrupt (Mac emulation thread → control socket thread)
 static std::mutex audio_irq_mutex;
 static std::condition_variable audio_irq_done_cv;
 static bool audio_irq_done = false;
-
-// Wake-up mechanism for audio thread (triggered by server AUDIO_REQUEST)
-static std::mutex audio_request_mutex;
-static std::condition_variable audio_request_cv;
-static bool audio_requested = false;
 
 // Timing for 20ms audio frames
 static auto last_audio_frame_time = std::chrono::steady_clock::now();
@@ -90,8 +91,7 @@ static uint64_t last_log_frame = 0;
 static bool g_debug_audio = false;
 
 // Forward declarations
-static void write_audio_to_shm(const uint8_t* data, size_t len);
-static void audio_thread_func();
+static void ring_buffer_write(const uint8_t* data, size_t len);
 
 
 /*
@@ -154,17 +154,6 @@ void AudioInit(void)
 	// Mark audio as available
 	audio_open = true;
 
-	// Start streaming thread immediately (runs continuously, checks num_sources each loop)
-	// This avoids thread start/stop overhead for brief sounds
-	// Using std::thread for consistency with video_ipc.cpp
-	audio_thread_cancel = false;
-	audio_thread = std::thread(audio_thread_func);
-	audio_thread_running = true;
-
-	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Streaming thread started\n");
-	}
-
 	fprintf(stderr, "Audio IPC: Initialized and READY (buffer size: %zu bytes, frames per block: %d, sample rates: 11025-48000 Hz)\n",
 	        audio_mix_buffer_size, audio_frames_per_block);
 	D(bug("Audio IPC: Initialized (buffer size: %zu bytes, frames: %d)\n", audio_mix_buffer_size, audio_frames_per_block));
@@ -177,23 +166,7 @@ void AudioInit(void)
 
 void AudioExit(void)
 {
-	// Stop streaming thread if active
-	if (audio_thread_running) {
-		audio_thread_cancel = true;
-
-		// Wake up thread if it's sleeping
-		audio_wakeup_cv.notify_one();
-
-		// Wait for thread to finish
-		if (audio_thread.joinable()) {
-			audio_thread.join();
-		}
-
-		audio_thread_running = false;
-		if (g_debug_audio) {
-			fprintf(stderr, "Audio IPC: Streaming thread stopped\n");
-		}
-	}
+	// No thread to stop - audio processing is inline now
 
 	if (audio_mix_buffer) {
 		free(audio_mix_buffer);
@@ -211,8 +184,9 @@ void AudioExit(void)
 
 void audio_enter_stream()
 {
-	// ALWAYS log this - it's critical for debugging
-	fprintf(stderr, "Audio IPC: *** STREAM STARTED *** (num_sources 0→1)\n");
+	if (g_debug_audio) {
+		fprintf(stderr, "Audio IPC: Stream started (num_sources 0→1)\n");
+	}
 	D(bug("Audio IPC: Stream started\n"));
 	last_audio_frame_time = std::chrono::steady_clock::now();
 }
@@ -220,16 +194,113 @@ void audio_enter_stream()
 /*
  *  Server requested audio data (pull model)
  *  Called from control socket thread when AUDIO_REQUEST message arrives
+ *
+ *  This function runs inline in the control socket thread - no dedicated audio thread needed.
+ *  The autonomous ring buffer model:
+ *  - This function triggers Mac interrupt and gets 4096 samples
+ *  - Writes to ring buffer
+ *  - Signals server via eventfd
+ *  - Returns to epoll_wait
+ *  - Server pulls 960 samples as needed from ring buffer
  */
 
 void audio_request_data()
 {
-	std::lock_guard<std::mutex> lock(audio_request_mutex);
-	audio_requested = true;
-	audio_request_cv.notify_one();
+	static int request_count = 0;
+	request_count++;
 
-	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Server requested audio data\n");
+	// If no audio sources active, signal server immediately (will send silence via DTX)
+	if (!AudioStatus.num_sources) {
+		MacEmuIPCBuffer* shm = IPC_GetVideoSHM();
+		if (shm && shm->audio_ready_eventfd >= 0) {
+			uint64_t val = 1;
+			write(shm->audio_ready_eventfd, &val, sizeof(val));
+		}
+		return;
+	}
+
+	// Trigger Mac audio interrupt to get fresh data
+	SetInterruptFlag(INTFLAG_AUDIO);
+	TriggerInterrupt();
+
+	// Wait for Mac to fill audio data (blocks until AudioInterrupt() completes)
+	{
+		std::unique_lock<std::mutex> lock(audio_irq_mutex);
+		audio_irq_done_cv.wait(lock, []{ return audio_irq_done; });
+		audio_irq_done = false;
+	}
+
+	// Read Mac's audio data and write to ring buffer
+	MacEmuIPCBuffer* shm = IPC_GetVideoSHM();
+	if (!shm || !audio_data) {
+		// SHM or audio_data invalid - signal anyway so server doesn't timeout
+		if (shm && shm->audio_ready_eventfd >= 0) {
+			uint64_t val = 1;
+			write(shm->audio_ready_eventfd, &val, sizeof(val));
+		}
+		return;
+	}
+
+	uint32 apple_stream_info = ReadMacInt32(audio_data + adatStreamInfo);
+	if (!apple_stream_info) {
+		// No stream info - signal server anyway
+		if (shm->audio_ready_eventfd >= 0) {
+			uint64_t val = 1;
+			write(shm->audio_ready_eventfd, &val, sizeof(val));
+		}
+		return;
+	}
+
+	uint32 sample_count = ReadMacInt32(apple_stream_info + scd_sampleCount);
+	uint32 buffer_ptr = ReadMacInt32(apple_stream_info + scd_buffer);
+	uint32 num_channels = ReadMacInt16(apple_stream_info + scd_numChannels);
+	uint32 sample_size = ReadMacInt16(apple_stream_info + scd_sampleSize);
+
+	if (g_debug_audio && request_count <= 10) {
+		fprintf(stderr, "Audio IPC: Request #%d: Got %u samples from Mac\n",
+			request_count, sample_count);
+	}
+
+	if (sample_count > 0 && buffer_ptr != 0) {
+		// Process audio data
+		uint32 bytes_per_sample = (sample_size >> 3);
+		size_t data_len = sample_count * bytes_per_sample * num_channels;
+
+		if (data_len > audio_mix_buffer_size) {
+			data_len = audio_mix_buffer_size;
+			sample_count = data_len / (bytes_per_sample * num_channels);
+		}
+
+		uint8_t* src = Mac2HostAddr(buffer_ptr);
+
+		if (sample_size == 8) {
+			// Convert U8 to S16
+			uint8_t* src_u8 = src;
+			int16_t* dst_s16 = (int16_t*)audio_mix_buffer;
+			for (uint32 i = 0; i < sample_count * num_channels; i++) {
+				dst_s16[i] = ((int16_t)src_u8[i] - 128) << 8;
+			}
+			data_len = sample_count * num_channels * 2;
+		} else {
+			// S16 data - direct copy (Mac provides S16MSB format)
+			memcpy(audio_mix_buffer, src, data_len);
+		}
+
+		// Write to ring buffer
+		if (g_debug_audio && request_count <= 10) {
+			fprintf(stderr, "Audio IPC: Writing %zu bytes to ring buffer (%u samples)\n",
+				data_len, sample_count);
+		}
+		ring_buffer_write(audio_mix_buffer, data_len);
+	}
+
+	// Signal server that data is ready (or that we responded to the request)
+	if (shm->audio_ready_eventfd >= 0) {
+		uint64_t val = 1;
+		ssize_t written = write(shm->audio_ready_eventfd, &val, sizeof(val));
+		if (written != sizeof(val) && g_debug_audio) {
+			fprintf(stderr, "Audio IPC: Warning - eventfd write failed: %s\n", strerror(errno));
+		}
 	}
 }
 
@@ -241,8 +312,9 @@ void audio_request_data()
 
 void audio_exit_stream()
 {
-	// ALWAYS log this - it's critical for debugging
-	fprintf(stderr, "Audio IPC: *** STREAM STOPPED *** (num_sources 1→0)\n");
+	if (g_debug_audio) {
+		fprintf(stderr, "Audio IPC: Stream stopped (num_sources 1→0)\n");
+	}
 	D(bug("Audio IPC: Stream stopped\n"));
 
 	// Thread continues running, will automatically stop processing
@@ -276,7 +348,12 @@ void AudioInterrupt(void)
 
 	// Call GetSourceData to fill apple_stream_info (like SDL does)
 	// This tells the Apple Mixer to prepare audio data for us to read
-	if (AudioStatus.mixer) {
+	if (!audio_data) {
+		// Audio component has been closed, audio_data freed
+		if (g_debug_audio) {
+			fprintf(stderr, "Audio IPC: AudioInterrupt - audio_data is NULL, component closed\n");
+		}
+	} else if (AudioStatus.mixer) {
 		M68kRegisters r;
 		r.a[0] = audio_data + adatStreamInfo;
 		r.a[1] = AudioStatus.mixer;
@@ -292,6 +369,108 @@ void AudioInterrupt(void)
 		audio_irq_done = true;
 	}
 	audio_irq_done_cv.notify_one();
+}
+
+
+/*
+ *  Ring buffer functions for audio buffering
+ */
+
+// Write data to ring buffer in SHM (called by AudioInterrupt with Mac's audio data)
+// Zero-copy: writes directly to SHM ring buffer, advances write index
+static void ring_buffer_write(const uint8_t* data, size_t len)
+{
+	MacEmuIPCBuffer* shm = IPC_GetVideoSHM();
+	if (!shm) return;
+
+	// Read current positions atomically
+	uint32_t write_pos = ATOMIC_LOAD(shm->audio_ring_write_pos);
+	uint32_t read_pos = ATOMIC_LOAD(shm->audio_ring_read_pos);
+	uint32_t ring_size = shm->audio_ring_size;
+
+	// Calculate available space
+	uint32_t available = (read_pos > write_pos) ?
+		(read_pos - write_pos - 1) :
+		(ring_size - write_pos + read_pos - 1);
+
+	if (len > available) {
+		if (g_debug_audio) {
+			fprintf(stderr, "Audio IPC: Ring buffer full! Dropping %zu bytes (available %u)\n",
+				len - available, available);
+		}
+		len = available;  // Drop excess data
+	}
+
+	// Write data directly to SHM ring buffer (handle wrap-around)
+	size_t first_chunk = std::min(len, (size_t)(ring_size - write_pos));
+	memcpy(&shm->audio_ring_buffer[write_pos], data, first_chunk);
+
+	if (first_chunk < len) {
+		// Wrap around to beginning
+		memcpy(&shm->audio_ring_buffer[0], data + first_chunk, len - first_chunk);
+	}
+
+	// Advance write position atomically (release semantics - publishes data writes)
+	write_pos = (write_pos + len) % ring_size;
+	ATOMIC_STORE(shm->audio_ring_write_pos, write_pos);
+}
+
+// Get pointer and size for reading from ring buffer (zero-copy)
+// Server calls this to get direct pointer into SHM ring buffer
+// Returns bytes available (may be less than requested if underrun)
+// NOTE: This is for emulator use only - server has its own implementation
+static size_t ring_buffer_get_read_info(uint8_t** out_ptr1, size_t* out_size1,
+                                         uint8_t** out_ptr2, size_t* out_size2,
+                                         size_t requested_len)
+{
+	MacEmuIPCBuffer* shm = IPC_GetVideoSHM();
+	if (!shm) return 0;
+
+	uint32_t write_pos = ATOMIC_LOAD(shm->audio_ring_write_pos);
+	uint32_t read_pos = ATOMIC_LOAD(shm->audio_ring_read_pos);
+	uint32_t ring_size = shm->audio_ring_size;
+
+	// Calculate available data
+	uint32_t available = (write_pos >= read_pos) ?
+		(write_pos - read_pos) :
+		(ring_size - read_pos + write_pos);
+
+	if (requested_len > available) {
+		if (g_debug_audio) {
+			static int underrun_count = 0;
+			if (++underrun_count <= 10 || underrun_count % 100 == 0) {
+				fprintf(stderr, "Audio IPC: Ring buffer underrun! Requested %zu, available %u (count=%d)\n",
+					requested_len, available, underrun_count);
+			}
+		}
+		requested_len = available;
+	}
+
+	// Return pointers (may need two chunks if wrapping)
+	size_t first_chunk = std::min(requested_len, (size_t)(ring_size - read_pos));
+	*out_ptr1 = &shm->audio_ring_buffer[read_pos];
+	*out_size1 = first_chunk;
+
+	if (first_chunk < requested_len) {
+		*out_ptr2 = &shm->audio_ring_buffer[0];
+		*out_size2 = requested_len - first_chunk;
+	} else {
+		*out_ptr2 = nullptr;
+		*out_size2 = 0;
+	}
+
+	return requested_len;
+}
+
+// Advance read position after consuming data (called by emulator audio thread)
+static void ring_buffer_advance_read(size_t len)
+{
+	MacEmuIPCBuffer* shm = IPC_GetVideoSHM();
+	if (!shm) return;
+
+	uint32_t read_pos = ATOMIC_LOAD(shm->audio_ring_read_pos);
+	read_pos = (read_pos + len) % shm->audio_ring_size;
+	ATOMIC_STORE(shm->audio_ring_read_pos, read_pos);
 }
 
 
@@ -418,163 +597,6 @@ bool audio_set_channels(int index)
 }
 
 
-/*
- *  Audio streaming thread - PULL MODEL (server-driven)
- *  Waits for server AUDIO_REQUEST messages, then triggers interrupt
- *  This matches SDL's callback architecture for perfect timing sync
- */
-
-static void audio_thread_func()
-{
-	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Streaming thread running (PULL MODEL - server-driven)\n");
-	}
-
-	int loop_count = 0;
-	int zero_sources_count = 0;
-	int no_data_count = 0;
-
-	while (!audio_thread_cancel) {
-		// Wait for server to request audio data (blocks until AUDIO_REQUEST arrives)
-		{
-			std::unique_lock<std::mutex> lock(audio_request_mutex);
-			audio_request_cv.wait(lock, []{ return audio_requested || audio_thread_cancel; });
-
-			if (audio_thread_cancel) break;
-
-			audio_requested = false;  // Reset for next request
-		}
-
-		if (AudioStatus.num_sources) {
-			// Trigger audio interrupt to signal Mac we're ready for data
-			loop_count++;
-			if (g_debug_audio && loop_count == 1) {
-				fprintf(stderr, "Audio IPC: Thread FIRST LOOP with num_sources=%d\n", AudioStatus.num_sources);
-			}
-			if (g_debug_audio && loop_count % 50 == 0) {  // Log every ~1 second
-				fprintf(stderr, "Audio IPC: Thread active (num_sources=%d, loop=%d)\n",
-				        AudioStatus.num_sources, loop_count);
-			}
-			D(bug("Audio IPC: Triggering audio interrupt\n"));
-			if (g_debug_audio && loop_count <= 10) {
-				fprintf(stderr, "Audio IPC: About to trigger interrupt (loop=%d)\n", loop_count);
-			}
-			SetInterruptFlag(INTFLAG_AUDIO);
-			TriggerInterrupt();
-
-			// Wait for AudioInterrupt() to complete
-			D(bug("Audio IPC: Waiting for interrupt completion\n"));
-			if (g_debug_audio && loop_count <= 10) {
-				fprintf(stderr, "Audio IPC: Waiting for AudioInterrupt() to complete...\n");
-			}
-			{
-				std::unique_lock<std::mutex> lock(audio_irq_mutex);
-				audio_irq_done_cv.wait(lock, []{ return audio_irq_done; });
-				audio_irq_done = false;  // Reset for next iteration
-			}
-			D(bug("Audio IPC: Interrupt complete\n"));
-			if (g_debug_audio && loop_count <= 10) {
-				fprintf(stderr, "Audio IPC: AudioInterrupt() completed, now reading data\n");
-			}
-
-			// Now read the audio data (like OSS/SDL do)
-			MacEmuIPCBuffer* video_shm = IPC_GetVideoSHM();
-			if (g_debug_audio && loop_count <= 10) {
-				fprintf(stderr, "Audio IPC: video_shm=%p\n", (void*)video_shm);
-			}
-			if (video_shm) {
-				uint32 apple_stream_info = ReadMacInt32(audio_data + adatStreamInfo);
-
-				// Debug: log first time and periodically if debug enabled
-				static int read_count = 0;
-				read_count++;
-				if (g_debug_audio && (read_count <= 20 || read_count % 100 == 0)) {
-					fprintf(stderr, "Audio IPC: Reading stream (count=%d, stream_info=0x%x, audio_data=0x%x)\n",
-					        read_count, apple_stream_info, audio_data);
-				}
-
-				if (apple_stream_info) {
-					uint32 sample_count = ReadMacInt32(apple_stream_info + scd_sampleCount);
-					uint32 buffer_ptr = ReadMacInt32(apple_stream_info + scd_buffer);
-					uint32 num_channels = ReadMacInt16(apple_stream_info + scd_numChannels);
-					uint32 sample_size = ReadMacInt16(apple_stream_info + scd_sampleSize);
-					uint32 sample_rate = ReadMacInt32(apple_stream_info + scd_sampleRate);
-
-					// Debug: log what we got
-					if (g_debug_audio && (read_count <= 20 || read_count % 100 == 0)) {
-						fprintf(stderr, "Audio IPC: Got sample_count=%u, buffer_ptr=0x%x, channels=%u, size=%u, rate=%u\n",
-						        sample_count, buffer_ptr, num_channels, sample_size, sample_rate >> 16);
-					}
-
-					if (sample_count > 0 && buffer_ptr != 0) {
-						// We have data! Process it
-						uint32 sample_size = AudioStatus.sample_size;
-						uint32 channels = AudioStatus.channels;
-						uint32 bytes_per_sample = (sample_size >> 3);
-						size_t data_len = sample_count * bytes_per_sample * channels;
-
-						if (data_len > audio_mix_buffer_size) {
-							data_len = audio_mix_buffer_size;
-							sample_count = data_len / (bytes_per_sample * channels);
-						}
-
-						// Copy and convert audio data
-						uint8_t* src = Mac2HostAddr(buffer_ptr);
-
-						if (sample_size == 8) {
-							// Convert U8 to S16
-							uint8_t* src_u8 = src;
-							int16_t* dst_s16 = (int16_t*)audio_mix_buffer;
-							for (uint32 i = 0; i < sample_count * channels; i++) {
-								dst_s16[i] = ((int16_t)src_u8[i] - 128) << 8;
-							}
-							data_len = sample_count * channels * 2;
-						} else {
-							// S16 data - direct copy like SDL does (Mac provides S16MSB format)
-							// SDL uses AUDIO_S16MSB and does direct memcpy - we do the same
-							// The server/Opus encoder will handle any needed byte swapping
-							memcpy(audio_mix_buffer, src, data_len);
-						}
-
-						// Write to SHM
-						if (g_debug_audio && read_count <= 20) {
-							fprintf(stderr, "Audio IPC: Writing %zu bytes to SHM (%u samples, %u channels)\n",
-							        data_len, sample_count, channels);
-						}
-						write_audio_to_shm(audio_mix_buffer, data_len);
-						no_data_count = 0;  // Reset
-					} else {
-						// No data yet
-						no_data_count++;
-						if (g_debug_audio && no_data_count % 100 == 0) {
-							fprintf(stderr, "Audio IPC: No data available yet (%d checks, sample_count=%u, buffer_ptr=0x%x)\n",
-							        no_data_count, sample_count, buffer_ptr);
-						}
-					}
-				} else {
-					// No stream info yet
-					no_data_count++;
-					if (g_debug_audio && no_data_count % 100 == 0) {
-						fprintf(stderr, "Audio IPC: No stream info yet (%d checks)\n", no_data_count);
-					}
-				}
-			}
-		} else {
-			// No sources - still send silence or do nothing
-			zero_sources_count++;
-			if (g_debug_audio && zero_sources_count == 1) {
-				fprintf(stderr, "Audio IPC: Thread received request but num_sources=0 (audio not active)\n");
-			}
-			loop_count = 0;
-			no_data_count = 0;
-		}
-
-		// No sleep needed - we block waiting for next AUDIO_REQUEST at top of loop
-	}
-
-	if (g_debug_audio) {
-		fprintf(stderr, "Audio IPC: Streaming thread exiting\n");
-	}
-}
+// No dedicated audio thread needed - audio processing happens inline in audio_request_data()
 
 #endif // ENABLE_IPC_AUDIO

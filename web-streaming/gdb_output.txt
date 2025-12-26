@@ -1,0 +1,81 @@
+Catchpoint 1 (signal SIGSEGV)
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+
+=== macemu WebRTC Server ===
+HTTP server:      http://0.0.0.0:8000
+Signaling port:   8090
+ROMs path:        storage/roms
+Images path:      storage/images
+Prefs file:       basilisk_ii.prefs
+STUN:             disabled
+
+Emulator:
+  Auto-start:     yes
+
+Debug flags:
+  - Audio processing
+
+[New Thread 0x7ffff65ff6c0 (LWP 159447)]
+HTTP: Server on port 8000
+[New Thread 0x7ffff5dfe6c0 (LWP 159448)]
+[New Thread 0x7ffff55fd6c0 (LWP 159449)]
+[New Thread 0x7ffff4dfc6c0 (LWP 159450)]
+[New Thread 0x7ffff45fb6c0 (LWP 159451)]
+[New Thread 0x7ffff3dfa6c0 (LWP 159452)]
+[New Thread 0x7ffff35f96c0 (LWP 159453)]
+[New Thread 0x7ffff2df86c0 (LWP 159454)]
+[New Thread 0x7ffff25f76c0 (LWP 159455)]
+[New Thread 0x7ffff1df66c0 (LWP 159456)]
+[New Thread 0x7ffff15f56c0 (LWP 159457)]
+[New Thread 0x7ffff0df46c0 (LWP 159458)]
+[New Thread 0x7fffebfff6c0 (LWP 159459)]
+WebRTC: Signaling server on port 8090
+
+Open http://localhost:8000 in your browser
+[Opus] Encoder initialized: 48000Hz, 2 ch, 128000 bps, frame=960 samples
+Found emulator: /home/mick/macemu/BasiliskII/src/Unix/BasiliskII
+Emulator: Starting /home/mick/macemu/BasiliskII/src/Unix/BasiliskII --config basilisk_ii.prefs
+[Attaching after Thread 0x7ffff7d2dec0 (LWP 159444) fork to child process 159460]
+[New inferior 2 (process 159460)]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+process 159460 is executing new program: /home/mick/macemu/BasiliskII/src/Unix/BasiliskII
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff77ff6c0 (LWP 159461)]
+[New Thread 0x7ffff6ffe6c0 (LWP 159462)]
+Audio IPC: Streaming thread running (PULL MODEL - server-driven)
+Audio IPC: Streaming thread started
+Audio IPC: Initialized and READY (buffer size: 3840 bytes, frames per block: 4096, sample rates: 11025-48000 Hz)
+IPC: Initializing video driver (v3, emulator-owned resources)
+IPC: Created video SHM '/macemu-video-159460' (800x600, 24.1 MB)
+IPC: Listening for server on '/tmp/macemu-159460.sock'
+[New Thread 0x7ffff4fe26c0 (LWP 159463)]
+[New Thread 0x7ffff47e16c0 (LWP 159464)]
+IPC: Video initialized (800x600 @ 32 bpp)
+IPC: Waiting for server to connect (PID 159460)...
+[New Thread 0x7ffff3e5f6c0 (LWP 159465)]
+[New Thread 0x7ffff365e6c0 (LWP 159466)]
+Audio IPC: *** STREAM STARTED *** (num_sources 0→1)
+Audio IPC: *** STREAM STOPPED *** (num_sources 1→0)
+Audio IPC: audio_exit_stream - shm=0x7ffff4fe3000
+Audio IPC: Setting audio_format to NONE
+Audio IPC: audio_format set successfully
+Audio IPC: *** STREAM STARTED *** (num_sources 0→1)
+Audio IPC: *** STREAM STOPPED *** (num_sources 1→0)
+Audio IPC: audio_exit_stream - shm=0x7ffff4fe3000
+Audio IPC: Setting audio_format to NONE
+Audio IPC: audio_format set successfully
+Audio IPC: *** STREAM STARTED *** (num_sources 0→1)
+Audio IPC: *** STREAM STARTED *** (num_sources 0→1)
+Audio IPC: *** STREAM STOPPED *** (num_sources 1→0)
+Audio IPC: audio_exit_stream - shm=0x7ffff4fe3000
+Audio IPC: Setting audio_format to NONE
+Audio IPC: audio_format set successfully

@@ -34,7 +34,7 @@ struct APIContext {
     bool emulator_connected;
     int emulator_pid;
     int started_emulator_pid;
-    MacEmuIPCBuffer* video_shm;
+    MacEmuIPCBuffer* ipc_shm;  // Shared memory for video and audio IPC
 
     // Codec state
     CodecType* server_codec;  // Pointer to g_server_codec

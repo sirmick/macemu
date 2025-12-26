@@ -71,6 +71,9 @@
 // IPC protocol definitions
 #include "ipc_protocol.h"
 
+// Audio subsystem (for pull model requests)
+#include "audio.h"
+
 #define DEBUG 0
 #include "debug.h"
 
@@ -536,6 +539,7 @@ static void control_socket_thread() {
                         case MACEMU_INPUT_MOUSE:   msg_size = sizeof(MacEmuMouseInput); break;
                         case MACEMU_INPUT_COMMAND: msg_size = sizeof(MacEmuCommandInput); break;
                         case MACEMU_INPUT_PING:    msg_size = sizeof(MacEmuPingInput); break;
+                        case MACEMU_INPUT_AUDIO_REQUEST: msg_size = sizeof(MacEmuAudioRequestInput); break;
                         default: msg_size = sizeof(MacEmuInputHeader); break;
                     }
                     if (offset + msg_size > (size_t)n) break;

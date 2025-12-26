@@ -130,15 +130,15 @@ Response APIRouter::handle_status(const Request& req) {
     json << ", \"emulator_running\": " << (ctx_->started_emulator_pid > 0 ? "true" : "false");
     json << ", \"emulator_pid\": " << ctx_->emulator_pid;
 
-    if (ctx_->video_shm) {
-        json << ", \"video\": {\"width\": " << ctx_->video_shm->width;
-        json << ", \"height\": " << ctx_->video_shm->height;
-        json << ", \"frame_count\": " << ctx_->video_shm->frame_count;
-        json << ", \"state\": " << ctx_->video_shm->state << "}";
+    if (ctx_->ipc_shm) {
+        json << ", \"video\": {\"width\": " << ctx_->ipc_shm->width;
+        json << ", \"height\": " << ctx_->ipc_shm->height;
+        json << ", \"frame_count\": " << ctx_->ipc_shm->frame_count;
+        json << ", \"state\": " << ctx_->ipc_shm->state << "}";
 
         // Mouse latency from emulator (atomic - can be updated by stats thread)
-        uint32_t latency_x10 = ATOMIC_LOAD(ctx_->video_shm->mouse_latency_avg_ms);
-        uint32_t latency_samples = ATOMIC_LOAD(ctx_->video_shm->mouse_latency_samples);
+        uint32_t latency_x10 = ATOMIC_LOAD(ctx_->ipc_shm->mouse_latency_avg_ms);
+        uint32_t latency_samples = ATOMIC_LOAD(ctx_->ipc_shm->mouse_latency_samples);
         json << ", \"mouse_latency_ms\": " << std::fixed << std::setprecision(1) << (latency_x10 / 10.0);
         json << ", \"mouse_latency_samples\": " << latency_samples;
     }
