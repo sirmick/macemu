@@ -1,52 +1,22 @@
-# Object files
-*.o
+# Unicorn will be added as submodule in Week 1 (but not docs!)
+/unicorn/
 
-# Backups
-*~
+# QEMU is abandoned in favor of Unicorn
+/qemu/
+/qemu-cpu/
 
-# Mac OS X metadata
-*.DS_Store
-
-#
-# Xcode gitignore settings are from https://github.com/github/gitignore/blob/master/Global/Xcode.gitignore
-#
-
-## Xcode, Build generated
+# Build artifacts
 build/
-DerivedData/
+*.o
+*.a
+*.so
+*.dylib
 
-## Xcode, Various settings
-*.pbxuser
-!default.pbxuser
-*.mode1v3
-!default.mode1v3
-*.mode2v3
-!default.mode2v3
-*.perspectivev3
-!default.perspectivev3
-xcuserdata/
-xcschemes/
-project.xcworkspace/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-## Xcode, Other
-*.moved-aside
-*.xccheckout
-*.xcscmblueprint
-
-#
-# JetBrains IDE settings
-#
-*.idea
-
-#
-# Emulator runtime files
-#
+# Runtime
 .basilisk_ii_xpram
-*.xpram
-
-#
-# Web streaming runtime
-#
-web-streaming/storage/
-web-streaming/basilisk_ii.prefs
-web-streaming/BasiliskII
