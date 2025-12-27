@@ -8,10 +8,18 @@ if cpu_backend == 'unicorn' or cpu_backend == 'dualcpu'
   cpu_deps += unicorn_dep
 endif
 
+if cpu_backend == 'uae' or cpu_backend == 'dualcpu'
+  # Build UAE CPU
+  subdir('uae_cpu')
+  cpu_sources += [
+    'uae_wrapper.cpp',
+  ]
+  cpu_deps += uae_dep
+endif
+
 if cpu_backend == 'dualcpu'
   cpu_sources += [
     'dualcpu.c',
-    'uae_stubs.c',  # Placeholder until UAE is integrated
   ]
 endif
 

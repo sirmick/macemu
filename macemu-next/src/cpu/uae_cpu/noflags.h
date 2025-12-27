@@ -132,11 +132,11 @@ static __inline__ void SET_CFLG_ALWAYS(uae_u32 x)
 #define optflag_subw(v, s, d) (v = (uae_s16)(d) - (uae_s16)(s))
 #define optflag_subb(v, s, d) (v = (uae_s8)(d) - (uae_s8)(s))
 
-#if NOFLAGS_CMP
-/* These are just for completeness sake */
+/* Define CMP optflags as no-ops for noflags version
+ * Note: This may break CAS/CAS2 instructions, but we're not using those yet
+ */
 #define optflag_cmpl(s, d) do { } while (0)
 #define optflag_cmpw(s, d) do { } while (0)
 #define optflag_cmpb(s, d) do { } while (0)
-#endif
 
 #endif
