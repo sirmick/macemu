@@ -1,0 +1,30 @@
+option('cpu_backend',
+  type: 'combo',
+  choices: ['unicorn', 'uae', 'dualcpu'],
+  value: 'unicorn',
+  description: 'CPU emulation backend'
+)
+
+option('basilisk',
+  type: 'boolean',
+  value: true,
+  description: 'Build BasiliskII'
+)
+
+option('sheepshaver',
+  type: 'boolean',
+  value: false,
+  description: 'Build SheepShaver'
+)
+
+option('tests',
+  type: 'boolean',
+  value: true,
+  description: 'Build test suite'
+)
+
+option('ipc_only',
+  type: 'boolean',
+  value: true,
+  description: 'Use IPC drivers only (no in-process devices)'
+)
