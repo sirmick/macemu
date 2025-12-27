@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "audio_config.h"
 #include <cerrno>
 #include <atomic>
 #include <chrono>
@@ -111,10 +112,12 @@ void AudioInit(void)
 	// Read debug flag once at startup
 	g_debug_audio = (getenv("MACEMU_DEBUG_AUDIO") != nullptr);
 
-	// Init audio status and feature flags
-	AudioStatus.sample_rate = 44100 << 16;  // Default 44.1kHz (Mac format: upper 16 bits = integer part)
-	AudioStatus.sample_size = 16;            // 16-bit samples
-	AudioStatus.channels = 2;                // Stereo
+	// Init audio status and feature flags using centralized audio_config.h constants
+	// Mac will calculate frame size: sample_rate * frame_duration_ms / 1000
+	// Example: 48000 * 20ms / 1000 = 960 samples (perfect for Opus)
+	AudioStatus.sample_rate = AUDIO_SAMPLE_RATE << 16;  // Mac format: upper 16 bits = integer part
+	AudioStatus.sample_size = AUDIO_SAMPLE_SIZE;
+	AudioStatus.channels = AUDIO_CHANNELS;
 	AudioStatus.mixer = 0;
 	AudioStatus.num_sources = 0;
 	audio_component_flags = cmpWantsRegisterMessage | kStereoOut | k16BitOut;
@@ -335,6 +338,57 @@ static void audio_thread_func()
 							}
 
 							uint8_t* src = Mac2HostAddr(buffer_ptr);
+
+							// AUDIO DEBUG: Capture raw Mac audio data
+							// Only capture non-silent frames (skip silence between sounds)
+							static FILE* capture_file = nullptr;
+							static int frames_captured = 0;
+							static int silent_frames = 0;
+
+							if (frames_captured < AUDIO_MAX_CAPTURE_FRAMES && getenv("MACEMU_AUDIO_CAPTURE")) {
+								// Calculate energy to detect non-silence
+								uint64_t energy = 0;
+								if (sample_size == 16) {
+									int16_t* samples = (int16_t*)src;
+									for (uint32 i = 0; i < sample_count * num_channels; i++) {
+										int16_t val_be = samples[i];
+										// Interpret as big-endian
+										int16_t val = (int16_t)(((val_be & 0xFF) << 8) | ((val_be >> 8) & 0xFF));
+										energy += (val < 0) ? -val : val;
+									}
+								}
+
+								// Only capture non-silent frames
+								if (energy > AUDIO_ENERGY_THRESHOLD) {
+									if (!capture_file) {
+										capture_file = fopen("/tmp/ipc_emulator_capture.raw", "wb");
+										fprintf(stderr, "IPC (emulator): Starting audio capture to /tmp/ipc_emulator_capture.raw\n");
+										fprintf(stderr, "IPC (emulator): Format: %u-bit, %u channels, %u Hz\n",
+										        sample_size, num_channels, sample_rate);
+										fprintf(stderr, "IPC (emulator): Capturing only non-silent frames (max %d frames)\n", AUDIO_MAX_CAPTURE_FRAMES);
+									}
+									fwrite(src, 1, data_len, capture_file);
+									frames_captured++;
+									silent_frames = 0;
+
+									// Log every 50 frames
+									if (frames_captured % 50 == 0) {
+										fprintf(stderr, "IPC (emulator): Captured %d non-silent frames\n", frames_captured);
+									}
+
+									// Stop after max frames
+									if (frames_captured >= AUDIO_MAX_CAPTURE_FRAMES) {
+										fclose(capture_file);
+										fprintf(stderr, "IPC (emulator): Audio capture complete (%d frames)\n", frames_captured);
+									}
+								} else {
+									silent_frames++;
+									// Log long silences
+									if (silent_frames == 50) {
+										fprintf(stderr, "IPC (emulator): Skipping silence (captured %d frames so far)\n", frames_captured);
+									}
+								}
+							}
 
 							if (sample_size == 8) {
 								// Convert U8 to S16

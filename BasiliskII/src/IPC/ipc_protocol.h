@@ -148,8 +148,10 @@ typedef struct {
 } MacEmuAudioFrame;
 
 // Ring buffer size (number of frames, not bytes)
-// 8 frames @ 20ms/frame = 160ms buffer (absorbs jitter/drift)
-#define MACEMU_AUDIO_FRAME_RING_SIZE 8
+// Small SHM buffer - just for producer/consumer handoff
+// Server maintains its own jitter buffer for smooth playback
+// 3 frames @ 20ms/frame = 60ms (enough for IPC latency variation)
+#define MACEMU_AUDIO_FRAME_RING_SIZE 3
 
 /*
  * MacEmuIPCBuffer - Shared memory for video, audio, and metadata

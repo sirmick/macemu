@@ -16,6 +16,7 @@
 #include "png_encoder.h"
 #include "opus_encoder.h"
 #include "tone_generator.h"
+#include "audio_config.h"
 
 // Utility modules
 #include "utils/keyboard_map.h"
@@ -1171,7 +1172,12 @@ private:
     // Helper: Setup Opus audio track with RTP packetizer
     void setup_audio_track(std::shared_ptr<PeerConnection> peer) {
         rtc::Description::Audio media("audio-stream", rtc::Description::Direction::SendOnly);
-        media.addOpusCodec(97);  // Opus uses payload type 97
+
+        // Opus profile built from centralized audio_config.h constants
+        // See audio_config.h for tuning: bitrate, frame duration, FEC, etc.
+        std::string opusProfile = WEBRTC_OPUS_PROFILE;
+        media.addOpusCodec(OPUS_PAYLOAD_TYPE, opusProfile);
+
         media.addSSRC(ssrc_ + 1, "audio-stream", "stream1", "audio-stream");
         peer->audio_track = peer->pc->addTrack(media);
 
@@ -2030,12 +2036,10 @@ static void audio_loop_tone_only(WebRTCServer& webrtc) {
             std::vector<int16_t> tone_samples = tone_gen.generate_frame();
 
             if (g_audio_encoder && !tone_samples.empty()) {
-                // Encode tone to Opus
-                std::vector<uint8_t> opus_data = g_audio_encoder->encode_dynamic(
+                // Encode tone to Opus (tone generator produces 48kHz, 960 samples)
+                std::vector<uint8_t> opus_data = g_audio_encoder->encode(
                     tone_samples.data(),
-                    tone_samples.size() / tone_gen.get_channels(),
-                    tone_gen.get_sample_rate(),
-                    tone_gen.get_channels()
+                    960  // 20ms at 48kHz
                 );
 
                 if (!opus_data.empty()) {
@@ -2142,55 +2146,104 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
         int16_t opus_buffer[960 * 2];
         const int16_t* samples_to_encode = nullptr;
 
-        // Check if resampling is needed
-        if (frame->sample_rate != 48000) {
-            // Resample using existing linear resampler in opus_encoder
-            // First byte-swap from big-endian to little-endian
-            std::vector<int16_t> byte_swapped(frame->samples * frame->channels);
-            const int16_t* src = reinterpret_cast<const int16_t*>(frame->data);
-            for (uint32_t i = 0; i < frame->samples * frame->channels; i++) {
-                uint16_t val = static_cast<uint16_t>(src[i]);
-                byte_swapped[i] = static_cast<int16_t>((val >> 8) | (val << 8));
+        // Process frame: Byte-swap from Mac's big-endian to Opus's little-endian
+        // Mac produces S16MSB (big-endian), Opus expects native int16_t (little-endian on x86_64)
+        // We force 48kHz in audio_ipc.cpp, so no resampling needed
+        const uint8_t* src_bytes = reinterpret_cast<const uint8_t*>(frame->data);
+        uint32_t total_samples = std::min(frame->samples, (uint32_t)960) * frame->channels;
+
+        // Detect if this is 8-bit audio masquerading as 16-bit (duplicated bytes)
+        // This happens when Mac apps produce 8-bit audio stored as duplicated 16-bit samples
+        bool is_8bit_duplicated = true;
+        for (uint32_t i = 0; i < std::min((uint32_t)20, total_samples) && is_8bit_duplicated; i++) {
+            if (src_bytes[i * 2] != src_bytes[i * 2 + 1]) {
+                is_8bit_duplicated = false;
             }
+        }
 
-            // Resample (uses opus_encoder's built-in linear resampler)
-            auto resampled = g_audio_encoder->resample_linear(
-                byte_swapped.data(),
-                frame->samples,
-                frame->sample_rate,
-                48000,
-                frame->channels
-            );
-
-            // Copy to opus_buffer (may need padding if less than 960 samples)
-            int resampled_samples = resampled.size() / frame->channels;
-            if (resampled_samples >= 960) {
-                memcpy(opus_buffer, resampled.data(), 960 * frame->channels * sizeof(int16_t));
+        // Log detection (once per session)
+        static bool logged_format = false;
+        if (!logged_format && !is_silence) {
+            if (is_8bit_duplicated) {
+                fprintf(stderr, "Audio: Detected 8-bit audio (duplicated bytes), converting to 16-bit\n");
             } else {
-                // Undersized after resampling - copy what we have and pad with silence
-                memcpy(opus_buffer, resampled.data(), resampled_samples * frame->channels * sizeof(int16_t));
-                memset(&opus_buffer[resampled_samples * frame->channels], 0,
-                       (960 - resampled_samples) * frame->channels * sizeof(int16_t));
+                fprintf(stderr, "Audio: Detected true 16-bit audio, byte-swapping\n");
             }
-            samples_to_encode = opus_buffer;
+            logged_format = true;
+        }
 
+        if (is_8bit_duplicated) {
+            // Convert 8-bit to proper 16-bit: read high byte as signed 8-bit, scale to full 16-bit range
+            // Example: 0x19 0x19 -> read 0x19 as int8 (25) -> scale: 25 * 256 = 6400
+            for (uint32_t i = 0; i < total_samples; i++) {
+                int8_t sample_8bit = static_cast<int8_t>(src_bytes[i * 2]);  // High byte
+                opus_buffer[i] = static_cast<int16_t>(sample_8bit) << 8;  // Scale to 16-bit range
+            }
         } else {
-            // No resampling needed (48kHz already) - just byte-swap
+            // True 16-bit: byte-swap from big-endian to little-endian
             const int16_t* src = reinterpret_cast<const int16_t*>(frame->data);
-            uint32_t total_samples = std::min(frame->samples, (uint32_t)960) * frame->channels;
-
             for (uint32_t i = 0; i < total_samples; i++) {
                 uint16_t val = static_cast<uint16_t>(src[i]);
                 opus_buffer[i] = static_cast<int16_t>((val >> 8) | (val << 8));
             }
+        }
 
-            // Pad if needed
-            if (frame->samples < 960) {
-                memset(&opus_buffer[frame->samples * frame->channels], 0,
-                       (960 - frame->samples) * frame->channels * sizeof(int16_t));
+        // Pad if needed
+        if (frame->samples < 960) {
+            memset(&opus_buffer[frame->samples * frame->channels], 0,
+                   (960 - frame->samples) * frame->channels * sizeof(int16_t));
+        }
+
+        samples_to_encode = opus_buffer;
+
+        // AUDIO DEBUG: Capture byte-swapped audio (what goes to Opus encoder)
+        // Only capture non-silent frames (skip silence between sounds)
+        {
+            static FILE* capture_file = nullptr;
+            static int frames_captured = 0;
+            static int silent_frames = 0;
+
+            if (frames_captured < AUDIO_MAX_CAPTURE_FRAMES && getenv("MACEMU_AUDIO_CAPTURE")) {
+                // Calculate energy to detect non-silence
+                uint64_t energy = 0;
+                for (uint32_t i = 0; i < total_samples; i++) {
+                    int16_t val = opus_buffer[i];
+                    energy += (val < 0) ? -val : val;
+                }
+
+                // Only capture non-silent frames
+                if (energy > AUDIO_ENERGY_THRESHOLD) {
+                    if (!capture_file) {
+                        capture_file = fopen("/tmp/ipc_server_capture.raw", "wb");
+                        fprintf(stderr, "IPC (server): Starting audio capture to /tmp/ipc_server_capture.raw\n");
+                        fprintf(stderr, "IPC (server): Format: 16-bit S16LE (little-endian), %u channels, 48000 Hz\n",
+                                frame->channels);
+                        fprintf(stderr, "IPC (server): Capturing only non-silent frames (max %d frames)\n", AUDIO_MAX_CAPTURE_FRAMES);
+                    }
+
+                    // Write full Opus frame (960 samples * 2 channels = 1920 samples = 3840 bytes)
+                    fwrite(opus_buffer, sizeof(int16_t), 960 * frame->channels, capture_file);
+                    frames_captured++;
+                    silent_frames = 0;
+
+                    // Log every 50 frames
+                    if (frames_captured % 50 == 0) {
+                        fprintf(stderr, "IPC (server): Captured %d non-silent frames\n", frames_captured);
+                    }
+
+                    // Stop after max frames
+                    if (frames_captured >= AUDIO_MAX_CAPTURE_FRAMES) {
+                        fclose(capture_file);
+                        fprintf(stderr, "IPC (server): Audio capture complete (%d frames)\n", frames_captured);
+                    }
+                } else {
+                    silent_frames++;
+                    // Log long silences
+                    if (silent_frames == 50) {
+                        fprintf(stderr, "IPC (server): Skipping silence (captured %d frames so far)\n", frames_captured);
+                    }
+                }
             }
-
-            samples_to_encode = opus_buffer;
         }
 
         // Encode to Opus (always 960 samples @ 48kHz stereo)
@@ -2323,8 +2376,9 @@ int main(int argc, char* argv[]) {
     PNGEncoder png_encoder;
     g_audio_encoder = std::make_unique<OpusAudioEncoder>();
 
-    // Initialize audio encoder (48kHz stereo is default for WebRTC)
-    if (!g_audio_encoder->init(48000, 2, 128000)) {
+    // Initialize audio encoder using centralized audio_config.h constants
+    // Settings match the WebRTC Opus profile for consistency
+    if (!g_audio_encoder->init(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, OPUS_BITRATE)) {
         fprintf(stderr, "WARNING: Failed to initialize Opus audio encoder\n");
     }
 
