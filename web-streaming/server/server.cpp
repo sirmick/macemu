@@ -286,18 +286,7 @@ static void crash_handler(int sig, siginfo_t *info, void *context) {
 // Using nlohmann/json library instead of hand-written parsing
 using json = json_utils::json;
 
-// Temporary compatibility shims for manual JSON string building
-// TODO: Replace with proper nlohmann/json usage in Phase 6 (HTTP refactor)
-static std::string json_escape(const std::string& s) {
-    json j = s;
-    std::string result = j.dump();
-    // Remove surrounding quotes added by dump()
-    if (result.size() >= 2 && result.front() == '"' && result.back() == '"') {
-        result = result.substr(1, result.size() - 2);
-    }
-    return result;
-}
-
+// JSON utility for parsing WebSocket messages
 static std::string json_get_string(const std::string& json_str, const std::string& key) {
     try {
         json j = json::parse(json_str);
@@ -384,9 +373,6 @@ static std::string find_emulator() {
 
     return "";
 }
-
-// Forward declarations
-static void read_webcodec_pref();
 
 static pid_t g_started_emulator_pid = -1;  // PID of emulator we started
 
@@ -521,29 +507,9 @@ static int check_emulator_status() {
  * TODO: Phase 7 - Remove wrappers and call modules directly
  */
 
-// Wrapper: Get storage inventory JSON
-static std::string get_storage_json() {
-    return storage::get_storage_json(g_roms_path, g_images_path);
-}
-
-// Wrapper: Write prefs file
-static bool write_prefs_file(const std::string& content) {
-    return storage::write_prefs_file(g_prefs_path, content);
-}
-
-// Wrapper: Read prefs file
-static std::string read_prefs_file() {
-    return storage::read_prefs_file(g_prefs_path);
-}
-
 // Wrapper: Create minimal prefs if needed
 static void create_minimal_prefs_if_needed() {
     storage::create_minimal_prefs_if_needed(g_prefs_path);
-}
-
-// Wrapper: Read webcodec preference
-static void read_webcodec_pref() {
-    g_server_codec = storage::read_webcodec_pref(g_prefs_path);
 }
 
 
