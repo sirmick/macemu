@@ -264,6 +264,21 @@ int main(int argc, char **argv)
 	printf("FPU: %s\n", FPUType ? "Yes" : "No");
 	printf("24-bit addressing: %s\n", TwentyFourBitAddressing ? "Yes" : "No");
 
+	// Set initial PC from ROM reset vector
+	// M68K reset vector: offset 0 = initial SSP, offset 4 = initial PC
+	uint32_t initial_ssp = (ROMBaseHost[0] << 24) | (ROMBaseHost[1] << 16) |
+	                       (ROMBaseHost[2] << 8) | ROMBaseHost[3];
+	uint32_t initial_pc = (ROMBaseHost[4] << 24) | (ROMBaseHost[5] << 16) |
+	                      (ROMBaseHost[6] << 8) | ROMBaseHost[7];
+
+	printf("\nROM Reset Vector:\n");
+	printf("  Initial SSP: 0x%08x\n", initial_ssp);
+	printf("  Initial PC:  0x%08x\n", initial_pc);
+
+	uae_set_areg(7, initial_ssp);  // A7 = Stack Pointer
+	uae_set_pc(initial_pc);
+	uae_set_sr(0x2700);  // Supervisor mode, interrupts disabled
+
 	// Execute 5 instructions
 	printf("\n=== Executing 5 Instructions ===\n");
 
