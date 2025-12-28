@@ -809,6 +809,11 @@ class BasiliskWebRTC {
         this.cachedWidth = 0;
         this.cachedHeight = 0;
 
+        // Cached mouse scaling for absolute mode (avoid getBoundingClientRect on every move)
+        this.cachedMouseRect = null;
+        this.cachedMouseScaleX = 1;
+        this.cachedMouseScaleY = 1;
+
         // PNG/DataChannel stats
         this.pngStats = {
             framesReceived: 0,
@@ -1631,12 +1636,16 @@ class BasiliskWebRTC {
                     return;
                 }
 
-                const rect = displayElement.getBoundingClientRect();
-                const scaleX = this.currentScreenWidth / rect.width;
-                const scaleY = this.currentScreenHeight / rect.height;
+                // Cache rect and scale to avoid expensive getBoundingClientRect() on every move
+                if (!this.cachedMouseRect) {
+                    this.cachedMouseRect = displayElement.getBoundingClientRect();
+                    this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
+                    this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
+                }
 
-                const macX = Math.floor((e.clientX - rect.left) * scaleX);
-                const macY = Math.floor((e.clientY - rect.top) * scaleY);
+                const rect = this.cachedMouseRect;
+                const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
+                const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
 
                 // Clamp to screen bounds
                 const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
@@ -1650,6 +1659,13 @@ class BasiliskWebRTC {
             }
         };
         displayElement.addEventListener('mousemove', handleMouseMove);
+
+        // Invalidate mouse cache on resize/fullscreen (for absolute mode)
+        const invalidateMouseCache = () => {
+            this.cachedMouseRect = null;
+        };
+        window.addEventListener('resize', invalidateMouseCache);
+        document.addEventListener('fullscreenchange', invalidateMouseCache);
 
         // Mouse buttons - work in both modes
         const handleMouseDown = (e) => {

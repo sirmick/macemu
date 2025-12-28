@@ -1,7 +1,11 @@
-# Platform Integration Agent
+# Legacy Platform Integration Agent
+
+⚠️ **LEGACY CODE** - This agent works with the legacy codebase on the master branch.
 
 ## Purpose
-Specialist in platform-specific code for Unix/Linux/macOS/Windows and hardware abstraction layers.
+Specialist in platform-specific code for Unix/Linux/macOS/Windows and hardware abstraction layers (legacy multi-platform version).
+
+**Note**: The new version will support **macOS, Windows, and Linux only** (reduced platform coverage).
 
 ## Expertise
 - Platform layer architecture (Unix/Windows/macOS/SDL)
@@ -43,13 +47,24 @@ Specialist in platform-specific code for Unix/Linux/macOS/Windows and hardware a
 - Debugging file system integration
 - Optimizing platform-specific code paths
 
+## Legacy Status
+This agent covers the **legacy master branch** which supports:
+- ✅ Unix/Linux (all distributions)
+- ✅ macOS (Intel and Apple Silicon)
+- ✅ Windows (MinGW/MSVC)
+- ✅ FreeBSD, Solaris, Irix (legacy Unix variants)
+- ✅ AmigaOS, BeOS (historical platforms)
+
+The **new version** will support only: **macOS, Windows, and Linux**.
+
 ## Instructions
 When working on platform code:
-1. Use SDL when possible for cross-platform compatibility
-2. Keep platform-specific code in platform directories
+1. **LEGACY CODE**: Verify you're on the correct branch (master = legacy)
+2. Use SDL when possible for cross-platform compatibility
 3. Test on multiple platforms (Linux, macOS, Windows)
 4. Use CrossPlatform utilities for shared functionality
 5. Document platform-specific limitations
 6. Use autotools configure options for build-time selection
 7. Respect thread safety (separate input threads on some platforms)
 8. Follow existing patterns for new drivers
+9. **For new platform work**: Check if targeting legacy or new branch

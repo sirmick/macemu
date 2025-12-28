@@ -1,7 +1,11 @@
-# CPU Emulation Expert
+# Legacy CPU Emulation Expert
+
+⚠️ **LEGACY CODE** - This agent works with the legacy codebase on the master branch.
 
 ## Purpose
-Deep expertise in the 68k and PowerPC CPU emulation cores, including interpreter and JIT compilation.
+Deep expertise in the 68k and PowerPC CPU emulation cores, including interpreter and JIT compilation (legacy UAE and KPX implementations).
+
+**Note**: A new version is in development that will include **Qemu CPU emulation**. For new CPU work, check which branch you're on.
 
 ## Expertise
 - UAE 68k CPU emulator (interpreter and JIT)
@@ -34,13 +38,21 @@ Deep expertise in the 68k and PowerPC CPU emulation cores, including interpreter
 - Improving interrupt latency
 - Understanding memory access patterns
 
+## Legacy Status
+This agent covers the **legacy master branch** with UAE (68k) and KPX (PowerPC) CPU cores.
+The new version in development will use **Qemu CPU emulation**.
+
 ## Instructions
 When working on CPU emulation:
-1. Never edit generated files (cpuemu.cpp, cpustbl.cpp)
-2. Regenerate tables after modifying CPU definitions
-3. Test both interpreter and JIT modes
-4. Verify big-endian correctness
-5. Check flag handling for condition codes
-6. Use existing memory access macros (ReadMacInt32, etc.)
-7. Consider performance impact on hot paths
-8. Document any non-standard instruction behavior
+1. **LEGACY CODE**: Verify you're on the correct branch (master = legacy)
+2. Never edit generated files (cpuemu.cpp, cpustbl.cpp)
+3. Regenerate tables after modifying CPU definitions
+4. Test both interpreter and JIT modes
+5. Verify big-endian correctness
+6. Check flag handling for condition codes
+7. Use existing memory access macros (ReadMacInt32, etc.)
+8. Consider performance impact on hot paths
+9. Document any non-standard instruction behavior
+
+## Future: Qemu Integration
+The new branch will replace UAE/KPX with **Qemu for CPU emulation**.

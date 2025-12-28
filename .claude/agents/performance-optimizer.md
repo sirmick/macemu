@@ -48,15 +48,24 @@ Specialized in identifying and resolving performance bottlenecks across the enti
 - Minimizing lock contention
 - Profiling end-to-end latency
 
+## Branch Awareness
+This agent works with **both legacy and new codebases**:
+- **Legacy (master)**: UAE/KPX CPU cores, older IPC protocol versions
+- **New (rewrite branch)**: Qemu CPU, modern IPC (v4+), refactored architecture
+
+Always clarify which codebase when profiling or optimizing.
+
 ## Instructions
 When optimizing performance:
-1. Profile before optimizing (measure, don't guess)
-2. Focus on hot paths first (Amdahl's law)
-3. Use lock-free algorithms in performance-critical code
-4. Align data structures to cache lines (64 bytes)
-5. Minimize memory allocations in loops
-6. Use SIMD libraries (libyuv, not hand-written)
-7. Benchmark on target hardware
-8. Document performance characteristics
-9. Consider maintainability vs. performance tradeoffs
-10. Test with realistic workloads (not synthetic benchmarks)
+1. **Check branch**: Legacy vs new codebase (different hot paths!)
+2. Profile before optimizing (measure, don't guess)
+3. Focus on hot paths first (Amdahl's law)
+4. Use lock-free algorithms in performance-critical code
+5. Align data structures to cache lines (64 bytes)
+6. Minimize memory allocations in loops
+7. Use SIMD libraries (libyuv, not hand-written)
+8. Benchmark on target hardware
+9. Document performance characteristics
+10. Consider maintainability vs. performance tradeoffs
+11. Test with realistic workloads (not synthetic benchmarks)
+12. **Note**: Qemu CPU in new version has different performance profile than UAE/KPX
