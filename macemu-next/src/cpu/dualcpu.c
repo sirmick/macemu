@@ -8,24 +8,12 @@
 
 #include "dualcpu.h"
 #include "unicorn_wrapper.h"
+#include "uae_wrapper.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-/* Forward declarations for UAE CPU interface */
-extern void uae_cpu_init(void);
-extern void uae_cpu_reset(void);
-extern void uae_cpu_execute_one(void);
-extern uint32_t uae_get_dreg(int reg);
-extern uint32_t uae_get_areg(int reg);
-extern uint32_t uae_get_pc(void);
-extern uint16_t uae_get_sr(void);
-extern void uae_set_dreg(int reg, uint32_t value);
-extern void uae_set_areg(int reg, uint32_t value);
-extern void uae_set_pc(uint32_t value);
-extern void uae_set_sr(uint16_t value);
-extern void uae_mem_map(uint32_t addr, uint32_t size);
-extern void uae_mem_write(uint32_t addr, const void *data, uint32_t size);
+/* UAE CPU interface now in uae_wrapper.h */
 
 struct DualCPU {
     /* CPU instances */
@@ -165,9 +153,12 @@ DualCPU* dualcpu_create(void) {
         return NULL;
     }
 
-    /* Initialize UAE CPU - stub for now */
-    // uae_cpu_init();
-    // uae_cpu_reset();
+    /* Initialize UAE CPU */
+    if (!uae_cpu_init()) {
+        free(dcpu);
+        return NULL;
+    }
+    uae_cpu_reset();
 
     return dcpu;
 }
@@ -209,8 +200,8 @@ bool dualcpu_map_ram(DualCPU *dcpu, uint32_t addr, uint32_t size) {
         return false;
     }
 
-    /* Map in UAE - stub */
-    // uae_mem_map(addr, size);
+    /* Map in UAE - set RAM pointer */
+    uae_mem_set_ram_ptr(dcpu->uae_ram, size);
 
     return true;
 }
@@ -237,9 +228,9 @@ bool dualcpu_map_rom(DualCPU *dcpu, uint32_t addr, const void *rom_data, uint32_
         return false;
     }
 
-    /* Map in UAE - stub */
-    // uae_mem_map(addr, size);
-    // uae_mem_write(addr, rom_data, size);
+    /* Map in UAE - set ROM pointer */
+    uae_mem_set_rom_ptr(dcpu->uae_rom, size);
+    /* ROM data already copied to dcpu->uae_rom above */
 
     return true;
 }
@@ -252,8 +243,8 @@ bool dualcpu_mem_write(DualCPU *dcpu, uint32_t addr, const void *data, uint32_t 
         return false;
     }
 
-    /* Write to UAE - stub */
-    // uae_mem_write(addr, data, size);
+    /* Write to UAE */
+    uae_mem_write(addr, data, size);
 
     return true;
 }
@@ -262,39 +253,40 @@ bool dualcpu_mem_write(DualCPU *dcpu, uint32_t addr, const void *data, uint32_t 
 void dualcpu_set_pc(DualCPU *dcpu, uint32_t pc) {
     if (!dcpu) return;
     unicorn_set_pc(dcpu->unicorn, pc);
-    // uae_set_pc(pc);
+    uae_set_pc(pc);
 }
 
 void dualcpu_set_dreg(DualCPU *dcpu, int reg, uint32_t value) {
     if (!dcpu) return;
     unicorn_set_dreg(dcpu->unicorn, reg, value);
-    // uae_set_dreg(reg, value);
+    uae_set_dreg(reg, value);
 }
 
 void dualcpu_set_areg(DualCPU *dcpu, int reg, uint32_t value) {
     if (!dcpu) return;
     unicorn_set_areg(dcpu->unicorn, reg, value);
-    // uae_set_areg(reg, value);
+    uae_set_areg(reg, value);
 }
 
 void dualcpu_set_sr(DualCPU *dcpu, uint16_t sr) {
     if (!dcpu) return;
     unicorn_set_sr(dcpu->unicorn, sr);
-    // uae_set_sr(sr);
+    uae_set_sr(sr);
 }
 
 /* Execute one instruction on both CPUs and compare */
 bool dualcpu_execute_one(DualCPU *dcpu) {
     if (!dcpu) return false;
 
+    CPUStateSnapshot uae_before, uae_after;
     CPUStateSnapshot unicorn_before, unicorn_after;
 
     /* Capture state before */
-    // capture_uae_state(dcpu, &uae_before);
+    capture_uae_state(dcpu, &uae_before);
     capture_unicorn_state(dcpu, &unicorn_before);
 
     /* Execute on UAE */
-    // uae_cpu_execute_one();
+    uae_cpu_execute_one();
 
     /* Execute on Unicorn */
     if (!unicorn_execute_one(dcpu->unicorn)) {
@@ -304,18 +296,18 @@ bool dualcpu_execute_one(DualCPU *dcpu) {
     }
 
     /* Capture state after */
-    // capture_uae_state(dcpu, &uae_after);
+    capture_uae_state(dcpu, &uae_after);
     capture_unicorn_state(dcpu, &unicorn_after);
 
     /* Save last states */
-    // dcpu->uae_last = uae_after;
+    dcpu->uae_last = uae_after;
     dcpu->unicorn_last = unicorn_after;
 
     /* Compare states */
-    // if (!compare_states(dcpu, &uae_after, &unicorn_after)) {
-    //     dcpu->stats.divergences++;
-    //     return false;
-    // }
+    if (!compare_states(dcpu, &uae_after, &unicorn_after)) {
+        dcpu->stats.divergences++;
+        return false;
+    }
 
     dcpu->stats.instructions_executed++;
     return true;

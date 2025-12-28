@@ -68,6 +68,13 @@ void test_simple_execution() {
 
     /* Execute first instruction (MOVEQ #-19, D3) */
     ok = dualcpu_execute_one(dcpu);
+    if (!ok) {
+        DualCPUStats stats;
+        dualcpu_get_stats(dcpu, &stats);
+        printf("  ✗ Execution failed: %s\n", dualcpu_get_error(dcpu));
+        printf("  ✗ Divergences: %lu\n", stats.divergences);
+        fflush(stdout);
+    }
     assert(ok);
 
     printf("  ✓ First instruction executed\n");

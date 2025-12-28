@@ -65,7 +65,7 @@ struct cputbl {
     cpuop_func *handler;
     uae_u16 specific;
     uae_u16 opcode;
-};
+} __attribute__((packed));
 
 extern cpuop_func *cpufunctbl[65536] ASM_SYM("cpufunctbl");
 

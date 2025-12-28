@@ -175,3 +175,21 @@ void uae_cpu_execute_one(void) {
     uae_u32 opcode = GET_OPCODE;
     (*cpufunctbl[opcode])(opcode);
 }
+
+/* Set memory base pointers directly (for dual-CPU mode) */
+extern uintptr MEMBaseDiff;  // From basilisk_glue.cpp
+
+void uae_mem_set_ram_ptr(void *ptr, uint32_t size) {
+    RAMBaseHost = (uint8 *)ptr;
+    RAMSize = size;
+    RAMBaseMac = 0x00000000;
+
+    // Set MEMBaseDiff for direct addressing: host_ptr = mac_addr + MEMBaseDiff
+    MEMBaseDiff = (uintptr)RAMBaseHost - RAMBaseMac;
+}
+
+void uae_mem_set_rom_ptr(void *ptr, uint32_t size) {
+    ROMBaseHost = (uint8 *)ptr;
+    ROMSize = size;
+    ROMBaseMac = 0x00400000;  /* Typical Mac ROM location */
+}

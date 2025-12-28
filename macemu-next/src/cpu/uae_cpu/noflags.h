@@ -1,9 +1,15 @@
 #ifndef NOFLAGS_H
 #define NOFLAGS_H
 
+/* When NOFLAGS is defined, redirect CPUFUNC to use _nf functions */
+#ifdef CPUFUNC
+#undef CPUFUNC
+#endif
+#define CPUFUNC(x) CPUFUNC_NF(x)
+
 /* Undefine everything that will *set* flags. Note: Leave *reading*
-   flags alone ;-). We assume that nobody does something like 
-   SET_ZFLG(a=b+c), i.e. expect side effects of the macros. That would 
+   flags alone ;-). We assume that nobody does something like
+   SET_ZFLG(a=b+c), i.e. expect side effects of the macros. That would
    be a stupid thing to do when using macros.
 */
 

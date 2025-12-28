@@ -224,12 +224,31 @@ static void build_cpufunctbl (void)
 				: cpu_level == 1 ? op_smalltbl_3_ff
 				: op_smalltbl_4_ff);
 
+	fprintf(stderr, "DEBUG: cpu_level=%d, tbl=%p, op_smalltbl_1_ff=%p\n",
+	        cpu_level, (void*)tbl, (void*)op_smalltbl_1_ff);
+	fprintf(stderr, "DEBUG: tbl[0]: handler=%p specific=%d opcode=0x%x\n",
+	        (void*)tbl[0].handler, tbl[0].specific, tbl[0].opcode);
+	fprintf(stderr, "DEBUG: sizeof(struct cputbl)=%zu, sizeof(cpuop_func*)=%zu\n",
+	        sizeof(struct cputbl), sizeof(cpuop_func*));
+	// Print raw bytes
+	unsigned char *raw = (unsigned char*)&tbl[0];
+	fprintf(stderr, "DEBUG: tbl[0] raw bytes:");
+	for (int b = 0; b < 16; b++) {
+		fprintf(stderr, " %02x", raw[b]);
+	}
+	fprintf(stderr, "\n");
+
 	for (opcode = 0; opcode < 65536; opcode++)
 		cpufunctbl[cft_map (opcode)] = op_illg_1;
+
+	int filled_count = 0;
 	for (i = 0; tbl[i].handler != NULL; i++) {
-		if (! tbl[i].specific)
+		if (! tbl[i].specific) {
 			cpufunctbl[cft_map (tbl[i].opcode)] = tbl[i].handler;
+			filled_count++;
+		}
 	}
+	fprintf(stderr, "DEBUG: Filled %d opcodes from op_smalltbl\n", filled_count);
 	for (opcode = 0; opcode < 65536; opcode++) {
 		cpuop_func *f;
 
@@ -238,8 +257,19 @@ static void build_cpufunctbl (void)
 
 		if (table68k[opcode].handler != -1) {
 			f = cpufunctbl[cft_map (table68k[opcode].handler)];
-			if (f == op_illg_1)
+			if (f == op_illg_1) {
+				fprintf(stderr, "FATAL: opcode 0x%04lx handler %ld maps to illegal instruction\n",
+				        opcode, table68k[opcode].handler);
+				fprintf(stderr, "DEBUG: Looking for handler %ld in cpufunctbl[%lu]\n",
+				        table68k[opcode].handler, cft_map(table68k[opcode].handler));
+				// Print first 10 entries from op_smalltbl_1_ff to debug
+				fprintf(stderr, "DEBUG: First 10 entries from op_smalltbl_1_ff:\n");
+				for (int j = 0; j < 10 && tbl[j].handler != NULL; j++) {
+					fprintf(stderr, "  [%d] opcode=0x%04x handler=%p specific=%d\n",
+					        j, tbl[j].opcode, (void*)tbl[j].handler, tbl[j].specific);
+				}
 				abort();
+			}
 			cpufunctbl[cft_map (opcode)] = f;
 		}
 	}

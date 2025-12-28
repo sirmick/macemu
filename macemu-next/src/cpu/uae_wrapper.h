@@ -28,6 +28,10 @@ void uae_mem_cleanup(void);
 void uae_mem_map_ram(uint32_t addr, uint32_t size);
 void uae_mem_map_rom(uint32_t addr, uint32_t size);
 
+/* Set memory base pointers (for dual-CPU mode) */
+void uae_mem_set_ram_ptr(void *ptr, uint32_t size);
+void uae_mem_set_rom_ptr(void *ptr, uint32_t size);
+
 /* Memory access */
 void uae_mem_write(uint32_t addr, const void *data, uint32_t size);
 void uae_mem_read(uint32_t addr, void *data, uint32_t size);
