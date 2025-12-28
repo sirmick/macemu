@@ -1,5 +1,5 @@
 /*
- *  prefs_editor.h - Preferences editor
+ *  prefs_editor_dummy.cpp - Preferences editor, dummy implementation
  *
  *  Basilisk II (C) 1997-2008 Christian Bauer
  *
@@ -18,26 +18,18 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef PREFS_EDITOR_H
-#define PREFS_EDITOR_H
+#include "sysdeps.h"
+#include "prefs.h"
+#include "prefs_editor.h"
+#include "user_strings.h"
 
-extern bool PrefsEditor(void);
 
-#if defined(ENABLE_GTK) || defined(STANDALONE_GUI)
+/*
+ *  Show preferences editor
+ *  Returns true when user clicked on "Start", false otherwise
+ */
 
-#include <gtk/gtk.h>
-
-#if !GLIB_CHECK_VERSION(2, 24, 0)
-#define GVariant void
-#endif
-#if !GLIB_CHECK_VERSION(2, 28, 0)
-#define GSimpleAction void
-#endif
-
-extern "C" {
-void dl_quit(GtkWidget *dialog);
-void cb_swap_opt_cmd (GtkWidget *widget);
-void cb_infobar_show (GtkWidget *widget);
+bool PrefsEditor(void)
+{
+	return true;
 }
-#endif
-#endif

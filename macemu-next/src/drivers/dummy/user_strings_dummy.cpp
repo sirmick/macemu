@@ -1,5 +1,5 @@
 /*
- *  prefs_editor.h - Preferences editor
+ *  user_strings_dummy.cpp - Localizable strings, dummy implementation
  *
  *  Basilisk II (C) 1997-2008 Christian Bauer
  *
@@ -18,26 +18,36 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef PREFS_EDITOR_H
-#define PREFS_EDITOR_H
+#include "sysdeps.h"
+#include "user_strings.h"
 
-extern bool PrefsEditor(void);
 
-#if defined(ENABLE_GTK) || defined(STANDALONE_GUI)
+// Platform-specific string definitions
+user_string_def platform_strings[] = {
+	{-1, NULL}	// End marker
+};
 
-#include <gtk/gtk.h>
 
-#if !GLIB_CHECK_VERSION(2, 24, 0)
-#define GVariant void
-#endif
-#if !GLIB_CHECK_VERSION(2, 28, 0)
-#define GSimpleAction void
-#endif
+/*
+ *  Fetch pointer to string, given the string number
+ */
 
-extern "C" {
-void dl_quit(GtkWidget *dialog);
-void cb_swap_opt_cmd (GtkWidget *widget);
-void cb_infobar_show (GtkWidget *widget);
+const char *GetString(int num)
+{
+	// First search for platform-specific string
+	int i = 0;
+	while (platform_strings[i].num >= 0) {
+		if (platform_strings[i].num == num)
+			return platform_strings[i].str;
+		i++;
+	}
+
+	// Not found, search for common string
+	i = 0;
+	while (common_strings[i].num >= 0) {
+		if (common_strings[i].num == num)
+			return common_strings[i].str;
+		i++;
+	}
+	return NULL;
 }
-#endif
-#endif

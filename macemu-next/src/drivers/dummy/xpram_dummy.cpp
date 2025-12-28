@@ -1,5 +1,5 @@
 /*
- *  prefs_editor.h - Preferences editor
+ *  xpram_dummy.cpp - XPRAM handling, dummy implementation
  *
  *  Basilisk II (C) 1997-2008 Christian Bauer
  *
@@ -18,26 +18,51 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef PREFS_EDITOR_H
-#define PREFS_EDITOR_H
+#include "sysdeps.h"
 
-extern bool PrefsEditor(void);
+#include <stdio.h>
+#include <stdlib.h>
 
-#if defined(ENABLE_GTK) || defined(STANDALONE_GUI)
+#include "xpram.h"
 
-#include <gtk/gtk.h>
 
-#if !GLIB_CHECK_VERSION(2, 24, 0)
-#define GVariant void
-#endif
-#if !GLIB_CHECK_VERSION(2, 28, 0)
-#define GSimpleAction void
-#endif
+// XPRAM file name and path
+const char XPRAM_FILE_NAME[] = "BasiliskII_XPRAM";
 
-extern "C" {
-void dl_quit(GtkWidget *dialog);
-void cb_swap_opt_cmd (GtkWidget *widget);
-void cb_infobar_show (GtkWidget *widget);
+
+/*
+ *  Load XPRAM from settings file
+ */
+
+void LoadXPRAM(const char *vmdir)
+{
+	FILE *f = fopen(XPRAM_FILE_NAME, "rb");
+	if (f != NULL) {
+		fread(XPRAM, 256, 1, f);
+		fclose(f);
+	}
 }
-#endif
-#endif
+
+
+/*
+ *  Save XPRAM to settings file
+ */
+
+void SaveXPRAM(void)
+{
+	FILE *f = fopen(XPRAM_FILE_NAME, "wb");
+	if (f != NULL) {
+		fwrite(XPRAM, 256, 1, f);
+		fclose(f);
+	}
+}
+
+
+/*
+ *  Delete PRAM file
+ */
+
+void ZapPRAM(void)
+{
+	remove(XPRAM_FILE_NAME);
+}
