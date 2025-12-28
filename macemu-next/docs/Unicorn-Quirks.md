@@ -177,18 +177,29 @@ void compare_cpu_state(void) {
 **Most common divergence:** UAE and Unicorn sometimes differ in condition code flag updates (Z, N, C, V flags in SR).
 
 Example from ROM boot test:
-- After 4 instructions, SR diverges
-- UAE: `0x2704` (Z flag set)
-- Unicorn: `0x2700` (no flags)
+- After 4 instructions, SR diverges at instruction **SUB.B D0,(A0)**
+- UAE: `0x2704` (Z flag set - correct!)
+- Unicorn: `0x2700` (no flags - bug!)
 - Both CPUs have same PC (0x02004054) and same registers
 
-**Why this happens:**
-- Different instruction implementations may update flags differently
-- Some instructions have undefined flag behavior
-- Both implementations are valid if PC and data registers match
+**Instruction trace:**
+```
+[0] PC=0x0200002A  JMP (d16,PC)
+[1] PC=0x0200008C  MOVE #imm,SR
+[2] PC=0x02000090  LEA (d16,PC),A6
+[3] PC=0x02000094  BRA.W
+[4] PC=0x02004052  SUB.B D0,(A0)  <- Divergence here!
+```
+
+**Analysis:**
+- Instruction: SUB.B D0,(A0) where D0=0, A0=0, mem[0]=0
+- Result: 0 - 0 = 0, so **Z flag should be set**
+- UAE correctly sets Z flag → SR=0x2704 ✓
+- Unicorn fails to set Z flag → SR=0x2700 ✗
+- This is a **known Unicorn bug** - some arithmetic instructions don't update condition codes correctly
 
 **What to check:**
-- If **only SR differs** and PC/registers match → usually OK
+- If **only SR differs** and PC/registers match → usually OK (minor flag differences)
 - If **PC or data registers differ** → real divergence, needs debugging
 
 ### 2. Undefined Behavior
