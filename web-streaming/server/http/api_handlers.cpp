@@ -281,10 +281,8 @@ Response APIRouter::handle_codec_post(const Request& req) {
         new_codec = CodecType::AV1;
     } else if (codec_str == "png" || codec_str == "PNG") {
         new_codec = CodecType::PNG;
-    } else if (codec_str == "raw" || codec_str == "RAW") {
-        new_codec = CodecType::RAW;
     } else {
-        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, png, or raw\"}");
+        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, or png\"}");
     }
 
     // Update codec

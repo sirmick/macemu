@@ -210,15 +210,14 @@ const connectionSteps = new ConnectionSteps();
  *
  * Allows switching between different decoding strategies:
  * - H.264 via WebRTC video track (native browser decoding)
- * - PNG via DataChannel (good for dithered 1-bit content)
- * - Raw RGBA via DataChannel (lowest latency, highest bandwidth)
+ * - AV1 via WebRTC video track (modern codec, best for dithered content)
+ * - PNG via DataChannel (good for dithered 1-bit content, supports dirty rects)
  */
 
 const CodecType = {
     H264: 'h264',   // WebRTC video track with H.264
     AV1: 'av1',     // WebRTC video track with AV1
-    PNG: 'png',     // PNG over DataChannel
-    RAW: 'raw'      // Raw RGBA over DataChannel
+    PNG: 'png'      // PNG over DataChannel
 };
 
 // Base class for video decoders
@@ -361,6 +360,9 @@ class PNGDecoder extends VideoDecoder {
         this.rttSamples = 0;
         this.lastRttLog = 0;
         this.lastAverageRtt = 0;  // Last calculated average for stats panel
+
+        // Ping timer (runs every 1 second)
+        this.pingTimer = null;
     }
 
     get type() { return CodecType.PNG; }
@@ -381,7 +383,27 @@ class PNGDecoder extends VideoDecoder {
     }
 
     cleanup() {
+        this.stopPingTimer();
         this.ctx = null;
+    }
+
+    // Start ping timer (call when DataChannel is ready)
+    startPingTimer(dataChannel) {
+        this.stopPingTimer();
+        this.dataChannel = dataChannel;
+
+        // Send ping every 1 second for RTT measurement
+        this.pingTimer = setInterval(() => {
+            this.sendPing(this.dataChannel);
+        }, 1000);
+    }
+
+    stopPingTimer() {
+        if (this.pingTimer) {
+            clearInterval(this.pingTimer);
+            this.pingTimer = null;
+        }
+        this.dataChannel = null;
     }
 
     // Get average video latency in ms
@@ -637,73 +659,6 @@ class PNGDecoder extends VideoDecoder {
     }
 }
 
-// Raw RGBA decoder using canvas rendering
-class RawDecoder extends VideoDecoder {
-    constructor(canvasElement) {
-        super(canvasElement);
-        this.canvas = canvasElement;
-        this.ctx = null;
-        this.imageData = null;
-        this.expectedWidth = 0;
-        this.expectedHeight = 0;
-    }
-
-    get type() { return CodecType.RAW; }
-    get name() { return 'Raw RGBA (DataChannel)'; }
-
-    init() {
-        this.ctx = this.canvas.getContext('2d');
-        if (!this.ctx) {
-            logger.error('Failed to get canvas 2D context');
-            return false;
-        }
-        logger.info('RawDecoder initialized');
-        return true;
-    }
-
-    cleanup() {
-        this.ctx = null;
-        this.imageData = null;
-    }
-
-    // Set expected dimensions (from signaling)
-    setDimensions(width, height) {
-        this.expectedWidth = width;
-        this.expectedHeight = height;
-        this.canvas.width = width;
-        this.canvas.height = height;
-        this.imageData = this.ctx.createImageData(width, height);
-        logger.info('RawDecoder dimensions set', { width, height });
-    }
-
-    // Handle raw RGBA data from DataChannel
-    handleData(data) {
-        if (!this.ctx || !this.imageData) return;
-
-        // data should be an ArrayBuffer containing RGBA pixels
-        const pixels = new Uint8ClampedArray(data);
-
-        // Verify size matches
-        const expectedSize = this.expectedWidth * this.expectedHeight * 4;
-        if (pixels.length !== expectedSize) {
-            logger.warn('Raw frame size mismatch', {
-                received: pixels.length,
-                expected: expectedSize
-            });
-            return;
-        }
-
-        this.imageData.data.set(pixels);
-        this.ctx.putImageData(this.imageData, 0, 0);
-        this.frameCount++;
-        this.lastFrameTime = performance.now();
-
-        if (this.onFrame) {
-            this.onFrame(this.frameCount);
-        }
-    }
-}
-
 // Factory to create the right decoder based on codec type
 function createDecoder(codecType, element) {
     switch (codecType) {
@@ -713,11 +668,31 @@ function createDecoder(codecType, element) {
             return new AV1Decoder(element);
         case CodecType.PNG:
             return new PNGDecoder(element);
-        case CodecType.RAW:
-            return new RawDecoder(element);
         default:
             logger.error('Unknown codec type', { codecType });
             return null;
+    }
+}
+
+// Helper: Convert codec string to CodecType enum
+function parseCodecString(codecStr) {
+    switch (codecStr) {
+        case 'h264': return CodecType.H264;
+        case 'av1': return CodecType.AV1;
+        case 'png': return CodecType.PNG;
+        default:
+            logger.warn('Unknown codec string, defaulting to PNG', { codec: codecStr });
+            return CodecType.PNG;
+    }
+}
+
+// Helper: Get display label for codec
+function getCodecLabel(codecType) {
+    switch (codecType) {
+        case CodecType.H264: return 'H.264';
+        case CodecType.AV1: return 'AV1';
+        case CodecType.PNG: return 'PNG';
+        default: return 'Unknown';
     }
 }
 
@@ -736,7 +711,7 @@ class BasiliskWebRTC {
         this.audioCapturing = false;  // Flag for synchronized audio capture
 
         // Codec/decoder management
-        this.codecType = CodecType.H264;  // Default to H.264
+        this.codecType = null;  // Will be set by server
         this.decoder = null;
 
         // Stats tracking
@@ -770,9 +745,6 @@ class BasiliskWebRTC {
         // Frame detection for black screen debugging
         this.firstFrameReceived = false;
         this.frameCheckInterval = null;
-
-        // Ping timer for RTT measurement
-        this.pingTimer = null;
     }
 
     // Set codec type before connecting
@@ -789,11 +761,16 @@ class BasiliskWebRTC {
 
     // Initialize decoder based on codec type
     initDecoder() {
+        if (!this.codecType) {
+            logger.warn('Cannot initialize decoder - codec not yet set by server');
+            return false;
+        }
+
         if (this.decoder) {
             this.decoder.cleanup();
         }
 
-        // AV1 and H.264 use video element, PNG/RAW use canvas
+        // AV1 and H.264 use video element, PNG uses canvas
         const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
         const element = usesVideoElement ? this.video : this.canvas;
         if (!element) {
@@ -828,15 +805,10 @@ class BasiliskWebRTC {
         this.cleanup();
         connectionSteps.reset();
 
-        // Initialize decoder for selected codec
-        if (!this.initDecoder()) {
-            logger.error('Failed to initialize decoder');
-            this.updateStatus('Decoder init failed', 'error');
-            return;
-        }
+        // Note: Decoder will be initialized once server sends codec in "connected" message
 
         if (debugConfig.debug_connection) {
-            logger.info('Connecting to signaling server', { url: this.wsUrl, codec: this.codecType });
+            logger.info('Connecting to signaling server', { url: this.wsUrl });
         }
         this.updateStatus('Connecting...', 'connecting');
         connectionSteps.setActive('ws');
@@ -911,10 +883,7 @@ class BasiliskWebRTC {
             case 'connected':
                 // Server tells us which codec to use
                 if (msg.codec) {
-                    const serverCodec = msg.codec === 'h264' ? CodecType.H264 :
-                                       msg.codec === 'av1' ? CodecType.AV1 :
-                                       msg.codec === 'png' ? CodecType.PNG :
-                                       msg.codec === 'raw' ? CodecType.RAW : CodecType.PNG;
+                    const serverCodec = parseCodecString(msg.codec);
                     if (serverCodec !== this.codecType) {
                         if (debugConfig.debug_connection) {
                             logger.info('Server codec', { codec: msg.codec });
@@ -925,11 +894,18 @@ class BasiliskWebRTC {
                         this.initDecoder();
                     }
 
-                    // Update codec selector UI and enable it
+                    // Update codec selector UI
                     const codecSelect = document.getElementById('codec-select');
                     if (codecSelect) {
                         codecSelect.value = msg.codec;
+                        // Enable selector now that we're connected
                         codecSelect.disabled = false;
+                    }
+
+                    // Update codec badge immediately
+                    const codecBadge = document.getElementById('codec-badge');
+                    if (codecBadge) {
+                        codecBadge.textContent = getCodecLabel(this.codecType);
                     }
                 }
                 if (debugConfig.debug_connection) {
@@ -957,11 +933,7 @@ class BasiliskWebRTC {
                 logger.info('Server requested reconnection', { reason: msg.reason, codec: msg.codec });
                 if (msg.reason === 'codec_change' && msg.codec) {
                     // Update codec type
-                    const newCodec = msg.codec === 'h264' ? CodecType.H264 :
-                                    msg.codec === 'av1' ? CodecType.AV1 :
-                                    msg.codec === 'png' ? CodecType.PNG :
-                                    msg.codec === 'raw' ? CodecType.RAW : CodecType.PNG;
-                    this.codecType = newCodec;
+                    this.codecType = parseCodecString(msg.codec);
                     this.stats.codec = msg.codec;
                 }
                 // Reconnect the PeerConnection with new codec
@@ -1334,6 +1306,13 @@ class BasiliskWebRTC {
         this.updateStatus('Connected', 'connected');
         this.hideOverlay();
         this.updateConnectionUI(true);
+
+        // Remove disconnected visual state
+        const displayContainer = document.getElementById('display-container');
+        if (displayContainer) {
+            displayContainer.classList.remove('disconnected');
+        }
+
         logger.info('Stream is playing');
     }
 
@@ -1390,6 +1369,12 @@ class BasiliskWebRTC {
             this.updateStatus('Connection ' + state, 'error');
             this.connected = false;
 
+            // Add disconnected visual state
+            const displayContainer = document.getElementById('display-container');
+            if (displayContainer) {
+                displayContainer.classList.add('disconnected');
+            }
+
             // If WebSocket is still open, just reconnect the PeerConnection
             // Otherwise do a full reconnect
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -1440,7 +1425,7 @@ class BasiliskWebRTC {
     setupDataChannel() {
         if (!this.dataChannel) return;
 
-        // Set binary type for receiving PNG/RAW frames
+        // Set binary type for receiving PNG frames
         this.dataChannel.binaryType = 'arraybuffer';
 
         this.dataChannel.onopen = () => {
@@ -1449,7 +1434,11 @@ class BasiliskWebRTC {
             }
             this.updateWebRTCState('dc', 'Open');
             this.setupInputHandlers();
-            this.startPingTimer();
+
+            // Start ping timer for PNG decoder
+            if (this.decoder && this.decoder.startPingTimer) {
+                this.decoder.startPingTimer(this.dataChannel);
+            }
         };
 
         this.dataChannel.onclose = () => {
@@ -1462,15 +1451,15 @@ class BasiliskWebRTC {
             this.updateWebRTCState('dc', 'Error');
         };
 
-        // Handle incoming messages (frames for PNG/RAW, or other messages)
+        // Handle incoming messages (frames for PNG, or other messages)
         this.dataChannel.onmessage = (event) => {
             if (event.data instanceof ArrayBuffer) {
-                // Binary data - this is a video frame for PNG/RAW codec
+                // Binary data - this is a video frame for PNG codec
                 const usesVideoTrack = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
                 if (this.decoder && !usesVideoTrack) {
                     this.decoder.handleData(event.data);
 
-                    // Track PNG/RAW frame stats
+                    // Track PNG frame stats
                     this.pngStats.framesReceived++;
                     this.pngStats.bytesReceived += event.data.byteLength;
                     this.pngStats.lastFrameTime = performance.now();
@@ -1484,11 +1473,17 @@ class BasiliskWebRTC {
                             logger.info('First frame received via DataChannel');
                         }
 
-                        // For PNG/RAW codecs, mark as connected and hide overlay
+                        // For PNG codec, mark as connected and hide overlay
                         this.connected = true;
                         this.updateStatus('Connected', 'connected');
                         this.hideOverlay();
                         this.updateConnectionUI(true);
+
+                        // Remove disconnected visual state
+                        const displayContainer = document.getElementById('display-container');
+                        if (displayContainer) {
+                            displayContainer.classList.remove('disconnected');
+                        }
                     }
                 }
             } else {
@@ -1509,7 +1504,7 @@ class BasiliskWebRTC {
     }
 
     setupInputHandlers() {
-        // Use the appropriate display element (video for H.264/AV1, canvas for PNG/RAW)
+        // Use the appropriate display element (video for H.264/AV1, canvas for PNG)
         const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
         const displayElement = usesVideoElement ? this.video : this.canvas;
         if (!displayElement) return;
@@ -1621,21 +1616,6 @@ class BasiliskWebRTC {
         }
     }
 
-    startPingTimer() {
-        // Stop any existing ping timer
-        if (this.pingTimer) {
-            clearInterval(this.pingTimer);
-        }
-
-        // Send ping every 1 second for RTT measurement
-        // Only when using PNG/RAW codec (decoder has sendPing method)
-        this.pingTimer = setInterval(() => {
-            if (this.decoder && this.decoder.sendPing && this.dataChannel) {
-                this.decoder.sendPing(this.dataChannel);
-            }
-        }, 1000);
-    }
-
     scheduleReconnect() {
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -1668,10 +1648,6 @@ class BasiliskWebRTC {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
-        if (this.pingTimer) {
-            clearInterval(this.pingTimer);
-            this.pingTimer = null;
-        }
         if (this.decoder) {
             this.decoder.cleanup();
             this.decoder = null;
@@ -1700,6 +1676,18 @@ class BasiliskWebRTC {
         this.updateStatus('Disconnected', 'error');
         this.updateConnectionUI(false);
         this.showOverlay('Disconnected', 'Click Connect to reconnect');
+
+        // Disable codec selector when disconnected
+        const codecSelect = document.getElementById('codec-select');
+        if (codecSelect) {
+            codecSelect.disabled = true;
+        }
+
+        // Add disconnected visual state
+        const displayContainer = document.getElementById('display-container');
+        if (displayContainer) {
+            displayContainer.classList.add('disconnected');
+        }
     }
 
     // Stats collection
@@ -1709,7 +1697,7 @@ class BasiliskWebRTC {
         const now = performance.now();
         const elapsed = (now - this.lastStatsTime) / 1000;
 
-        // For PNG/RAW codecs, calculate stats from our own tracking
+        // For PNG codec, calculate stats from our own tracking
         const usesVideoTrack = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
         if (!usesVideoTrack) {
             if (elapsed > 0) {
@@ -1821,19 +1809,13 @@ class BasiliskWebRTC {
         // Codec badge
         const codecBadge = document.getElementById('codec-badge');
         if (codecBadge) {
-            const codecLabel = this.codecType === CodecType.H264 ? 'H.264' :
-                              this.codecType === CodecType.AV1 ? 'AV1' :
-                              this.codecType === CodecType.PNG ? 'PNG' : 'RAW';
-            codecBadge.textContent = codecLabel;
+            codecBadge.textContent = getCodecLabel(this.codecType);
         }
 
         // Footer resolution
         const resEl = document.getElementById('resolution');
         if (resEl && width) {
-            const codecLabel = this.codecType === CodecType.H264 ? 'H.264' :
-                              this.codecType === CodecType.AV1 ? 'AV1' :
-                              this.codecType === CodecType.PNG ? 'PNG' : 'RAW';
-            resEl.textContent = `${width} x ${height} (${codecLabel})`;
+            resEl.textContent = `${width} x ${height} (${getCodecLabel(this.codecType)})`;
         }
 
         // Debug panel stats
@@ -1873,7 +1855,7 @@ class BasiliskWebRTC {
             }
         }
 
-        // Show/hide ping breakdown section based on codec (only for PNG/RAW)
+        // Show/hide ping breakdown section based on codec (only for PNG)
         const pingBreakdownSection = document.getElementById('ping-breakdown-section');
         if (pingBreakdownSection) {
             pingBreakdownSection.style.display = usesRTP ? 'none' : 'block';
@@ -2160,100 +2142,9 @@ function getWebSocketUrl() {
     return `${protocol}//${hostname}:8090/`;
 }
 
-// Log browser and codec capabilities
-async function logBrowserCapabilities() {
-    // Browser info
-    const ua = navigator.userAgent;
-    const browserMatch = ua.match(/(Firefox|Chrome|Safari|Edge|OPR)\/(\d+)/);
-    const browser = browserMatch ? `${browserMatch[1]} ${browserMatch[2]}` : 'Unknown';
-
-    logger.info('Browser', {
-        name: browser,
-        userAgent: ua.substring(0, 100) + (ua.length > 100 ? '...' : '')
-    });
-
-    // Check H.264 decode support via MediaCapabilities API
-    if ('mediaCapabilities' in navigator) {
-        try {
-            // Test H.264 Constrained Baseline Level 5.1 (what server sends)
-            const h264Config = {
-                type: 'file',
-                video: {
-                    contentType: 'video/mp4; codecs="avc1.42e033"',  // CBP Level 5.1
-                    width: 1920,
-                    height: 1080,
-                    framerate: 30,
-                    bitrate: 40000000  // 40 Mbps
-                }
-            };
-            const h264Result = await navigator.mediaCapabilities.decodingInfo(h264Config);
-            if (debugConfig.debug_connection) {
-                logger.info('H.264 CBP L5.1 decode', {
-                    supported: h264Result.supported,
-                    smooth: h264Result.smooth,
-                    powerEfficient: h264Result.powerEfficient
-                });
-            }
-
-            // Also test Level 3.1 for comparison
-            const h264L31Config = {
-                type: 'file',
-                video: {
-                    contentType: 'video/mp4; codecs="avc1.42e01f"',  // CBP Level 3.1
-                    width: 1280,
-                    height: 720,
-                    framerate: 30,
-                    bitrate: 10000000
-                }
-            };
-            const h264L31Result = await navigator.mediaCapabilities.decodingInfo(h264L31Config);
-            if (debugConfig.debug_connection) {
-                logger.info('H.264 CBP L3.1 decode', {
-                    supported: h264L31Result.supported,
-                    smooth: h264L31Result.smooth,
-                    powerEfficient: h264L31Result.powerEfficient
-                });
-            }
-        } catch (e) {
-            logger.warn('MediaCapabilities check failed', { error: e.message });
-        }
-    } else {
-        logger.warn('MediaCapabilities API not available');
-    }
-
-    // Check RTCRtpReceiver capabilities
-    if (RTCRtpReceiver.getCapabilities) {
-        const videoCaps = RTCRtpReceiver.getCapabilities('video');
-        if (videoCaps) {
-            const h264Codecs = videoCaps.codecs.filter(c => c.mimeType.includes('H264') || c.mimeType.includes('h264'));
-            if (debugConfig.debug_connection) {
-                logger.info('WebRTC H.264 codecs', {
-                    count: h264Codecs.length,
-                    profiles: h264Codecs.map(c => c.sdpFmtpLine || 'default').join('; ')
-                });
-            }
-        }
-    }
-
-    // Hardware acceleration check (Chrome-specific)
-    if ('gpu' in navigator) {
-        try {
-            const adapter = await navigator.gpu?.requestAdapter();
-            if (adapter) {
-                logger.info('WebGPU available', { name: adapter.name || 'unknown' });
-            }
-        } catch (e) {
-            // WebGPU not available
-        }
-    }
-}
-
 function initClient() {
     logger.init();
     logger.info('Basilisk II WebRTC Client initialized');
-
-    // Log browser capabilities asynchronously
-    logBrowserCapabilities().catch(e => logger.warn('Capability check failed', { error: e.message }));
 
     const video = document.getElementById('display');
     const canvas = document.getElementById('display-canvas');
@@ -2264,17 +2155,23 @@ function initClient() {
 
     client = new BasiliskWebRTC(video, canvas);
 
-    // Codec is now determined by server (from prefs file webcodec setting)
-    // Client will receive codec in "connected" message and switch if needed
+    // Note: Codec is determined by server (from prefs file webcodec setting)
+    // Client will receive codec in "connected" message and initialize decoder then
 
     // Start stats collection
     statsInterval = setInterval(() => {
         if (client) client.updateStats();
     }, 1000);
 
+    // Set initial disconnected visual state
+    const displayContainer = document.getElementById('display-container');
+    if (displayContainer) {
+        displayContainer.classList.add('disconnected');
+    }
+
     // Auto-connect
     const wsUrl = getWebSocketUrl();
-    logger.info('Auto-connecting', { url: wsUrl, codec: client.codecType });
+    logger.info('Auto-connecting', { url: wsUrl });
     client.connect(wsUrl);
 }
 
@@ -2867,6 +2764,13 @@ async function startEmulator() {
 
 async function stopEmulator() {
     logger.info('Stopping emulator...');
+
+    // Immediately show disconnected state (polling will confirm in 2s)
+    const displayContainer = document.getElementById('display-container');
+    if (displayContainer) {
+        displayContainer.classList.add('disconnected');
+    }
+
     try {
         const res = await fetch(getApiUrl('emulator/stop'), { method: 'POST' });
         const data = await res.json();
@@ -2936,19 +2840,33 @@ async function pollEmulatorStatus() {
         // Update emulator status in header status bar
         const emuStatusDot = document.getElementById('emulator-status-dot');
         const emuStatusText = document.getElementById('emulator-status-text');
+        const displayContainer = document.getElementById('display-container');
+
         if (emuStatusDot && emuStatusText) {
             if (data.emulator_running && data.emulator_connected) {
                 emuStatusDot.style.background = '#4CAF50';  // Green
                 emuStatusText.textContent = 'ON';
                 emuStatusText.style.color = '#4CAF50';
+                // Remove disconnected state when emulator is fully running
+                if (displayContainer) {
+                    displayContainer.classList.remove('disconnected');
+                }
             } else if (data.emulator_running) {
                 emuStatusDot.style.background = '#FF9800';  // Orange
                 emuStatusText.textContent = 'STARTING';
                 emuStatusText.style.color = '#FF9800';
+                // Keep disconnected state while starting
+                if (displayContainer) {
+                    displayContainer.classList.add('disconnected');
+                }
             } else {
                 emuStatusDot.style.background = '#666';  // Gray
                 emuStatusText.textContent = 'OFF';
                 emuStatusText.style.color = '#999';
+                // Add disconnected state when emulator is off
+                if (displayContainer) {
+                    displayContainer.classList.add('disconnected');
+                }
             }
         }
 

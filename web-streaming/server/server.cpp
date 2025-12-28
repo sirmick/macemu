@@ -617,7 +617,7 @@ struct PeerConnection {
     std::string id;
     CodecType codec = CodecType::H264;  // Codec type for this peer
     bool ready = false;
-    bool needs_first_frame = true;  // PNG/RAW peers need full first frame
+    bool needs_first_frame = true;  // PNG peers need full first frame
     // Note: pending_candidates removed - libdatachannel queues candidates internally
 };
 
@@ -994,7 +994,6 @@ public:
         int h264 = 0;
         int av1 = 0;
         int png = 0;
-        int raw = 0;
     };
 
     CodecPeerCounts get_codec_peer_counts() {
@@ -1006,7 +1005,6 @@ public:
                 case CodecType::H264: counts.h264++; break;
                 case CodecType::AV1: counts.av1++; break;
                 case CodecType::PNG: counts.png++; break;
-                case CodecType::RAW: counts.raw++; break;
             }
         }
         return counts;
@@ -1042,8 +1040,7 @@ public:
     // Send "reconnect" message to all clients (for codec changes)
     void notify_codec_change(CodecType new_codec) {
         const char* codec_name = (new_codec == CodecType::H264) ? "h264" :
-                                 (new_codec == CodecType::AV1) ? "av1" :
-                                 (new_codec == CodecType::PNG) ? "png" : "raw";
+                                 (new_codec == CodecType::AV1) ? "av1" : "png";
 
         json msg = {
             {"type", "reconnect"},
@@ -1204,8 +1201,7 @@ private:
             // Use server-side codec preference (from prefs file)
             peer->codec = g_server_codec;
             const char* codec_name = (g_server_codec == CodecType::H264) ? "h264" :
-                                     (g_server_codec == CodecType::AV1) ? "av1" :
-                                     (g_server_codec == CodecType::PNG) ? "png" : "raw";
+                                     (g_server_codec == CodecType::AV1) ? "av1" : "png";
             if (g_debug_connection) {
                 fprintf(stderr, "[WebRTC] Peer %s using %s codec (server-configured)\n",
                         peer_id.c_str(), codec_name);
@@ -1273,7 +1269,7 @@ private:
                     setup_av1_track(peer);
                 }
             } else {
-                // PNG/RAW codecs use DataChannel for video, mark as ready immediately
+                // PNG codec uses DataChannel for video, mark as ready immediately
                 // when DataChannel opens (no video track needed)
                 if (g_debug_connection) {
                     fprintf(stderr, "[WebRTC] Peer %s using %s codec via DataChannel (no video track)\n",
@@ -1321,11 +1317,11 @@ private:
                 if (g_debug_connection) {
                     fprintf(stderr, "[WebRTC] DataChannel OPEN for %s\n", peer_id.c_str());
                 }
-                // For PNG/RAW codecs (no video track), mark peer as ready when DataChannel opens
-                if (peer->codec == CodecType::PNG || peer->codec == CodecType::RAW) {
+                // For PNG codec (no video track), mark peer as ready when DataChannel opens
+                if (peer->codec == CodecType::PNG) {
                     peer->ready = true;
                     if (g_debug_connection) {
-                        fprintf(stderr, "[WebRTC] PNG/RAW peer %s marked ready (DataChannel opened)\n", peer_id.c_str());
+                        fprintf(stderr, "[WebRTC] PNG peer %s marked ready (DataChannel opened)\n", peer_id.c_str());
                     }
                 }
             });
@@ -1551,7 +1547,7 @@ private:
             }
             case 'P': {
                 // Ping: P sequence,timestamp
-                // NOTE: Ping responses are only sent in PNG/RAW codec mode via DataChannel metadata header.
+                // NOTE: Ping responses are only sent in PNG codec mode via DataChannel metadata header.
                 // H.264 uses RTP video track with no metadata support - ping echoes would be discarded.
                 uint32_t sequence = 0;
                 double ts = 0;

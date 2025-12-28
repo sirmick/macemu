@@ -3,8 +3,8 @@
  *
  * Allows switching between different encoding strategies:
  * - H.264 via OpenH264 (WebRTC video track)
- * - PNG for dithered content (DataChannel binary)
- * - Raw RGBA (DataChannel binary, highest bandwidth)
+ * - AV1 via SVT-AV1 (WebRTC video track, best for dithered content)
+ * - PNG for dithered content (DataChannel binary, supports dirty rects)
  */
 
 #ifndef CODEC_H
@@ -16,8 +16,7 @@
 enum class CodecType {
     H264,       // WebRTC video track with H.264
     AV1,        // WebRTC video track with AV1 (best for dithered content)
-    PNG,        // PNG over DataChannel (good for dithered)
-    RAW         // Raw RGBA over DataChannel (lowest latency)
+    PNG         // PNG over DataChannel (good for dithered, supports dirty rects)
 };
 
 struct EncodedFrame {
