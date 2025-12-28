@@ -32,6 +32,10 @@
         </div>
 
         <div class="controls">
+            <div style="display: flex; align-items: center; gap: 8px; padding: 4px 12px;">
+                <label style="font-size: 0.9em; color: #aaa;">Resolution:</label>
+                <span id="header-resolution" style="color: #fff; font-weight: 500;">-- x --</span>
+            </div>
             <div class="codec-selector">
                 <label for="codec-select">Codec:</label>
                 <select id="codec-select" onchange="changeCodec()" disabled>
@@ -46,10 +50,6 @@
                     <option value="relative" selected>Relative</option>
                     <option value="absolute">Absolute</option>
                 </select>
-            </div>
-            <div class="codec-selector" style="pointer-events: none;">
-                <label>Resolution:</label>
-                <span id="header-resolution" style="color: #fff; font-weight: 500;">-- x --</span>
             </div>
             <button class="btn" id="config-btn" onclick="openConfig()">Settings</button>
             <button class="btn success" id="start-btn" onclick="startEmulator()">Start</button>
