@@ -47,6 +47,10 @@
                     <option value="absolute">Absolute</option>
                 </select>
             </div>
+            <div class="codec-selector" style="pointer-events: none;">
+                <label>Resolution:</label>
+                <span id="header-resolution" style="color: #fff; font-weight: 500;">-- x --</span>
+            </div>
             <button class="btn" id="config-btn" onclick="openConfig()">Settings</button>
             <button class="btn success" id="start-btn" onclick="startEmulator()">Start</button>
             <button class="btn danger" id="stop-btn" onclick="stopEmulator()">Stop</button>

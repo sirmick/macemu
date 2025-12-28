@@ -11,13 +11,43 @@ const debugConfig = {
     debug_perf: false          // Performance stats, ping logs
 };
 
-// Fetch debug config from server
-async function fetchDebugConfig() {
+// Store UI config from server
+let serverUIConfig = {
+    webcodec: 'h264',
+    mousemode: 'relative',
+    resolution: '800x600'
+};
+
+async function fetchConfig() {
     try {
         const response = await fetch('/api/config');
         const config = await response.json();
         Object.assign(debugConfig, config);
         console.log('[Browser] Debug config:', debugConfig);
+
+        // Store UI config from server
+        if (config.webcodec) serverUIConfig.webcodec = config.webcodec;
+        if (config.mousemode) serverUIConfig.mousemode = config.mousemode;
+        if (config.resolution) serverUIConfig.resolution = config.resolution;
+
+        // Set UI dropdowns to match server config
+        const codecSelect = document.getElementById('codec-select');
+        if (codecSelect && config.webcodec) {
+            codecSelect.value = config.webcodec;
+        }
+
+        const mouseSelect = document.getElementById('mouse-mode-select');
+        if (mouseSelect && config.mousemode) {
+            mouseSelect.value = config.mousemode;
+        }
+
+        // Set initial resolution display
+        const headerResEl = document.getElementById('header-resolution');
+        if (headerResEl && config.resolution) {
+            headerResEl.textContent = config.resolution;
+        }
+
+        console.log('[Browser] UI config loaded:', serverUIConfig);
     } catch (e) {
         console.warn('[Browser] Failed to fetch debug config, using defaults');
     }
@@ -774,6 +804,10 @@ class BasiliskWebRTC {
         this.lastStatsTime = performance.now();
         this.lastBytesReceived = 0;
         this.lastFramesDecoded = 0;
+
+        // Cached resolution to avoid unnecessary DOM updates
+        this.cachedWidth = 0;
+        this.cachedHeight = 0;
 
         // PNG/DataChannel stats
         this.pngStats = {
@@ -2082,16 +2116,32 @@ class BasiliskWebRTC {
             height = this.canvas.height;
         }
 
-        // Codec badge
-        const codecBadge = document.getElementById('codec-badge');
-        if (codecBadge) {
-            codecBadge.textContent = getCodecLabel(this.codecType);
-        }
+        // Only update resolution display if it changed (avoid unnecessary DOM updates)
+        if (width !== this.cachedWidth || height !== this.cachedHeight) {
+            this.cachedWidth = width;
+            this.cachedHeight = height;
 
-        // Footer resolution
-        const resEl = document.getElementById('resolution');
-        if (resEl && width) {
-            resEl.textContent = `${width} x ${height} (${getCodecLabel(this.codecType)})`;
+            // Codec badge
+            const codecBadge = document.getElementById('codec-badge');
+            if (codecBadge) {
+                codecBadge.textContent = getCodecLabel(this.codecType);
+            }
+
+            // Footer resolution
+            const resEl = document.getElementById('resolution');
+            if (resEl && width) {
+                resEl.textContent = `${width} x ${height} (${getCodecLabel(this.codecType)})`;
+            }
+
+            // Header resolution
+            const headerResEl = document.getElementById('header-resolution');
+            if (headerResEl) {
+                if (width && height) {
+                    headerResEl.textContent = `${width} x ${height}`;
+                } else {
+                    headerResEl.textContent = '-- x --';
+                }
+            }
         }
 
         // Debug panel stats
@@ -2601,6 +2651,10 @@ frameskip 0
 scale_nearest false
 scale_integer false
 
+# WebRTC streaming settings
+webcodec {{WEBCODEC}}
+mousemode {{MOUSEMODE}}
+
 # Input settings
 keyboardtype 5
 keycodes false
@@ -2657,7 +2711,9 @@ function parsePrefsFile(content) {
         model: 14,
         fpu: true,
         jit: true,
-        sound: true
+        sound: true,
+        webcodec: 'h264',
+        mousemode: 'relative'
     };
 
     if (!content) return config;
@@ -2713,6 +2769,12 @@ function parsePrefsFile(content) {
             case 'nosound':
                 config.sound = value !== 'true';
                 break;
+            case 'webcodec':
+                config.webcodec = value;
+                break;
+            case 'mousemode':
+                config.mousemode = value;
+                break;
         }
     }
 
@@ -2743,7 +2805,9 @@ function generatePrefsFile(config, romsPath, imagesPath) {
         .replace('{{MODEL}}', config.model.toString())
         .replace('{{FPU}}', config.fpu ? 'true' : 'false')
         .replace('{{JIT}}', config.jit ? 'true' : 'false')
-        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true');
+        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true')
+        .replace('{{WEBCODEC}}', config.webcodec || 'h264')
+        .replace('{{MOUSEMODE}}', config.mousemode || 'relative');
 
     return prefs;
 }
@@ -3233,7 +3297,7 @@ setInterval(pollEmulatorStatus, 2000);
 
 // Initialize on page load
 window.addEventListener('DOMContentLoaded', async () => {
-    await fetchDebugConfig();  // Load debug flags from server
+    await fetchConfig();  // Load config from server
     initClient();
     pollEmulatorStatus();
 });

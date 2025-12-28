@@ -76,11 +76,62 @@ Response APIRouter::handle(const Request& req, bool* handled) {
 }
 
 Response APIRouter::handle_config(const Request& req) {
+    // Parse prefs file to extract webcodec and mousemode
+    std::string prefs_content = storage::read_prefs_file(ctx_->prefs_path);
+    std::string webcodec = "h264";  // default
+    std::string mousemode = "relative";  // default
+    std::string resolution = "800x600";  // default
+
+    // Parse prefs file line by line
+    std::istringstream stream(prefs_content);
+    std::string line;
+    while (std::getline(stream, line)) {
+        // Trim whitespace
+        size_t start = line.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos || line[start] == '#') continue;
+
+        size_t space = line.find(' ', start);
+        if (space == std::string::npos) continue;
+
+        std::string key = line.substr(start, space - start);
+        std::string value = line.substr(space + 1);
+
+        // Trim value
+        size_t value_start = value.find_first_not_of(" \t\r\n");
+        if (value_start != std::string::npos) {
+            value = value.substr(value_start);
+            size_t value_end = value.find_last_not_of(" \t\r\n");
+            if (value_end != std::string::npos) {
+                value = value.substr(0, value_end + 1);
+            }
+        }
+
+        if (key == "webcodec") {
+            webcodec = value;
+        } else if (key == "mousemode") {
+            mousemode = value;
+        } else if (key == "screen") {
+            // Parse "ipc/800/600" format
+            size_t slash1 = value.find('/');
+            if (slash1 != std::string::npos) {
+                size_t slash2 = value.find('/', slash1 + 1);
+                if (slash2 != std::string::npos) {
+                    std::string w = value.substr(slash1 + 1, slash2 - slash1 - 1);
+                    std::string h = value.substr(slash2 + 1);
+                    resolution = w + "x" + h;
+                }
+            }
+        }
+    }
+
     std::ostringstream json;
     json << "{";
     json << "\"debug_connection\": " << (ctx_->debug_connection ? "true" : "false");
     json << ", \"debug_mode_switch\": " << (ctx_->debug_mode_switch ? "true" : "false");
     json << ", \"debug_perf\": " << (ctx_->debug_perf ? "true" : "false");
+    json << ", \"webcodec\": \"" << storage::json_escape(webcodec) << "\"";
+    json << ", \"mousemode\": \"" << storage::json_escape(mousemode) << "\"";
+    json << ", \"resolution\": \"" << storage::json_escape(resolution) << "\"";
     json << "}";
     return Response::json(json.str());
 }
