@@ -422,7 +422,8 @@ class PNGDecoder extends VideoDecoder {
 
     // Handle PNG data from DataChannel
     // Frame format: [8-byte t1_frame_ready] [4-byte x] [4-byte y] [4-byte width] [4-byte height]
-    //               [4-byte frame_width] [4-byte frame_height] [8-byte t4_send_time] [PNG data]
+    //               [4-byte frame_width] [4-byte frame_height] [8-byte t4_send_time]
+    //               [44-byte ping data] [8-byte cursor data] [PNG data]
     handleData(data) {
         if (!this.ctx) return;
 
@@ -432,8 +433,8 @@ class PNGDecoder extends VideoDecoder {
         let rectX = 0, rectY = 0, rectWidth = 0, rectHeight = 0;
         let frameWidth = 0, frameHeight = 0;
 
-        // Parse metadata header if present (ArrayBuffer with at least 84 bytes + PNG signature)
-        if (data instanceof ArrayBuffer && data.byteLength > 92) {
+        // Parse metadata header if present (ArrayBuffer with at least 113 bytes + PNG signature)
+        if (data instanceof ArrayBuffer && data.byteLength > 121) {
             const view = new DataView(data);
 
             // Read T1: 8-byte emulator frame ready time (ms since Unix epoch)
@@ -456,32 +457,55 @@ class PNGDecoder extends VideoDecoder {
             hi = view.getUint32(36, true);
             t4_send = lo + hi * 0x100000000;
 
+            // Read cursor position (5 bytes: x, y, visible)
+            const cursorX = view.getUint16(40, true);
+            const cursorY = view.getUint16(42, true);
+            const cursorVisible = view.getUint8(44);
+
+            // Update cursor state
+            this.currentCursorX = cursorX;
+            this.currentCursorY = cursorY;
+            this.cursorVisible = (cursorVisible !== 0);
+            if (this.mouseMode === 'absolute') {
+                this.renderCursor();
+            }
+
             // Read ping echo with full roundtrip timestamps
-            const pingSeq = view.getUint32(40, true);
+            const pingSeq = view.getUint32(45, true);
 
             // Browser send time (performance.now() milliseconds)
-            lo = view.getUint32(44, true);
-            hi = view.getUint32(48, true);
+            lo = view.getUint32(49, true);
+            hi = view.getUint32(53, true);
             const ping_browser_send_ms = lo + hi * 0x100000000;
 
             // Server receive time (CLOCK_REALTIME microseconds)
-            lo = view.getUint32(52, true);
-            hi = view.getUint32(56, true);
+            lo = view.getUint32(57, true);
+            hi = view.getUint32(61, true);
             const ping_server_recv_us = lo + hi * 0x100000000;
 
             // Emulator receive time (CLOCK_REALTIME microseconds)
-            lo = view.getUint32(60, true);
-            hi = view.getUint32(64, true);
+            lo = view.getUint32(65, true);
+            hi = view.getUint32(69, true);
             const ping_emulator_recv_us = lo + hi * 0x100000000;
 
             // Frame ready time (CLOCK_REALTIME microseconds)
-            lo = view.getUint32(68, true);
-            hi = view.getUint32(72, true);
+            lo = view.getUint32(73, true);
+            hi = view.getUint32(77, true);
             const ping_frame_ready_us = lo + hi * 0x100000000;
 
-            // Server send time (CLOCK_REALTIME microseconds)
-            lo = view.getUint32(76, true);
-            hi = view.getUint32(80, true);
+            // Server read from SHM (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(81, true);
+            hi = view.getUint32(85, true);
+            const ping_server_read_us = lo + hi * 0x100000000;
+
+            // Encoding finished (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(89, true);
+            hi = view.getUint32(93, true);
+            const ping_encode_done_us = lo + hi * 0x100000000;
+
+            // Server sending (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(97, true);
+            hi = view.getUint32(101, true);
             const ping_server_send_us = lo + hi * 0x100000000;
 
             // Calculate all latencies if this frame echoes our ping
@@ -500,18 +524,19 @@ class PNGDecoder extends VideoDecoder {
                     }
                     this.lastReceivedPingSeq = pingSeq;
 
-                    // Process ping echo
+                    // Process ping echo with all 8 timestamps
                     const ping_browser_recv_ms = performance.now();
                     this.handlePingEcho(pingSeq, ping_browser_send_ms, ping_server_recv_us,
                                        ping_emulator_recv_us, ping_frame_ready_us,
+                                       ping_server_read_us, ping_encode_done_us,
                                        ping_server_send_us, ping_browser_recv_ms);
                 }
                 // Else: duplicate echo (expected due to 5-frame echo), silently ignore
             }
             // Note: Pings are sent every 1 second and echoed in 5 consecutive frames
 
-            // PNG data starts after 84-byte header
-            pngData = data.slice(84);
+            // PNG data starts after 113-byte header (40 base + 5 cursor + 68 ping with 7 timestamps)
+            pngData = data.slice(113);
         }
 
         // Create blob from PNG data
@@ -541,6 +566,10 @@ class PNGDecoder extends VideoDecoder {
                         logger.info('Canvas resized', { width: frameWidth, height: frameHeight });
                     }
                 }
+                // Update screen dimensions for absolute mouse mode (if onFrame callback exists)
+                if (this.onFrame && this.onFrame.updateScreenSize) {
+                    this.onFrame.updateScreenSize(frameWidth, frameHeight);
+                }
             }
 
             // Draw bitmap at dirty rect position
@@ -551,7 +580,7 @@ class PNGDecoder extends VideoDecoder {
             this.lastFrameTime = performance.now();
 
             if (this.onFrame) {
-                this.onFrame(this.frameCount);
+                this.onFrame(this.frameCount, { cursorX, cursorY, cursorVisible, frameWidth, frameHeight });
             }
 
             // Log latency stats periodically (every 3 seconds)
@@ -576,7 +605,7 @@ class PNGDecoder extends VideoDecoder {
     }
 
     handlePingEcho(sequence, browser_send_ms, server_recv_us, emulator_recv_us,
-                   frame_ready_us, server_send_us, browser_recv_ms) {
+                   frame_ready_us, server_read_us, encode_done_us, server_send_us, browser_recv_ms) {
         // Calculate latencies at each hop
         // Note: browser_send/recv use browser clock (performance.now())
         //       server/emulator timestamps use CLOCK_REALTIME (microseconds)
@@ -584,18 +613,22 @@ class PNGDecoder extends VideoDecoder {
         // Total RTT (browser clock only - accurate!)
         const total_rtt_ms = browser_recv_ms - browser_send_ms;
 
-        // Server-side latencies (same clock - accurate!)
-        const ipc_latency_us = emulator_recv_us - server_recv_us;     // Server → Emulator IPC
-        const frame_wait_us = frame_ready_us - emulator_recv_us;      // Wait for next frame
-        const encode_send_us = server_send_us - frame_ready_us;       // PNG encode + send
+        // Server-side latencies (same clock - accurate!) - now with complete breakdown
+        const ipc_latency_us = emulator_recv_us - server_recv_us;     // t2→t3: Server → Emulator IPC
+        const emulator_proc_us = frame_ready_us - emulator_recv_us;   // t3→t4: Emulator processing → frame ready
+        const wake_latency_us = server_read_us - frame_ready_us;      // t4→t5: Frame ready → server wakes up
+        const encode_us = encode_done_us - server_read_us;            // t5→t6: Encoding time
+        const send_prep_us = server_send_us - encode_done_us;         // t6→t7: Packetizing/send prep
 
         // Convert microseconds to milliseconds
         const ipc_latency_ms = ipc_latency_us / 1000.0;
-        const frame_wait_ms = frame_wait_us / 1000.0;
-        const encode_send_ms = encode_send_us / 1000.0;
+        const emulator_proc_ms = emulator_proc_us / 1000.0;
+        const wake_latency_ms = wake_latency_us / 1000.0;
+        const encode_ms = encode_us / 1000.0;
+        const send_prep_ms = send_prep_us / 1000.0;
 
         // Network latency (estimated as remainder after subtracting known server-side latencies)
-        const server_side_total_ms = ipc_latency_ms + frame_wait_ms + encode_send_ms;
+        const server_side_total_ms = ipc_latency_ms + emulator_proc_ms + wake_latency_ms + encode_ms + send_prep_ms;
         const network_ms = total_rtt_ms - server_side_total_ms;
 
         // Get current time for logging and stats
@@ -611,14 +644,16 @@ class PNGDecoder extends VideoDecoder {
             logger.warn(`[Ping] Unusually high RTT: ${total_rtt_ms.toFixed(1)}ms (not included in average)`);
         }
 
-        // Store latest ping breakdown for stats panel
+        // Store latest ping breakdown for stats panel (complete 8-stage breakdown)
         this.latestPing = {
             sequence: sequence,
             total_rtt_ms: total_rtt_ms,
             network_ms: network_ms,
             ipc_ms: ipc_latency_ms,
-            wait_ms: frame_wait_ms,
-            encode_ms: encode_send_ms,
+            emulator_ms: emulator_proc_ms,
+            wake_ms: wake_latency_ms,
+            encode_ms: encode_ms,
+            send_prep_ms: send_prep_ms,
             timestamp: now
         };
 
@@ -628,7 +663,8 @@ class PNGDecoder extends VideoDecoder {
         if (debugConfig.debug_perf) {
             const rttLog = `Ping #${sequence} RTT ${total_rtt_ms.toFixed(1)}ms: ` +
                           `net=${network_ms.toFixed(1)}ms ipc=${ipc_latency_ms.toFixed(1)}ms ` +
-                          `wait=${frame_wait_ms.toFixed(1)}ms enc=${encode_send_ms.toFixed(1)}ms | ` +
+                          `emu=${emulator_proc_ms.toFixed(1)}ms wake=${wake_latency_ms.toFixed(1)}ms ` +
+                          `enc=${encode_ms.toFixed(1)}ms send=${send_prep_ms.toFixed(1)}ms | ` +
                           `avg=${avgRtt.toFixed(1)}ms (${this.rttSamples})`;
             logger.info(rttLog);
         }
@@ -713,6 +749,18 @@ class BasiliskWebRTC {
         // Codec/decoder management
         this.codecType = null;  // Will be set by server
         this.decoder = null;
+
+        // Mouse mode ('absolute' or 'relative')
+        this.mouseMode = 'relative';  // Default to relative (matches UI and emulator)
+        this.currentScreenWidth = 0;  // Mac screen dimensions (from server)
+        this.currentScreenHeight = 0;
+
+        // Cursor overlay (for absolute mode)
+        this.cursorOverlay = document.getElementById('cursor-overlay');
+        this.cursorCtx = this.cursorOverlay ? this.cursorOverlay.getContext('2d') : null;
+        this.currentCursorX = 0;
+        this.currentCursorY = 0;
+        this.cursorVisible = false;
 
         // Stats tracking
         this.stats = {
@@ -1195,6 +1243,10 @@ class BasiliskWebRTC {
                         height: this.video.videoHeight
                     });
                     this.updateWebRTCState('video-size', `${this.video.videoWidth} x ${this.video.videoHeight}`);
+
+                    // Update screen dimensions for absolute mouse mode
+                    this.currentScreenWidth = this.video.videoWidth;
+                    this.currentScreenHeight = this.video.videoHeight;
                 };
 
                 this.video.onloadeddata = () => {
@@ -1435,6 +1487,9 @@ class BasiliskWebRTC {
             this.updateWebRTCState('dc', 'Open');
             this.setupInputHandlers();
 
+            // Send initial mouse mode to emulator
+            this.sendMouseModeChange(this.mouseMode);
+
             // Start ping timer for PNG decoder
             if (this.decoder && this.decoder.startPingTimer) {
                 this.decoder.startPingTimer(this.dataChannel);
@@ -1454,6 +1509,14 @@ class BasiliskWebRTC {
         // Handle incoming messages (frames for PNG, or other messages)
         this.dataChannel.onmessage = (event) => {
             if (event.data instanceof ArrayBuffer) {
+                // Check if this is a frame metadata message for H.264/AV1 (65 bytes)
+                // Format: [cursor_x:2][cursor_y:2][cursor_visible:1][ping_seq:4][t1:8][t2:8][t3:8][t4:8][t5:8][t6:8][t7:8]
+                if (event.data.byteLength === 65) {
+                    const view = new DataView(event.data);
+                    this.handleFrameMetadata(view);
+                    return;
+                }
+
                 // Binary data - this is a video frame for PNG codec
                 const usesVideoTrack = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
                 if (this.decoder && !usesVideoTrack) {
@@ -1509,37 +1572,72 @@ class BasiliskWebRTC {
         const displayElement = usesVideoElement ? this.video : this.canvas;
         if (!displayElement) return;
 
-        // Click to capture mouse (pointer lock for relative movement)
+        // Mouse event handlers - support both relative and absolute modes
+
+        // Click handler - request pointer lock only in relative mode
         displayElement.addEventListener('click', () => {
-            if (!document.pointerLockElement) {
+            if (this.mouseMode === 'relative' && !document.pointerLockElement) {
                 displayElement.requestPointerLock();
             }
         });
 
-        // Mouse move - only when pointer is locked (relative movement)
-        // Include timestamp for end-to-end latency measurement
-        // Binary protocol for minimal latency
-        document.addEventListener('mousemove', (e) => {
-            if (document.pointerLockElement === displayElement) {
-                this.sendMouseMove(e.movementX, e.movementY, performance.now());
-            }
-        });
+        // Mouse move handler - supports both modes
+        const handleMouseMove = (e) => {
+            if (!this.connected) return;
 
-        // Mouse buttons (also on document when pointer locked)
+            if (this.mouseMode === 'relative') {
+                // Relative mode: use pointer lock and send deltas
+                if (document.pointerLockElement === displayElement) {
+                    this.sendMouseMove(e.movementX, e.movementY, performance.now());
+                }
+            } else {
+                // Absolute mode: calculate Mac screen coordinates from canvas position
+                if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
+                    console.warn('[Browser] Absolute mouse: screen dimensions not set yet');
+                    return;
+                }
+
+                const rect = displayElement.getBoundingClientRect();
+                const scaleX = this.currentScreenWidth / rect.width;
+                const scaleY = this.currentScreenHeight / rect.height;
+
+                const macX = Math.floor((e.clientX - rect.left) * scaleX);
+                const macY = Math.floor((e.clientY - rect.top) * scaleY);
+
+                // Clamp to screen bounds
+                const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
+                const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
+
+                if (debugConfig.debug_connection) {
+                    console.log('[Browser] Absolute mouse:', { macX: clampedX, macY: clampedY, screenW: this.currentScreenWidth, screenH: this.currentScreenHeight });
+                }
+
+                this.sendMouseAbsolute(clampedX, clampedY, performance.now());
+            }
+        };
+        displayElement.addEventListener('mousemove', handleMouseMove);
+
+        // Mouse buttons - work in both modes
         const handleMouseDown = (e) => {
-            if (document.pointerLockElement === displayElement) {
+            if (!this.connected) return;
+
+            // In relative mode, only handle if pointer is locked
+            // In absolute mode, always handle
+            if (this.mouseMode === 'absolute' || document.pointerLockElement === displayElement) {
                 e.preventDefault();
                 this.sendMouseButton(e.button, true, performance.now());
             }
         };
         const handleMouseUp = (e) => {
-            if (document.pointerLockElement === displayElement) {
+            if (!this.connected) return;
+
+            if (this.mouseMode === 'absolute' || document.pointerLockElement === displayElement) {
                 e.preventDefault();
                 this.sendMouseButton(e.button, false, performance.now());
             }
         };
-        document.addEventListener('mousedown', handleMouseDown);
-        document.addEventListener('mouseup', handleMouseUp);
+        displayElement.addEventListener('mousedown', handleMouseDown);
+        displayElement.addEventListener('mouseup', handleMouseUp);
 
         displayElement.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -1559,23 +1657,38 @@ class BasiliskWebRTC {
         });
 
         if (debugConfig.debug_connection) {
-            logger.info('Input handlers registered (pointer lock mode)', { element: displayElement.tagName });
+            logger.info('Input handlers registered', {
+                element: displayElement.tagName,
+                mouseMode: this.mouseMode
+            });
         }
     }
 
     // Binary protocol helpers (matches browser input format sent to server)
     // Format: [type:1] [data...]
-    // Mouse move: type=1, dx:int16, dy:int16, timestamp:float64
+    // Mouse move (relative): type=1, dx:int16, dy:int16, timestamp:float64
     // Mouse button: type=2, button:uint8, down:uint8, timestamp:float64
     // Key: type=3, keycode:uint16, down:uint8, timestamp:float64
+    // Mouse move (absolute): type=5, x:uint16, y:uint16, timestamp:float64
 
     sendMouseMove(dx, dy, timestamp) {
         if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
         const buffer = new ArrayBuffer(1 + 2 + 2 + 8);
         const view = new DataView(buffer);
-        view.setUint8(0, 1);  // type: mouse move
+        view.setUint8(0, 1);  // type: mouse move (relative)
         view.setInt16(1, dx, true);  // little-endian
         view.setInt16(3, dy, true);
+        view.setFloat64(5, timestamp, true);
+        this.dataChannel.send(buffer);
+    }
+
+    sendMouseAbsolute(x, y, timestamp) {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+        const buffer = new ArrayBuffer(1 + 2 + 2 + 8);
+        const view = new DataView(buffer);
+        view.setUint8(0, 5);  // type: mouse move (absolute)
+        view.setUint16(1, x, true);  // absolute X coordinate
+        view.setUint16(3, y, true);  // absolute Y coordinate
         view.setFloat64(5, timestamp, true);
         this.dataChannel.send(buffer);
     }
@@ -1614,6 +1727,169 @@ class BasiliskWebRTC {
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
             this.dataChannel.send(JSON.stringify(msg));
         }
+    }
+
+    // Send mouse mode change to server (type=6, mode: 0=absolute, 1=relative)
+    sendMouseModeChange(mode) {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+        const buffer = new ArrayBuffer(1 + 1);
+        const view = new DataView(buffer);
+        view.setUint8(0, 6);  // type: mouse mode change
+        view.setUint8(1, mode === 'relative' ? 1 : 0);  // 0=absolute, 1=relative
+        this.dataChannel.send(buffer);
+
+        if (debugConfig.debug_connection) {
+            logger.info('Mouse mode change sent to server', { mode });
+        }
+    }
+
+    // Handle frame metadata for H.264/AV1 (sent via data channel)
+    // Format: [cursor_x:2][cursor_y:2][cursor_visible:1][ping_seq:4][t1:8][t2:8][t3:8][t4:8][t5:8][t6:8][t7:8]
+    handleFrameMetadata(view) {
+        // Read cursor position
+        const cursorX = view.getUint16(0, true);
+        const cursorY = view.getUint16(2, true);
+        const cursorVisible = view.getUint8(4);
+
+        // Update cursor state
+        this.currentCursorX = cursorX;
+        this.currentCursorY = cursorY;
+        this.cursorVisible = (cursorVisible !== 0);
+        if (this.mouseMode === 'absolute') {
+            this.renderCursor();
+        }
+
+        // Read ping echo data
+        const pingSeq = view.getUint32(5, true);
+        if (pingSeq > 0) {
+            // Read all 7 ping timestamps (8 bytes each, little-endian)
+            let lo, hi;
+
+            // t1: Browser send time (performance.now() milliseconds)
+            lo = view.getUint32(9, true);
+            hi = view.getUint32(13, true);
+            const t1_browser_ms = lo + hi * 0x100000000;
+
+            // t2: Server receive time (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(17, true);
+            hi = view.getUint32(21, true);
+            const t2_server_us = lo + hi * 0x100000000;
+
+            // t3: Emulator receive time (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(25, true);
+            hi = view.getUint32(29, true);
+            const t3_emulator_us = lo + hi * 0x100000000;
+
+            // t4: Frame ready time (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(33, true);
+            hi = view.getUint32(37, true);
+            const t4_frame_us = lo + hi * 0x100000000;
+
+            // t5: Server read from SHM (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(41, true);
+            hi = view.getUint32(45, true);
+            const t5_server_read_us = lo + hi * 0x100000000;
+
+            // t6: Encoding finished (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(49, true);
+            hi = view.getUint32(53, true);
+            const t6_encode_done_us = lo + hi * 0x100000000;
+
+            // t7: Server sending (CLOCK_REALTIME microseconds)
+            lo = view.getUint32(57, true);
+            hi = view.getUint32(61, true);
+            const t7_server_send_us = lo + hi * 0x100000000;
+
+            // t8: Browser receive time (performance.now())
+            const t8_browser_recv_ms = performance.now();
+
+            // Process ping echo via decoder (which has the handlePingEcho method and ping stats)
+            if (this.decoder && this.decoder.handlePingEcho) {
+                this.decoder.handlePingEcho(pingSeq, t1_browser_ms, t2_server_us,
+                                           t3_emulator_us, t4_frame_us, t5_server_read_us,
+                                           t6_encode_done_us, t7_server_send_us, t8_browser_recv_ms);
+            }
+        }
+    }
+
+    // Handle cursor update message from server (type 7) - DEPRECATED, keeping for compatibility
+    // Format: [type:1] [x:uint16] [y:uint16] [visible:uint8]
+    handleCursorUpdate(view) {
+        const x = view.getUint16(1, true);  // little-endian
+        const y = view.getUint16(3, true);
+        const visible = view.getUint8(5);
+
+        this.currentCursorX = x;
+        this.currentCursorY = y;
+        this.cursorVisible = (visible !== 0);
+
+        // Render cursor overlay if in absolute mode
+        if (this.mouseMode === 'absolute') {
+            this.renderCursor();
+        }
+    }
+
+    // Render cursor on overlay canvas
+    renderCursor() {
+        if (!this.cursorCtx || !this.cursorOverlay) return;
+
+        // Get display element dimensions for scaling
+        const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+        const displayElement = usesVideoElement ? this.video : this.canvas;
+        if (!displayElement) return;
+
+        // Update overlay canvas size to match display
+        const rect = displayElement.getBoundingClientRect();
+        if (this.cursorOverlay.width !== rect.width || this.cursorOverlay.height !== rect.height) {
+            this.cursorOverlay.width = rect.width;
+            this.cursorOverlay.height = rect.height;
+            this.cursorOverlay.style.width = rect.width + 'px';
+            this.cursorOverlay.style.height = rect.height + 'px';
+            this.cursorOverlay.style.display = 'block';
+        }
+
+        // Clear canvas
+        this.cursorCtx.clearRect(0, 0, this.cursorOverlay.width, this.cursorOverlay.height);
+
+        if (!this.cursorVisible || this.currentScreenWidth === 0) return;
+
+        // Scale cursor position from Mac screen coords to display coords
+        const scaleX = rect.width / this.currentScreenWidth;
+        const scaleY = rect.height / this.currentScreenHeight;
+        const displayX = this.currentCursorX * scaleX;
+        const displayY = this.currentCursorY * scaleY;
+
+        // Draw a simple cursor (white arrow with black outline)
+        this.cursorCtx.save();
+        this.cursorCtx.translate(displayX, displayY);
+
+        // Black outline
+        this.cursorCtx.fillStyle = 'black';
+        this.cursorCtx.beginPath();
+        this.cursorCtx.moveTo(0, 0);
+        this.cursorCtx.lineTo(0, 20);
+        this.cursorCtx.lineTo(5, 15);
+        this.cursorCtx.lineTo(9, 23);
+        this.cursorCtx.lineTo(12, 21);
+        this.cursorCtx.lineTo(8, 13);
+        this.cursorCtx.lineTo(14, 13);
+        this.cursorCtx.closePath();
+        this.cursorCtx.fill();
+
+        // White fill (slightly smaller)
+        this.cursorCtx.fillStyle = 'white';
+        this.cursorCtx.beginPath();
+        this.cursorCtx.moveTo(1, 1);
+        this.cursorCtx.lineTo(1, 18);
+        this.cursorCtx.lineTo(5, 14);
+        this.cursorCtx.lineTo(8, 21);
+        this.cursorCtx.lineTo(10, 20);
+        this.cursorCtx.lineTo(7, 13);
+        this.cursorCtx.lineTo(13, 13);
+        this.cursorCtx.closePath();
+        this.cursorCtx.fill();
+
+        this.cursorCtx.restore();
     }
 
     scheduleReconnect() {
@@ -2226,6 +2502,24 @@ function showDebugTab(tabName) {
 
 function clearLog() {
     logger.clear();
+}
+
+function changeMouseMode() {
+    const select = document.getElementById('mouse-mode-select');
+    if (!select || !client) return;
+
+    const newMode = select.value;  // 'absolute' or 'relative'
+    client.mouseMode = newMode;
+
+    // Release pointer lock if switching from relative to absolute
+    if (newMode === 'absolute' && document.pointerLockElement) {
+        document.exitPointerLock();
+    }
+
+    logger.info('Mouse mode changed', { mode: newMode });
+
+    // Send mode change notification to server/emulator
+    client.sendMouseModeChange(newMode);
 }
 
 // Known ROM database with checksums and recommendations
@@ -2912,15 +3206,21 @@ async function pollEmulatorStatus() {
         if (client && client.decoder && client.decoder.getLatestPing) {
             const ping = client.decoder.getLatestPing();
             if (ping) {
+                const totalEl = document.getElementById('stat-ping-total');
                 const networkEl = document.getElementById('stat-ping-network');
                 const ipcEl = document.getElementById('stat-ping-ipc');
-                const waitEl = document.getElementById('stat-ping-wait');
+                const emulatorEl = document.getElementById('stat-ping-emulator');
+                const wakeEl = document.getElementById('stat-ping-wake');
                 const encodeEl = document.getElementById('stat-ping-encode');
+                const sendEl = document.getElementById('stat-ping-send');
 
+                if (totalEl) totalEl.textContent = ping.total_rtt_ms.toFixed(1) + ' ms';
                 if (networkEl) networkEl.textContent = ping.network_ms.toFixed(1) + ' ms';
                 if (ipcEl) ipcEl.textContent = ping.ipc_ms.toFixed(1) + ' ms';
-                if (waitEl) waitEl.textContent = ping.wait_ms.toFixed(1) + ' ms';
+                if (emulatorEl) emulatorEl.textContent = ping.emulator_ms.toFixed(1) + ' ms';
+                if (wakeEl) wakeEl.textContent = ping.wake_ms.toFixed(1) + ' ms';
                 if (encodeEl) encodeEl.textContent = ping.encode_ms.toFixed(1) + ' ms';
+                if (sendEl) sendEl.textContent = ping.send_prep_ms.toFixed(1) + ' ms';
             }
         }
     } catch (e) {

@@ -40,6 +40,13 @@
                     <option value="av1">AV1</option>
                 </select>
             </div>
+            <div class="codec-selector">
+                <label for="mouse-mode-select">Mouse:</label>
+                <select id="mouse-mode-select" onchange="changeMouseMode()">
+                    <option value="relative" selected>Relative</option>
+                    <option value="absolute">Absolute</option>
+                </select>
+            </div>
             <button class="btn" id="config-btn" onclick="openConfig()">Settings</button>
             <button class="btn success" id="start-btn" onclick="startEmulator()">Start</button>
             <button class="btn danger" id="stop-btn" onclick="stopEmulator()">Stop</button>
@@ -53,6 +60,7 @@
             <div id="display-container">
                 <video id="display" autoplay playsinline muted></video>
                 <canvas id="display-canvas" style="display: none;"></canvas>
+                <canvas id="cursor-overlay" style="position: absolute; top: 0; left: 0; pointer-events: none; display: none;"></canvas>
                 <div class="overlay" id="overlay">
                     <div class="overlay-content">
                         <div class="spinner" id="spinner"></div>
@@ -139,10 +147,14 @@
                             <div class="value" id="stat-rtt">-- ms</div>
                         </div>
                     </div>
-                    <!-- Ping Breakdown Section (PNG codec only) -->
+                    <!-- Ping Breakdown Section -->
                     <div id="ping-breakdown-section">
-                        <h4 style="margin-top: 15px; margin-bottom: 10px; color: #888;">Ping Latency Breakdown</h4>
+                        <h4 style="margin-top: 15px; margin-bottom: 10px; color: #888;">Ping Latency Breakdown (8-stage)</h4>
                         <div class="stats-grid">
+                            <div class="stat-card">
+                                <div class="label">Total RTT</div>
+                                <div class="value" id="stat-ping-total">-- ms</div>
+                            </div>
                             <div class="stat-card">
                                 <div class="label">Network</div>
                                 <div class="value" id="stat-ping-network">-- ms</div>
@@ -152,12 +164,20 @@
                                 <div class="value" id="stat-ping-ipc">-- ms</div>
                             </div>
                             <div class="stat-card">
-                                <div class="label">Frame Wait</div>
-                                <div class="value" id="stat-ping-wait">-- ms</div>
+                                <div class="label">Emulator</div>
+                                <div class="value" id="stat-ping-emulator">-- ms</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="label">Wake</div>
+                                <div class="value" id="stat-ping-wake">-- ms</div>
                             </div>
                             <div class="stat-card">
                                 <div class="label">Encode</div>
                                 <div class="value" id="stat-ping-encode">-- ms</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="label">Send Prep</div>
+                                <div class="value" id="stat-ping-send">-- ms</div>
                             </div>
                         </div>
                     </div>
