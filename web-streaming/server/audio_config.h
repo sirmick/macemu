@@ -37,17 +37,18 @@
 
 // Opus bitrate (bits per second)
 // Recommendations:
+//   - 32000 (32kbps):  Lower quality, testing for packet loss
 //   - 64000 (64kbps):  Good quality mono
 //   - 96000 (96kbps):  Good quality stereo (libdatachannel default)
 //   - 128000 (128kbps): High quality stereo
-//   - 256000 (256kbps): Very high quality stereo (current setting)
+//   - 256000 (256kbps): Very high quality stereo
 //   - 510000 (510kbps): Maximum quality stereo
-#define OPUS_BITRATE            256000
+#define OPUS_BITRATE            96000
 
 // Opus complexity (0-10)
 // Higher = better quality but more CPU
-// 10 = maximum quality
-#define OPUS_COMPLEXITY         10
+// Using moderate complexity for compatibility
+#define OPUS_COMPLEXITY         5
 
 // Opus signal type
 // OPUS_SIGNAL_MUSIC = optimize for music (current)
@@ -92,11 +93,14 @@
 
 // Build Opus profile string for WebRTC SDP
 // Format: "minptime=10;maxaveragebitrate=256000;stereo=1;sprop-stereo=1;useinbandfec=1"
+// NOTE: stereo and sprop-stereo are BOOLEAN (0 or 1), NOT channel count!
+//       stereo=1 means "enable stereo mode" (2 channels)
+//       stereo=0 means "mono mode" (1 channel)
 #define WEBRTC_OPUS_PROFILE \
     "minptime=" TOSTRING(AUDIO_FRAME_DURATION_MS) \
     ";maxaveragebitrate=" TOSTRING(OPUS_BITRATE) \
-    ";stereo=" TOSTRING(AUDIO_CHANNELS) \
-    ";sprop-stereo=" TOSTRING(AUDIO_CHANNELS) \
+    ";stereo=1" \
+    ";sprop-stereo=1" \
     ";useinbandfec=" TOSTRING(OPUS_INBAND_FEC)
 
 // ============================================================================

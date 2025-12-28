@@ -15,7 +15,6 @@
 #include "av1_encoder.h"
 #include "png_encoder.h"
 #include "opus_encoder.h"
-#include "tone_generator.h"
 #include "audio_config.h"
 
 // Utility modules
@@ -1628,7 +1627,6 @@ private:
     int port_ = 8090;
     std::unique_ptr<rtc::WebSocketServer> ws_server_;
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point audio_start_time_ = std::chrono::steady_clock::now();
 
     std::mutex peers_mutex_;
     std::map<std::string, std::shared_ptr<PeerConnection>> peers_;
@@ -2100,56 +2098,6 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
     }
 
     fprintf(stderr, "Video: Exiting frame processing loop\n");
-}
-
-
-/*
- * Audio processing loop - Tone generator only (for testing)
- */
-
-static void audio_loop_tone_only(WebRTCServer& webrtc) {
-    // Create tone generator for testing (440Hz A4 note, 48kHz stereo)
-    ToneGenerator tone_gen(48000, 2);
-    tone_gen.set_frequency(440.0);
-
-    auto last_tone_time = std::chrono::steady_clock::now();
-    uint64_t frames_sent = 0;
-
-    fprintf(stderr, "Audio: Starting audio processing loop (TONE ONLY MODE - Mac audio disabled)\n");
-
-    while (g_running) {
-        // Generate test tone at 20ms intervals
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tone_time);
-
-        if (elapsed.count() >= 20) {  // 20ms frame
-            last_tone_time = now;
-
-            // Generate tone frame
-            std::vector<int16_t> tone_samples = tone_gen.generate_frame();
-
-            if (g_audio_encoder && !tone_samples.empty()) {
-                // Encode tone to Opus (tone generator produces 48kHz, 960 samples)
-                std::vector<uint8_t> opus_data = g_audio_encoder->encode(
-                    tone_samples.data(),
-                    960  // 20ms at 48kHz
-                );
-
-                if (!opus_data.empty()) {
-                    if (g_debug_audio && frames_sent % 50 == 0) {  // Log every second
-                        fprintf(stderr, "Audio: Tone generator - encoded %zu bytes Opus\n", opus_data.size());
-                    }
-                    webrtc.send_audio_to_all_peers(opus_data, frames_sent);
-                    frames_sent++;
-                }
-            }
-        } else {
-            // Sleep for remaining time
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-
-    fprintf(stderr, "Audio: Exiting audio processing loop\n");
 }
 
 
