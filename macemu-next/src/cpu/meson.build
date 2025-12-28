@@ -27,7 +27,7 @@ endif
 cpu_lib = static_library('cpu',
   cpu_sources,
   dependencies: cpu_deps,
-  include_directories: include_directories('.')
+  include_directories: [include_directories('.'), include_directories('../common/include')]
 )
 
 cpu_dep = declare_dependency(

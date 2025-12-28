@@ -244,7 +244,13 @@ static void build_cpufunctbl (void)
 	int filled_count = 0;
 	for (i = 0; tbl[i].handler != NULL; i++) {
 		if (! tbl[i].specific) {
-			cpufunctbl[cft_map (tbl[i].opcode)] = tbl[i].handler;
+			unsigned int mapped_idx = cft_map(tbl[i].opcode);
+			cpufunctbl[mapped_idx] = tbl[i].handler;
+			// Debug first few interesting opcodes
+			if (tbl[i].opcode == 0x4efa || tbl[i].opcode == 0x2100) {
+				fprintf(stderr, "DEBUG: tbl[%d] opcode=0x%04x -> cpufunctbl[0x%04x] = %p\n",
+				        i, tbl[i].opcode, mapped_idx, (void*)tbl[i].handler);
+			}
 			filled_count++;
 		}
 	}
@@ -1403,7 +1409,29 @@ int m68k_do_specialties (void)
 void m68k_do_execute (void)
 {
 	for (;;) {
+		// DEBUG: Check if HAVE_GET_WORD_UNSWAPPED is defined
+		static int first_exec = 1;
+		if (first_exec) {
+			fprintf(stderr, "DEBUG m68k_do_execute:\n");
+#ifdef HAVE_GET_WORD_UNSWAPPED
+			fprintf(stderr, "  HAVE_GET_WORD_UNSWAPPED IS DEFINED!\n");
+#else
+			fprintf(stderr, "  HAVE_GET_WORD_UNSWAPPED is NOT defined (good)\n");
+#endif
+			fflush(stderr);
+			first_exec = 0;
+		}
+
 		uae_u32 opcode = GET_OPCODE;
+
+		// DEBUG: Print first opcode value
+		if (first_exec == 0) {
+			fprintf(stderr, "  Fetched opcode: 0x%04x\n", opcode);
+			fprintf(stderr, "  Calling cpufunctbl[0x%04x] = %p\n", opcode, (void*)cpufunctbl[opcode]);
+			fflush(stderr);
+			first_exec = -1;  // Only print once
+		}
+
 #if FLIGHT_RECORDER
 		m68k_record_step(m68k_getpc());
 #endif

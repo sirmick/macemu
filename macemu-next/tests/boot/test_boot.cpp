@@ -14,6 +14,7 @@
 #include "sysdeps.h"
 #include "cpu_emulation.h"
 #include "uae_wrapper.h"
+#include "newcpu.h"  // For regstruct and regs
 #include "main.h"
 #include "prefs.h"
 #include "video.h"
@@ -249,7 +250,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	close(rom_fd);
-	printf("ROM loaded successfully\n");
+
+	// ROM is stored in big-endian format (as in the file)
+	// UAE's do_get_mem_word() will handle byte-swapping when the CPU reads it
+	printf("ROM loaded successfully (kept in big-endian format)\n");
 
 	// Initialize everything
 	printf("\n=== Initializing Emulator ===\n");
@@ -264,35 +268,97 @@ int main(int argc, char **argv)
 	printf("FPU: %s\n", FPUType ? "Yes" : "No");
 	printf("24-bit addressing: %s\n", TwentyFourBitAddressing ? "Yes" : "No");
 
-	// Set initial PC from ROM reset vector
-	// M68K reset vector: offset 0 = initial SSP, offset 4 = initial PC
-	uint32_t initial_ssp = (ROMBaseHost[0] << 24) | (ROMBaseHost[1] << 16) |
-	                       (ROMBaseHost[2] << 8) | ROMBaseHost[3];
-	uint32_t initial_pc = (ROMBaseHost[4] << 24) | (ROMBaseHost[5] << 16) |
-	                      (ROMBaseHost[6] << 8) | ROMBaseHost[7];
+	// Reset CPU (like BasiliskII's Start680x0() does)
+	// This sets PC to ROMBaseMac + 0x2a and A7 to 0x2000
+	printf("\nResetting CPU (calling m68k_reset)...\n");
+	extern void m68k_reset(void);  // From UAE CPU
+	m68k_reset();
 
-	printf("\nROM Reset Vector:\n");
-	printf("  Initial SSP: 0x%08x\n", initial_ssp);
-	printf("  Initial PC:  0x%08x\n", initial_pc);
+	printf("\nCPU reset complete. Registers:\n");
+	printf("  PC = 0x%08x\n", uae_get_pc());
+	printf("  A7 = 0x%08x\n", uae_get_areg(7));
+	printf("  SR = 0x%04x\n", uae_get_sr());
 
-	uae_set_areg(7, initial_ssp);  // A7 = Stack Pointer
-	uae_set_pc(initial_pc);
-	uae_set_sr(0x2700);  // Supervisor mode, interrupts disabled
-
-	// Execute 5 instructions
-	printf("\n=== Executing 5 Instructions ===\n");
-
-	for (int i = 0; i < 5; i++) {
-		uint32_t pc_before = uae_get_pc();
-		uint16_t sr_before = uae_get_sr();
-
-		printf("Instruction %d: PC=0x%08x SR=0x%04x\n", i + 1, pc_before, sr_before);
-
-		uae_cpu_execute_one();
-
-		uint32_t pc_after = uae_get_pc();
-		printf("              -> PC=0x%08x\n", pc_after);
+	// Check regs.pc_p to see where it's actually pointing
+	extern regstruct regs;  // From UAE CPU (defined in newcpu.h)
+	printf("\nInternal CPU state:\n");
+	printf("  regs.pc_p = %p\n", (void *)regs.pc_p);
+	printf("  Should be: %p (ROMBaseHost + 0x2a)\n", (void *)(ROMBaseHost + 0x2a));
+	if (regs.pc_p) {
+		uint8_t *ptr = (uint8_t *)regs.pc_p;
+		printf("  Bytes at regs.pc_p: %02x %02x %02x %02x\n",
+		       ptr[0], ptr[1], ptr[2], ptr[3]);
 	}
+	fflush(stdout);
+
+	// Execute instructions (like BasiliskII's m68k_execute() but with a limit)
+	printf("\n=== Starting Execution ===\n");
+	printf("Executing limited instruction loop (like m68k_execute)...\n\n");
+
+	// Verify ROM is readable at the expected location
+	printf("Memory layout verification:\n");
+	printf("  MEMBaseDiff = 0x%lx\n", (unsigned long)MEMBaseDiff);
+	printf("  RAMBaseHost = 0x%lx\n", (unsigned long)RAMBaseHost);
+	printf("  ROMBaseHost = 0x%lx\n", (unsigned long)ROMBaseHost);
+	printf("  RAMBaseMac = 0x%08x\n", RAMBaseMac);
+	printf("  ROMBaseMac = 0x%08x\n", ROMBaseMac);
+	printf("\n");
+
+	// Check ROM bytes at offset 0x2a
+	printf("ROM verification at offset 0x2a:\n");
+	uint8_t *rom_at_2a = ROMBaseHost + 0x2a;
+	printf("  Bytes at ROMBaseHost+0x2a: %02x %02x %02x %02x\n",
+	       rom_at_2a[0], rom_at_2a[1], rom_at_2a[2], rom_at_2a[3]);
+	printf("  Expected: 4e fa 00 60 (JMP instruction)\n");
+	printf("\n");
+	fflush(stdout);
+
+	extern void m68k_do_execute(void);  // From UAE CPU
+	extern bool quit_program;           // From UAE CPU
+
+	int instruction_count = 0;
+	int max_instructions = 1000;  // Limit for testing
+
+	// Before starting, let's manually check what opcode would be fetched
+	printf("Manual opcode fetch check:\n");
+	uint16_t *pc_as_u16 = (uint16_t *)regs.pc_p;
+	uint16_t raw_bytes = *pc_as_u16;
+	printf("  Raw bytes at regs.pc_p (little-endian read): 0x%04x\n", raw_bytes);
+
+	// Try using UAE's do_get_mem_word
+	extern uae_u32 do_get_mem_word(uae_u16 *a);
+	uint32_t opcode_via_uae = do_get_mem_word((uae_u16 *)regs.pc_p);
+	printf("  Opcode via do_get_mem_word: 0x%04x\n", opcode_via_uae);
+
+	// Check cpufunctbl
+	extern cpuop_func *cpufunctbl[];
+	printf("  cpufunctbl[0x%04x] = %p\n", opcode_via_uae, (void *)cpufunctbl[opcode_via_uae]);
+	printf("  cpufunctbl[0x2100] = %p\n", (void *)cpufunctbl[0x2100]);
+
+	printf("\n");
+	fflush(stdout);
+
+	quit_program = false;
+	for (int i = 0; i < max_instructions; i++) {
+		// Show progress
+		if (i % 100 == 0) {
+			printf("[%5d] PC=%08x A7=%08x SR=%04x\n",
+			       i, uae_get_pc(), uae_get_areg(7), uae_get_sr());
+			fflush(stdout);
+		}
+
+		// Execute one iteration (like m68k_execute does)
+		m68k_do_execute();
+
+		instruction_count++;
+
+		if (quit_program) {
+			printf("\nquit_program was set, stopping execution\n");
+			break;
+		}
+	}
+
+	printf("\n\nTotal iterations executed: %d\n", instruction_count);
 
 	// Clean up
 	printf("\n=== Shutting Down ===\n");

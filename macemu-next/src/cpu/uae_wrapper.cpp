@@ -6,7 +6,7 @@
 
 // UAE CPU headers
 extern "C" {
-#include "uae_cpu/sysdeps.h"
+#include "sysdeps.h"
 #include "uae_cpu/main.h"
 }
 
@@ -213,4 +213,13 @@ void uae_mem_set_rom_ptr(void *ptr, uint32_t size) {
     ROMBaseHost = (uint8 *)ptr;
     ROMSize = size;
     ROMBaseMac = 0x00400000;  /* Typical Mac ROM location */
+}
+
+/* Disassembly */
+void uae_disasm(uint32_t addr, uint32_t *next_pc, int count) {
+    uaecptr npc;
+    m68k_disasm(addr, &npc, count);
+    if (next_pc) {
+        *next_pc = npc;
+    }
 }

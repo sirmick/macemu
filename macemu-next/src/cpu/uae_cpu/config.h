@@ -55,9 +55,12 @@
 #define USE_PTHREADS_SERVICES 1
 
 /* Byte order - little endian x86 */
+/* Don't define WORDS_BIGENDIAN on little-endian systems - leave it undefined */
+/*
 #ifndef WORDS_BIGENDIAN
 #define WORDS_BIGENDIAN 0
 #endif
+*/
 
 /* Sizes */
 #define SIZEOF_SHORT 2

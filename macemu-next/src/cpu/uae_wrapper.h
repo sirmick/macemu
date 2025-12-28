@@ -50,6 +50,9 @@ void uae_set_sr(uint16_t value);
 /* Execution */
 void uae_cpu_execute_one(void);  /* Execute one instruction */
 
+/* Disassembly */
+void uae_disasm(uint32_t addr, uint32_t *next_pc, int count);  /* Disassemble instructions */
+
 #ifdef __cplusplus
 }
 #endif
