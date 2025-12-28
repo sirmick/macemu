@@ -250,6 +250,10 @@ typedef struct {
     // Pre-zeroed silence frame (used during underruns, not in ring buffer)
     MacEmuAudioFrame audio_silence_frame;
 
+    // Audio capture trigger (set by server when user presses 'C')
+    // 0 = no capture, 1 = trigger capture on all layers
+    ATOMIC_UINT32 capture_trigger;
+
     // BGRA frame buffers - fixed size for max resolution
     // Each frame: width * height * 4 bytes (B, G, R, A per pixel)
     uint8_t frames[MACEMU_NUM_BUFFERS][MACEMU_BGRA_FRAME_SIZE];

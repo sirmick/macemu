@@ -733,6 +733,7 @@ class BasiliskWebRTC {
         this.videoTrack = null;
         this.connected = false;
         this.wsUrl = null;
+        this.audioCapturing = false;  // Flag for synchronized audio capture
 
         // Codec/decoder management
         this.codecType = CodecType.H264;  // Default to H.264
@@ -1164,6 +1165,9 @@ class BasiliskWebRTC {
                         paused: audioElement.paused,
                         readyState: audioElement.readyState
                     });
+
+                    // Audio capture is now triggered by server when user presses 'C'
+                    // (removed auto-start)
                 }).catch(e => {
                     logger.warn('Audio play() failed', { error: e.message });
                 });
@@ -1489,7 +1493,17 @@ class BasiliskWebRTC {
                 }
             } else {
                 // Text data - might be control messages
-                logger.debug('DataChannel text message', { data: event.data });
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'capture') {
+                        logger.info('[Capture] Triggered by server!');
+                        this.startAudioCapture();
+                    } else {
+                        logger.debug('DataChannel text message', { data: event.data });
+                    }
+                } catch (e) {
+                    logger.debug('DataChannel text message (not JSON)', { data: event.data });
+                }
             }
         };
     }
@@ -1963,6 +1977,147 @@ class BasiliskWebRTC {
         });
 
         el.textContent = info.join('\n') || 'No video media found in SDP';
+    }
+
+    // Synchronized audio capture (triggered by server when user presses 'C')
+    startAudioCapture() {
+        const SAMPLE_RATE = 48000;
+        const CAPTURE_DURATION = 10;  // 10 seconds
+        const CAPTURE_SAMPLES = SAMPLE_RATE * CAPTURE_DURATION * 2;  // Stereo
+
+        if (this.audioCapturing) {
+            logger.warn('[AudioCapture] Already capturing!');
+            return;
+        }
+
+        const audioElement = document.getElementById('macemu-audio');
+        if (!audioElement || !audioElement.srcObject) {
+            logger.error('[AudioCapture] No audio element or stream found!');
+            return;
+        }
+
+        logger.info('[AudioCapture] ========================================');
+        logger.info('[AudioCapture] STARTING SYNCHRONIZED CAPTURE');
+        logger.info('[AudioCapture] ========================================');
+        logger.info('[AudioCapture] Capturing 10 seconds of audio...');
+        logger.info('[AudioCapture] ========================================');
+
+        this.audioCapturing = true;
+
+        try {
+            const captureContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+            const source = captureContext.createMediaStreamSource(audioElement.srcObject);
+            const captureProcessor = captureContext.createScriptProcessor(4096, 2, 2);
+
+            let capturedSamples = new Int16Array(CAPTURE_SAMPLES);
+            let sampleOffset = 0;
+            const startTime = performance.now();
+
+            captureProcessor.onaudioprocess = (e) => {
+                const elapsed = (performance.now() - startTime) / 1000;
+
+                // Stop after 10 seconds
+                if (elapsed >= CAPTURE_DURATION) {
+                    captureProcessor.disconnect();
+                    source.disconnect();
+                    this.audioCapturing = false;
+
+                    logger.info('[AudioCapture] ========================================');
+                    logger.info('[AudioCapture] CAPTURE COMPLETE');
+                    logger.info('[AudioCapture] ========================================');
+
+                    // Trim to actual captured length
+                    const finalSamples = capturedSamples.slice(0, sampleOffset);
+
+                    // Create WAV file
+                    const wav = this.createWAV(finalSamples, SAMPLE_RATE, 2);
+                    const blob = new Blob([wav], { type: 'audio/wav' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'firefox-audio-synchronized.wav';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+
+                    const durationSec = (finalSamples.length / 2 / SAMPLE_RATE).toFixed(1);
+                    const sizeMB = (wav.byteLength / 1024 / 1024).toFixed(2);
+                    logger.info(`[AudioCapture] Saved: firefox-audio-synchronized.wav`);
+                    logger.info(`[AudioCapture] Duration: ${durationSec}s, Size: ${sizeMB}MB`);
+                    logger.info(`[AudioCapture] Format: 48kHz, 16-bit, stereo, PCM`);
+                    logger.info('[AudioCapture] ========================================');
+                    return;
+                }
+
+                // Get stereo PCM data
+                const left = e.inputBuffer.getChannelData(0);
+                const right = e.inputBuffer.getChannelData(1);
+
+                // Convert float32 to int16 stereo interleaved and append
+                for (let i = 0; i < left.length && sampleOffset < CAPTURE_SAMPLES; i++) {
+                    capturedSamples[sampleOffset++] = Math.max(-32768, Math.min(32767, left[i] * 32768));
+                    capturedSamples[sampleOffset++] = Math.max(-32768, Math.min(32767, right[i] * 32768));
+                }
+
+                // Progress update every second
+                if (Math.floor(elapsed) !== Math.floor(elapsed - 0.1)) {
+                    logger.info(`[AudioCapture] ${elapsed.toFixed(1)}s / ${CAPTURE_DURATION}s`);
+                }
+            };
+
+            source.connect(captureProcessor);
+            captureProcessor.connect(captureContext.destination);
+
+        } catch (e) {
+            logger.error('[AudioCapture] Failed:', { error: e.message });
+            this.audioCapturing = false;
+        }
+    }
+
+    // Helper: Create WAV file
+    createWAV(samples, sampleRate, numChannels) {
+        const bytesPerSample = 2;
+        const blockAlign = numChannels * bytesPerSample;
+        const byteRate = sampleRate * blockAlign;
+        const dataSize = samples.length * bytesPerSample;
+
+        const buffer = new ArrayBuffer(44 + dataSize);
+        const view = new DataView(buffer);
+
+        // Helper to write string
+        const writeString = (offset, string) => {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        };
+
+        // RIFF header
+        writeString(0, 'RIFF');
+        view.setUint32(4, 36 + dataSize, true);
+        writeString(8, 'WAVE');
+
+        // fmt chunk
+        writeString(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, numChannels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, byteRate, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, 16, true);
+
+        // data chunk
+        writeString(36, 'data');
+        view.setUint32(40, dataSize, true);
+
+        // PCM data
+        const offset = 44;
+        for (let i = 0; i < samples.length; i++) {
+            view.setInt16(offset + i * 2, samples[i], true);
+        }
+
+        return buffer;
     }
 }
 

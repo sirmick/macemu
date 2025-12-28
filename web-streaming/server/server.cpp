@@ -34,6 +34,8 @@
 #include <rtc/h264rtppacketizer.hpp>
 #include <rtc/av1rtppacketizer.hpp>
 #include <rtc/rtppacketizationconfig.hpp>
+#include <rtc/rtcpsrreporter.hpp>
+#include <rtc/rtcpnackresponder.hpp>
 #include <rtc/frameinfo.hpp>
 
 #include <string>
@@ -68,6 +70,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
+#include <termios.h>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -125,11 +128,11 @@ static std::atomic<uint64_t> g_key_count(0);
 // Global flag to request keyframe (set when new peer connects)
 static std::atomic<bool> g_request_keyframe(false);
 
+// Audio capture trigger (set when user presses 'C' in terminal)
+static std::atomic<bool> g_capture_requested(false);
+
 // Audio encoder (shared across all peers)
 static std::unique_ptr<OpusAudioEncoder> g_audio_encoder;
-
-// Forward declarations
-class WebRTCServer;
 
 // Signal handler for graceful shutdown
 static void signal_handler(int sig) {
@@ -335,7 +338,8 @@ static bool try_connect_to_emulator(pid_t pid) {
     return success;
 }
 
-// Forward declaration - implementation after WebRTCServer class
+// Forward declarations
+class WebRTCServer;
 static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr, bool disconnect_peers = false);
 
 
@@ -793,7 +797,7 @@ public:
     }
 
     // Send Opus audio frame via RTP audio track
-    void send_audio_to_all_peers(const std::vector<uint8_t>& opus_data) {
+    void send_audio_to_all_peers(const std::vector<uint8_t>& opus_data, uint64_t frame_number) {
         if (opus_data.empty()) {
             if (g_debug_audio) {
                 fprintf(stderr, "[WebRTC] Audio: Skipping empty opus_data\n");
@@ -813,10 +817,13 @@ public:
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
-        // Calculate audio timestamp using chrono for precise timing
-        // Opus clock rate is 48000 Hz
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration<double>(now - audio_start_time_);
+        // Calculate exact sample time based on frame number
+        // Each frame is exactly 20ms (960 samples at 48kHz)
+        // This ensures perfect timing regardless of jitter in the audio loop
+        auto elapsed = std::chrono::duration<double>(frame_number * 0.020); // 20ms = 0.020 seconds
+
+        // Create FrameInfo with exact sample time
+        // The RtcpSrReporter will convert this to RTP timestamps at 48kHz clock rate
         rtc::FrameInfo frameInfo(elapsed);
 
         int sent_count = 0;
@@ -835,6 +842,10 @@ public:
             }
 
             try {
+                // Send raw Opus packet - RTP packetizer chain handles:
+                // 1. OpusRtpPacketizer: Wraps Opus data in RTP packet
+                // 2. RtcpSrReporter: Generates sender reports with proper timestamps
+                // 3. RtcpNackResponder: Handles retransmission requests
                 peer->audio_track->sendFrame(
                     reinterpret_cast<const std::byte*>(opus_data.data()),
                     opus_data.size(),
@@ -850,6 +861,24 @@ public:
             if (frame_count++ % 50 == 0) {
                 fprintf(stderr, "[WebRTC] Audio sent: %zu bytes to %d peers (%d track_missing, %d track_closed)\n",
                         opus_data.size(), sent_count, track_missing, track_closed);
+            }
+        }
+    }
+
+    // Send capture trigger to all connected peers via DataChannel
+    void send_capture_trigger() {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+
+        std::string trigger_msg = "{\"type\":\"capture\"}";
+
+        for (auto& [id, peer] : peers_) {
+            if (peer->data_channel && peer->data_channel->isOpen()) {
+                try {
+                    peer->data_channel->send(trigger_msg);
+                    fprintf(stderr, "[Capture] Sent trigger to browser peer %s\n", id.c_str());
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[Capture] Failed to send trigger to %s: %s\n", id.c_str(), e.what());
+                }
             }
         }
     }
@@ -1176,17 +1205,29 @@ private:
         // Opus profile built from centralized audio_config.h constants
         // See audio_config.h for tuning: bitrate, frame duration, FEC, etc.
         std::string opusProfile = WEBRTC_OPUS_PROFILE;
+        fprintf(stderr, "[Audio] Opus SDP profile: %s\n", opusProfile.c_str());
         media.addOpusCodec(OPUS_PAYLOAD_TYPE, opusProfile);
 
         media.addSSRC(ssrc_ + 1, "audio-stream", "stream1", "audio-stream");
         peer->audio_track = peer->pc->addTrack(media);
 
-        // Set up Opus RTP packetizer
+        // Set up Opus RTP packetizer with RTCP support (following libdatachannel best practices)
         // Opus uses 48000 Hz clock rate (defined in OpusRtpPacketizer template parameter)
         auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
-            ssrc_ + 1, "audio-stream", 97, 48000
+            ssrc_ + 1, "audio-stream", OPUS_PAYLOAD_TYPE, rtc::OpusRtpPacketizer::defaultClockRate
         );
         auto packetizer = std::make_shared<rtc::OpusRtpPacketizer>(rtpConfig);
+
+        // Add RTCP SR (Sender Report) for proper timestamp synchronization
+        // This is CRITICAL for browsers to correctly sync and play audio
+        auto srReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
+        packetizer->addToChain(srReporter);
+
+        // Add RTCP NACK (Negative Acknowledgement) responder for packet loss recovery
+        // Improves audio quality on lossy networks
+        auto nackResponder = std::make_shared<rtc::RtcpNackResponder>();
+        packetizer->addToChain(nackResponder);
+
         peer->audio_track->setMediaHandler(packetizer);
 
         peer->audio_track->onOpen([peer]() {
@@ -1596,6 +1637,57 @@ private:
 
     uint32_t ssrc_ = 1;
 };
+
+// Global WebRTC server pointer for stdin monitor
+static WebRTCServer* g_webrtc_server = nullptr;
+
+/*
+ * Stdin monitor for synchronized audio capture
+ * Monitors keyboard input for 'C' key press to trigger capture on all layers
+ */
+static void monitor_stdin_for_capture() {
+    // Make stdin non-blocking and raw mode
+    struct termios old_tio, new_tio;
+    tcgetattr(STDIN_FILENO, &old_tio);
+    new_tio = old_tio;
+    new_tio.c_lflag &= ~(ICANON | ECHO);  // Disable canonical mode and echo
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+
+    fprintf(stderr, "\n=== Press 'C' key to trigger synchronized audio capture ===\n");
+    fprintf(stderr, "    (captures 10 seconds of audio at all layers)\n\n");
+
+    while (g_running) {
+        char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            if (c == 'c' || c == 'C') {
+                fprintf(stderr, "\n*** CAPTURE TRIGGERED ***\n");
+                fprintf(stderr, "[Capture] Starting synchronized capture on all layers...\n");
+
+                g_capture_requested.store(true);
+
+                // Set shared memory flag for emulator
+                if (g_ipc_shm) {
+                    ATOMIC_STORE(g_ipc_shm->capture_trigger, 1);
+                    fprintf(stderr, "[Capture] Emulator capture flag set\n");
+                }
+
+                // Send trigger to browser via data channel
+                if (g_webrtc_server) {
+                    g_webrtc_server->send_capture_trigger();
+                }
+
+                fprintf(stderr, "[Capture] All layers triggered!\n");
+                fprintf(stderr, "    - Emulator will save to: /tmp/ipc_emulator_capture.raw\n");
+                fprintf(stderr, "    - Server will save to: /tmp/ipc_server_capture.raw\n");
+                fprintf(stderr, "    - Firefox will download: firefox-audio-synchronized.wav\n\n");
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Restore terminal settings
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+}
 
 // Implementation of disconnect_from_emulator (needs WebRTCServer definition)
 static void disconnect_from_emulator(WebRTCServer* webrtc, bool disconnect_peers) {
@@ -2021,6 +2113,7 @@ static void audio_loop_tone_only(WebRTCServer& webrtc) {
     tone_gen.set_frequency(440.0);
 
     auto last_tone_time = std::chrono::steady_clock::now();
+    uint64_t frames_sent = 0;
 
     fprintf(stderr, "Audio: Starting audio processing loop (TONE ONLY MODE - Mac audio disabled)\n");
 
@@ -2043,14 +2136,11 @@ static void audio_loop_tone_only(WebRTCServer& webrtc) {
                 );
 
                 if (!opus_data.empty()) {
-                    if (g_debug_audio) {
-                        static int frame_count = 0;
-                        if (frame_count % 50 == 0) {  // Log every second
-                            fprintf(stderr, "Audio: Tone generator - encoded %zu bytes Opus\n", opus_data.size());
-                        }
-                        frame_count++;
+                    if (g_debug_audio && frames_sent % 50 == 0) {  // Log every second
+                        fprintf(stderr, "Audio: Tone generator - encoded %zu bytes Opus\n", opus_data.size());
                     }
-                    webrtc.send_audio_to_all_peers(opus_data);
+                    webrtc.send_audio_to_all_peers(opus_data, frames_sent);
+                    frames_sent++;
                 }
             }
         } else {
@@ -2202,8 +2292,16 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
             static FILE* capture_file = nullptr;
             static int frames_captured = 0;
             static int silent_frames = 0;
+            static bool capture_started = false;
 
-            if (frames_captured < AUDIO_MAX_CAPTURE_FRAMES && getenv("MACEMU_AUDIO_CAPTURE")) {
+            // Check for capture trigger (set by stdin monitor when user presses 'C')
+            if (g_capture_requested.load() && !capture_started) {
+                capture_started = true;
+                frames_captured = 0;  // Reset counter
+                fprintf(stderr, "[Server Audio] *** CAPTURE TRIGGERED *** (via stdin monitor)\n");
+            }
+
+            if (capture_started && frames_captured < AUDIO_MAX_CAPTURE_FRAMES) {
                 // Calculate energy to detect non-silence
                 uint64_t energy = 0;
                 for (uint32_t i = 0; i < total_samples; i++) {
@@ -2253,9 +2351,9 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
                 960  // Opus frame size
             );
 
-            // Send to peers
+            // Send to peers with frame-based timing
             if (!opus_data.empty()) {
-                webrtc.send_audio_to_all_peers(opus_data);
+                webrtc.send_audio_to_all_peers(opus_data, frames_consumed);
             }
         }
 
@@ -2412,6 +2510,13 @@ int main(int argc, char* argv[]) {
     } else {
         fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
     }
+
+    // Set global WebRTC server pointer for stdin monitor
+    g_webrtc_server = &webrtc;
+
+    // Launch stdin monitor thread for synchronized audio capture
+    std::thread stdin_monitor_thread(monitor_stdin_for_capture);
+    stdin_monitor_thread.detach();
 
     // Launch audio thread
     std::thread audio_thread(audio_loop, std::ref(webrtc));

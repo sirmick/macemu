@@ -344,8 +344,17 @@ static void audio_thread_func()
 							static FILE* capture_file = nullptr;
 							static int frames_captured = 0;
 							static int silent_frames = 0;
+							static bool capture_started = false;
 
-							if (frames_captured < AUDIO_MAX_CAPTURE_FRAMES && getenv("MACEMU_AUDIO_CAPTURE")) {
+							// Check for capture trigger from shared memory (set by server when user presses 'C')
+							uint32_t trigger = ATOMIC_LOAD(shm->capture_trigger);
+							if (trigger && !capture_started) {
+								capture_started = true;
+								frames_captured = 0;  // Reset counter
+								fprintf(stderr, "[IPC Emulator] *** CAPTURE TRIGGERED *** (via shared memory flag)\n");
+							}
+
+							if (capture_started && frames_captured < AUDIO_MAX_CAPTURE_FRAMES) {
 								// Calculate energy to detect non-silence
 								uint64_t energy = 0;
 								if (sample_size == 16) {
