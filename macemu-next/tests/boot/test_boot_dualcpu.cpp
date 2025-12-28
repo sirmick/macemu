@@ -142,19 +142,20 @@ int main(int argc, char **argv)
 	bool diverged = false;
 
 	for (int i = 0; i < max_instructions; i++) {
-		// Show PC before each instruction (for first 10 instructions)
+		// Show PC and SR before each instruction (for first 10 instructions)
 		if (i < 10) {
-			CPUStateSnapshot before_state;
-			dualcpu_get_divergence(dcpu, &before_state, NULL);
+			CPUStateSnapshot uae_before, unicorn_before;
+			dualcpu_get_divergence(dcpu, &uae_before, &unicorn_before);
 
 			// Read opcode from ROM
-			uint32_t pc_offset = before_state.pc - ROM_BASE;
+			uint32_t pc_offset = uae_before.pc - ROM_BASE;
 			uint16_t opcode = 0;
 			if (pc_offset < rom_size - 1) {
 				opcode = (rom_data[pc_offset] << 8) | rom_data[pc_offset + 1];
 			}
 
-			printf("[%d] PC=0x%08X opcode=0x%04X\n", i, before_state.pc, opcode);
+			printf("[%d] BEFORE: PC=0x%08X opcode=0x%04X  UAE_SR=0x%04X  UC_SR=0x%04X\n",
+			       i, uae_before.pc, opcode, uae_before.sr, unicorn_before.sr);
 			fflush(stdout);
 		}
 
