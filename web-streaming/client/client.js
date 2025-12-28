@@ -462,6 +462,7 @@ class PNGDecoder extends VideoDecoder {
         let t1_frame_ready = 0, t4_send = 0;
         let rectX = 0, rectY = 0, rectWidth = 0, rectHeight = 0;
         let frameWidth = 0, frameHeight = 0;
+        let cursorX = 0, cursorY = 0, cursorVisible = 0;  // Declare at function scope
 
         // Parse metadata header if present (ArrayBuffer with at least 113 bytes + PNG signature)
         if (data instanceof ArrayBuffer && data.byteLength > 121) {
@@ -488,9 +489,9 @@ class PNGDecoder extends VideoDecoder {
             t4_send = lo + hi * 0x100000000;
 
             // Read cursor position (5 bytes: x, y, visible)
-            const cursorX = view.getUint16(40, true);
-            const cursorY = view.getUint16(42, true);
-            const cursorVisible = view.getUint8(44);
+            cursorX = view.getUint16(40, true);
+            cursorY = view.getUint16(42, true);
+            cursorVisible = view.getUint8(44);
 
             // Update cursor state
             this.currentCursorX = cursorX;
@@ -868,6 +869,19 @@ class BasiliskWebRTC {
         this.decoder = createDecoder(this.codecType, element);
         if (!this.decoder) {
             return false;
+        }
+
+        // Set up frame callback for PNG decoder to update screen dimensions
+        if (this.codecType === CodecType.PNG) {
+            this.decoder.onFrame = (frameCount, metadata) => {
+                // Update screen dimensions for absolute mouse mode
+                if (metadata && metadata.frameWidth && metadata.frameHeight) {
+                    this.currentScreenWidth = metadata.frameWidth;
+                    this.currentScreenHeight = metadata.frameHeight;
+                    // Invalidate mouse cache when resolution changes
+                    this.cachedMouseRect = null;
+                }
+            };
         }
 
         // Show/hide appropriate element
