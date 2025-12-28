@@ -19,15 +19,17 @@ struct DualCPU {
     /* CPU instances */
     UnicornCPU *unicorn;
 
-    /* Memory regions (separate for each CPU) */
-    uint8_t *uae_ram;
+    /* Memory regions */
+    /* UAE needs contiguous buffer for DIRECT_ADDRESSING */
+    uint8_t *uae_memory;      /* Single contiguous buffer for RAM+ROM */
+    uint32_t uae_memory_size; /* Total size of UAE buffer */
+
+    /* Unicorn uses separate allocations */
     uint8_t *unicorn_ram;
+    uint8_t *unicorn_rom;
+
     uint32_t ram_base;
     uint32_t ram_size;
-
-    /* ROM */
-    uint8_t *uae_rom;
-    uint8_t *unicorn_rom;
     uint32_t rom_base;
     uint32_t rom_size;
 
@@ -182,9 +184,8 @@ void dualcpu_destroy(DualCPU *dcpu) {
         unicorn_destroy(dcpu->unicorn);
     }
 
-    if (dcpu->uae_ram) free(dcpu->uae_ram);
+    if (dcpu->uae_memory) free(dcpu->uae_memory);
     if (dcpu->unicorn_ram) free(dcpu->unicorn_ram);
-    if (dcpu->uae_rom) free(dcpu->uae_rom);
     if (dcpu->unicorn_rom) free(dcpu->unicorn_rom);
 
     if (dcpu->uae_trace) fclose(dcpu->uae_trace);
@@ -196,53 +197,68 @@ void dualcpu_destroy(DualCPU *dcpu) {
 /* Memory setup */
 bool dualcpu_map_ram(DualCPU *dcpu, uint32_t addr, uint32_t size) {
     if (!dcpu) return false;
-
-    /* Allocate separate RAM for each CPU */
-    dcpu->uae_ram = calloc(1, size);
-    dcpu->unicorn_ram = calloc(1, size);
-    if (!dcpu->uae_ram || !dcpu->unicorn_ram) {
+    if (addr != 0) {
+        snprintf(dcpu->error, sizeof(dcpu->error),
+                "dualcpu_map_ram: RAM must start at address 0 (got 0x%X)", addr);
         return false;
     }
 
     dcpu->ram_base = addr;
     dcpu->ram_size = size;
 
+    /* Allocate Unicorn RAM separately */
+    dcpu->unicorn_ram = calloc(1, size);
+    if (!dcpu->unicorn_ram) {
+        return false;
+    }
+
     /* Map in Unicorn */
     if (!unicorn_map_ram(dcpu->unicorn, addr, NULL, size)) {
         return false;
     }
 
-    /* Map in UAE - set RAM pointer */
-    uae_mem_set_ram_ptr(dcpu->uae_ram, size);
+    /* UAE: Don't allocate yet - wait for ROM mapping to know total size */
 
     return true;
 }
 
 bool dualcpu_map_rom(DualCPU *dcpu, uint32_t addr, const void *rom_data, uint32_t size) {
     if (!dcpu || !rom_data) return false;
-
-    /* Allocate separate ROM for each CPU */
-    dcpu->uae_rom = malloc(size);
-    dcpu->unicorn_rom = malloc(size);
-    if (!dcpu->uae_rom || !dcpu->unicorn_rom) {
+    if (dcpu->ram_base != 0 || dcpu->ram_size == 0) {
+        snprintf(dcpu->error, sizeof(dcpu->error),
+                "dualcpu_map_rom: RAM must be mapped first at address 0");
         return false;
     }
 
-    /* Copy ROM data */
-    memcpy(dcpu->uae_rom, rom_data, size);
-    memcpy(dcpu->unicorn_rom, rom_data, size);
-
     dcpu->rom_base = addr;
     dcpu->rom_size = size;
+
+    /* Allocate Unicorn ROM separately */
+    dcpu->unicorn_rom = malloc(size);
+    if (!dcpu->unicorn_rom) {
+        return false;
+    }
+    memcpy(dcpu->unicorn_rom, rom_data, size);
 
     /* Map in Unicorn */
     if (!unicorn_map_rom(dcpu->unicorn, addr, rom_data, size)) {
         return false;
     }
 
-    /* Map in UAE - set ROM pointer */
-    uae_mem_set_rom_ptr(dcpu->uae_rom, size);
-    /* ROM data already copied to dcpu->uae_rom above */
+    /* UAE: Allocate single contiguous buffer from 0 to ROM_END */
+    uint32_t rom_end = dcpu->rom_base + dcpu->rom_size;
+    dcpu->uae_memory_size = rom_end;
+    dcpu->uae_memory = calloc(1, dcpu->uae_memory_size);
+    if (!dcpu->uae_memory) {
+        return false;
+    }
+
+    /* Copy ROM data into UAE buffer at the correct offset */
+    memcpy(dcpu->uae_memory + dcpu->rom_base, rom_data, size);
+    /* RAM portion is already zeroed by calloc */
+
+    /* Tell UAE about the memory layout */
+    uae_mem_set_ram_ptr(dcpu->uae_memory, dcpu->uae_memory_size);
 
     return true;
 }

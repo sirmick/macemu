@@ -193,7 +193,27 @@ void uae_set_sr(uint16_t value) {
 /* Execution */
 void uae_cpu_execute_one(void) {
     /* Execute one instruction */
+    static int first = 1;
+    if (first) {
+        fprintf(stderr, "DEBUG uae_cpu_execute_one BEFORE opcode fetch:\n");
+        fprintf(stderr, "  regs.pc = 0x%08X\n", (unsigned int)regs.pc);
+        fprintf(stderr, "  regs.pc_p = %p\n", (void*)regs.pc_p);
+        fprintf(stderr, "  RAMBaseHost = %p\n", (void*)RAMBaseHost);
+        fprintf(stderr, "  ROMBaseHost = %p\n", (void*)ROMBaseHost);
+        fprintf(stderr, "  RAMBaseMac = 0x%08X\n", RAMBaseMac);
+        fprintf(stderr, "  ROMBaseMac = 0x%08X\n", ROMBaseMac);
+        fprintf(stderr, "  MEMBaseDiff = 0x%lX\n", (unsigned long)MEMBaseDiff);
+        if (regs.pc_p) {
+            uint8_t *p = (uint8_t*)regs.pc_p;
+            fprintf(stderr, "  Bytes at regs.pc_p: %02X %02X %02X %02X\n", p[0], p[1], p[2], p[3]);
+        }
+    }
     uae_u32 opcode = GET_OPCODE;
+    if (first) {
+        fprintf(stderr, "  Fetched opcode: 0x%04X\n", opcode);
+        fprintf(stderr, "  Handler: %p\n", (void*)cpufunctbl[opcode]);
+        first = 0;
+    }
     (*cpufunctbl[opcode])(opcode);
 }
 
@@ -213,6 +233,12 @@ void uae_mem_set_rom_ptr(void *ptr, uint32_t size) {
     ROMBaseHost = (uint8 *)ptr;
     ROMSize = size;
     ROMBaseMac = 0x00400000;  /* Typical Mac ROM location */
+}
+
+void uae_mem_set_rom_ptr_with_addr(void *ptr, uint32_t addr, uint32_t size) {
+    ROMBaseHost = (uint8 *)ptr;
+    ROMSize = size;
+    ROMBaseMac = addr;  /* Use provided ROM address */
 }
 
 /* Disassembly */
