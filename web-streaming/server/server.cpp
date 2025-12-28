@@ -69,7 +69,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
-#include <termios.h>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -127,8 +126,8 @@ static std::atomic<uint64_t> g_key_count(0);
 // Global flag to request keyframe (set when new peer connects)
 static std::atomic<bool> g_request_keyframe(false);
 
-// Audio capture trigger (set when user presses 'C' in terminal)
-static std::atomic<bool> g_capture_requested(false);
+// Audio capture trigger (removed - was debug feature via stdin monitor)
+// static std::atomic<bool> g_capture_requested(false);
 
 // Audio encoder (shared across all peers)
 static std::unique_ptr<OpusAudioEncoder> g_audio_encoder;
@@ -864,23 +863,7 @@ public:
         }
     }
 
-    // Send capture trigger to all connected peers via DataChannel
-    void send_capture_trigger() {
-        std::lock_guard<std::mutex> lock(peers_mutex_);
-
-        std::string trigger_msg = "{\"type\":\"capture\"}";
-
-        for (auto& [id, peer] : peers_) {
-            if (peer->data_channel && peer->data_channel->isOpen()) {
-                try {
-                    peer->data_channel->send(trigger_msg);
-                    fprintf(stderr, "[Capture] Sent trigger to browser peer %s\n", id.c_str());
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "[Capture] Failed to send trigger to %s: %s\n", id.c_str(), e.what());
-                }
-            }
-        }
-    }
+    // Capture trigger removed - was debug feature
 
     // Send PNG frame via DataChannel (binary) with metadata header
     // Frame format: [8-byte t1_frame_ready] [4-byte x] [4-byte y] [4-byte width] [4-byte height]
@@ -1636,56 +1619,8 @@ private:
     uint32_t ssrc_ = 1;
 };
 
-// Global WebRTC server pointer for stdin monitor
-static WebRTCServer* g_webrtc_server = nullptr;
-
-/*
- * Stdin monitor for synchronized audio capture
- * Monitors keyboard input for 'C' key press to trigger capture on all layers
- */
-static void monitor_stdin_for_capture() {
-    // Make stdin non-blocking and raw mode
-    struct termios old_tio, new_tio;
-    tcgetattr(STDIN_FILENO, &old_tio);
-    new_tio = old_tio;
-    new_tio.c_lflag &= ~(ICANON | ECHO);  // Disable canonical mode and echo
-    tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
-
-    fprintf(stderr, "\n=== Press 'C' key to trigger synchronized audio capture ===\n");
-    fprintf(stderr, "    (captures 10 seconds of audio at all layers)\n\n");
-
-    while (g_running) {
-        char c;
-        if (read(STDIN_FILENO, &c, 1) == 1) {
-            if (c == 'c' || c == 'C') {
-                fprintf(stderr, "\n*** CAPTURE TRIGGERED ***\n");
-                fprintf(stderr, "[Capture] Starting synchronized capture on all layers...\n");
-
-                g_capture_requested.store(true);
-
-                // Set shared memory flag for emulator
-                if (g_ipc_shm) {
-                    ATOMIC_STORE(g_ipc_shm->capture_trigger, 1);
-                    fprintf(stderr, "[Capture] Emulator capture flag set\n");
-                }
-
-                // Send trigger to browser via data channel
-                if (g_webrtc_server) {
-                    g_webrtc_server->send_capture_trigger();
-                }
-
-                fprintf(stderr, "[Capture] All layers triggered!\n");
-                fprintf(stderr, "    - Emulator will save to: /tmp/ipc_emulator_capture.raw\n");
-                fprintf(stderr, "    - Server will save to: /tmp/ipc_server_capture.raw\n");
-                fprintf(stderr, "    - Firefox will download: firefox-audio-synchronized.wav\n\n");
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    // Restore terminal settings
-    tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
-}
+// Stdin monitor removed - was debug feature for synchronized audio capture
+// Capture functionality can be triggered via API endpoint if needed in future
 
 // Implementation of disconnect_from_emulator (needs WebRTCServer definition)
 static void disconnect_from_emulator(WebRTCServer* webrtc, bool disconnect_peers) {
@@ -2247,14 +2182,9 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
             static int silent_frames = 0;
             static bool capture_started = false;
 
-            // Check for capture trigger (set by stdin monitor when user presses 'C')
-            if (g_capture_requested.load() && !capture_started) {
-                capture_started = true;
-                frames_captured = 0;  // Reset counter
-                fprintf(stderr, "[Server Audio] *** CAPTURE TRIGGERED *** (via stdin monitor)\n");
-            }
-
-            if (capture_started && frames_captured < AUDIO_MAX_CAPTURE_FRAMES) {
+            // Debug capture removed - was triggered via stdin monitor
+            // Can be re-enabled via API endpoint if needed
+            if (false && capture_started && frames_captured < AUDIO_MAX_CAPTURE_FRAMES) {
                 // Calculate energy to detect non-silence
                 uint64_t energy = 0;
                 for (uint32_t i = 0; i < total_samples; i++) {
@@ -2463,13 +2393,6 @@ int main(int argc, char* argv[]) {
     } else {
         fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
     }
-
-    // Set global WebRTC server pointer for stdin monitor
-    g_webrtc_server = &webrtc;
-
-    // Launch stdin monitor thread for synchronized audio capture
-    std::thread stdin_monitor_thread(monitor_stdin_for_capture);
-    stdin_monitor_thread.detach();
 
     // Launch audio thread
     std::thread audio_thread(audio_loop, std::ref(webrtc));
