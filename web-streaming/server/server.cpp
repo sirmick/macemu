@@ -1875,6 +1875,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             continue;
         }
 
+        // Check emulator still connected (race with disconnect)
+        if (!g_emulator_connected || !g_ipc_shm) {
+            continue;
+        }
+
         // Latency measurement: time from emulator frame completion to now
         // Plain read - synchronized by eventfd read above
         uint64_t frame_timestamp_us = g_ipc_shm->timestamp_us;
@@ -2125,7 +2130,7 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
 
         // Cache SHM pointer locally to avoid race conditions with disconnect
         MacEmuIPCBuffer* shm = g_ipc_shm;
-        if (!shm) {
+        if (!shm || !g_emulator_connected) {
             std::this_thread::sleep_for(frame_duration);
             continue;
         }
