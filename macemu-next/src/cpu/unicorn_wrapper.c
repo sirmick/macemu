@@ -76,6 +76,10 @@ static void hook_memory(uc_engine *uc, uc_mem_type type,
 
 /* CPU lifecycle */
 UnicornCPU* unicorn_create(UnicornArch arch) {
+    return unicorn_create_with_model(arch, -1);  /* Use default CPU model */
+}
+
+UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model) {
     UnicornCPU *cpu = calloc(1, sizeof(UnicornCPU));
     if (!cpu) return NULL;
 
@@ -107,6 +111,17 @@ UnicornCPU* unicorn_create(UnicornArch arch) {
         fprintf(stderr, "Failed to create Unicorn CPU: %s\n", uc_strerror(err));
         free(cpu);
         return NULL;
+    }
+
+    /* Set CPU model if specified */
+    if (cpu_model >= 0) {
+        err = uc_ctl_set_cpu_model(cpu->uc, cpu_model);
+        if (err != UC_ERR_OK) {
+            fprintf(stderr, "Failed to set Unicorn CPU model: %s\n", uc_strerror(err));
+            uc_close(cpu->uc);
+            free(cpu);
+            return NULL;
+        }
     }
 
     return cpu;

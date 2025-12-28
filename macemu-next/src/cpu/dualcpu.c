@@ -148,8 +148,12 @@ DualCPU* dualcpu_create(void) {
     DualCPU *dcpu = calloc(1, sizeof(DualCPU));
     if (!dcpu) return NULL;
 
-    /* Create Unicorn CPU */
-    dcpu->unicorn = unicorn_create(UCPU_ARCH_M68K);
+    /* Configure both CPUs for 68040 */
+    uae_set_cpu_type(4, 0);  /* CPU_68040, no separate FPU (040 has integrated FPU) */
+
+    /* Create Unicorn CPU with 68040 model */
+    #define UC_CPU_M68K_M68040 3  /* From unicorn/m68k.h */
+    dcpu->unicorn = unicorn_create_with_model(UCPU_ARCH_M68K, UC_CPU_M68K_M68040);
     if (!dcpu->unicorn) {
         free(dcpu);
         return NULL;

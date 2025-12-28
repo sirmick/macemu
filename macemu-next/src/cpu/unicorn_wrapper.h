@@ -40,6 +40,7 @@ typedef void (*MemoryHookCallback)(UnicornCPU *cpu, UnicornMemType type,
 
 /* CPU lifecycle */
 UnicornCPU* unicorn_create(UnicornArch arch);
+UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model); /* M68K: UC_CPU_M68K_M68040, etc. */
 void unicorn_destroy(UnicornCPU *cpu);
 
 /* Memory mapping */

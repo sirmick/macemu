@@ -44,6 +44,12 @@ extern uint8 *MacFrameBaseHost;
 extern uint32 MacFrameSize;
 #endif
 
+/* CPU configuration */
+void uae_set_cpu_type(int cpu_type, int fpu_type) {
+    CPUType = cpu_type;
+    FPUType = fpu_type;
+}
+
 /* CPU initialization */
 bool uae_cpu_init(void) {
     return Init680x0();

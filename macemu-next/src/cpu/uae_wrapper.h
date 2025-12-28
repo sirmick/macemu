@@ -20,6 +20,9 @@ bool uae_cpu_init(void);
 void uae_cpu_reset(void);
 void uae_cpu_exit(void);
 
+/* CPU configuration - must be called before uae_cpu_init() */
+void uae_set_cpu_type(int cpu_type, int fpu_type);  /* cpu_type: 2=68020, 4=68040; fpu_type: 0=none, 1=68881 */
+
 /* Memory setup */
 bool uae_mem_init(uint32_t ram_size, uint32_t rom_size);
 void uae_mem_cleanup(void);
