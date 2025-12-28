@@ -28,7 +28,7 @@
 /* Using emulated 68k */
 #define EMULATED_68K 1
 
-/* Use optimized flags (required for m68k.h macros) */
+/* Use optimized flags (required for correct flag handling) */
 #define OPTIMIZED_FLAGS 1
 
 /* Platform-specific flag handling */
@@ -81,5 +81,12 @@
 /* Function attributes */
 #define REGPARAM
 #define REGPARAM2
+
+/* Force byte-swapped memory access even on x86
+ * This is needed because we store M68K memory in big-endian format,
+ * not native (little-endian) format */
+#ifdef HAVE_GET_WORD_UNSWAPPED
+#undef HAVE_GET_WORD_UNSWAPPED
+#endif
 
 #endif /* CONFIG_H */

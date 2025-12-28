@@ -160,6 +160,18 @@ DualCPU* dualcpu_create(void) {
     }
     uae_cpu_reset();
 
+    /* Ensure both CPUs start with identical zeroed register state */
+    for (int i = 0; i < 8; i++) {
+        unicorn_set_dreg(dcpu->unicorn, i, 0);
+        unicorn_set_areg(dcpu->unicorn, i, 0);
+        uae_set_dreg(i, 0);
+        uae_set_areg(i, 0);
+    }
+    unicorn_set_sr(dcpu->unicorn, 0x2700);  /* Supervisor mode, interrupts disabled */
+    uae_set_sr(0x2700);
+    unicorn_set_pc(dcpu->unicorn, 0);
+    uae_set_pc(0);
+
     return dcpu;
 }
 

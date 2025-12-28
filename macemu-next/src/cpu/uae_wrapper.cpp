@@ -106,13 +106,31 @@ void uae_mem_map_rom(uint32_t addr, uint32_t size) {
 void uae_mem_write(uint32_t addr, const void *data, uint32_t size) {
     if (!data) return;
 
+    uint8_t *dest = NULL;
     /* Determine if writing to RAM or ROM */
     if (addr >= RAMBaseMac && addr < RAMBaseMac + RAMSize) {
         uint32_t offset = addr - RAMBaseMac;
-        memcpy(RAMBaseHost + offset, data, size);
+        dest = RAMBaseHost + offset;
     } else if (addr >= ROMBaseMac && addr < ROMBaseMac + ROMSize) {
         uint32_t offset = addr - ROMBaseMac;
-        memcpy(ROMBaseHost + offset, data, size);
+        dest = ROMBaseHost + offset;
+    }
+
+    if (!dest) return;
+
+    /* UAE stores memory in NATIVE (little-endian) format on x86.
+     * Input data is big-endian M68K format, so byte-swap when writing. */
+    const uint8_t *src = (const uint8_t *)data;
+    if (size >= 2 && (addr & 1) == 0) {
+        /* Word-aligned, swap 16-bit words */
+        for (uint32_t i = 0; i < size - 1; i += 2) {
+            dest[i] = src[i + 1];
+            dest[i + 1] = src[i];
+        }
+        if (size & 1) dest[size - 1] = src[size - 1];  /* Odd trailing byte */
+    } else {
+        /* Unaligned or single byte */
+        memcpy(dest, src, size);
     }
 }
 
@@ -145,6 +163,8 @@ uint32_t uae_get_pc(void) {
 }
 
 uint16_t uae_get_sr(void) {
+    extern void MakeSR(void);
+    MakeSR();  /* Build SR from separate flag variables (OPTIMIZED_FLAGS) */
     return regs.sr;
 }
 
@@ -165,13 +185,14 @@ void uae_set_pc(uint32_t value) {
 }
 
 void uae_set_sr(uint16_t value) {
+    extern void MakeFromSR(void);
     regs.sr = value;
+    MakeFromSR();  /* Extract flags from SR into separate variables (OPTIMIZED_FLAGS) */
 }
 
 /* Execution */
 void uae_cpu_execute_one(void) {
-    /* Execute one instruction using UAE's dispatch table */
-    extern cpuop_func *cpufunctbl[];
+    /* Execute one instruction */
     uae_u32 opcode = GET_OPCODE;
     (*cpufunctbl[opcode])(opcode);
 }
