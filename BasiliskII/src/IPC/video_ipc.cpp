@@ -144,6 +144,7 @@ static uint8 current_palette[256 * 3];
 // Debug flags (read once at initialization)
 static bool g_debug_perf = false;
 static bool g_debug_mode_switch = false;
+static bool g_debug_mouse = false;
 
 
 /*
@@ -348,9 +349,11 @@ static void process_binary_input(const uint8_t* data, size_t len) {
                 // Reinterpret int16_t as uint16_t for absolute coordinates
                 x = static_cast<uint16_t>(mouse->x);
                 y = static_cast<uint16_t>(mouse->y);
-                static int abs_log_count = 0;
-                if (abs_log_count++ < 5) {
-                    fprintf(stderr, "IPC: Absolute mouse: x=%d, y=%d (raw: %d, %d)\n", x, y, mouse->x, mouse->y);
+                if (g_debug_mouse) {
+                    static int abs_log_count = 0;
+                    if (abs_log_count++ < 5) {
+                        fprintf(stderr, "IPC: Absolute mouse: x=%d, y=%d (raw: %d, %d)\n", x, y, mouse->x, mouse->y);
+                    }
                 }
                 // Ensure ADB is in absolute mode for this movement
                 ADBSetRelMouseMode(false);
@@ -1110,6 +1113,7 @@ static bool IPC_VideoInit(bool classic)
     // Read debug flags once at startup
     g_debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
     g_debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
+    g_debug_mouse = (getenv("MACEMU_DEBUG_MOUSE") != nullptr);
 
     fprintf(stderr, "IPC: Initializing video driver (v3, emulator-owned resources)\n");
 

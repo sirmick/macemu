@@ -441,6 +441,7 @@ Typical performance at 640x480, H.264:
 - `MACEMU_DEBUG_FRAMES` - Per-frame logging (verbose!)
 - `MACEMU_DEBUG_AUDIO` - Audio pipeline tracing
 - `MACEMU_DEBUG_PNG` - PNG encoding details
+- `MACEMU_DEBUG_MOUSE` - Mouse input logs (absolute/relative coordinates)
 
 ## See Also
 

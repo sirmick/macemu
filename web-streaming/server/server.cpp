@@ -93,6 +93,7 @@ static server_config::ServerConfig g_config;
 #define g_debug_perf        (g_config.debug_perf)
 #define g_debug_frames      (g_config.debug_frames)
 #define g_debug_audio       (g_config.debug_audio)
+#define g_debug_mouse       (g_config.debug_mouse)
 
 // g_debug_mode_switch and g_debug_png need to be non-static for encoders
 bool g_debug_mode_switch = false;
@@ -1569,7 +1570,7 @@ private:
                 uint16_t y = *reinterpret_cast<const uint16_t*>(data + 3);
                 double timestamp = *reinterpret_cast<const double*>(data + 5);
                 uint64_t browser_ts = static_cast<uint64_t>(timestamp);
-                if (g_debug_connection) {
+                if (g_debug_mouse) {
                     fprintf(stderr, "[Server] Absolute mouse: x=%u, y=%u\n", x, y);
                 }
                 send_mouse_input(x, y, current_buttons, browser_ts, true);  // absolute=true
@@ -1581,7 +1582,7 @@ private:
                 uint8_t mode = data[1];
                 mouse_mode_relative = (mode == 1);
                 send_mouse_mode_change(mouse_mode_relative);
-                if (g_debug_connection) {
+                if (g_debug_mouse) {
                     fprintf(stderr, "[Server] Mouse mode changed to: %s\n",
                             mouse_mode_relative ? "relative" : "absolute");
                 }

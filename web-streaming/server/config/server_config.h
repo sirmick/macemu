@@ -41,6 +41,7 @@ struct ServerConfig {
     bool debug_frames = false;       // Save frame dumps to disk (.ppm files)
     bool debug_audio = false;        // Audio processing logs
     bool debug_png = false;          // PNG encoding and dirty rect logs
+    bool debug_mouse = false;        // Mouse input logs (absolute/relative coordinates)
 
     // Constructor with default codec
     ServerConfig();
