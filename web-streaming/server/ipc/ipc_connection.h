@@ -45,7 +45,8 @@ public:
 
     // Input sending
     bool send_key_input(int mac_keycode, bool down);
-    bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms);
+    bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms, bool absolute = false);
+    bool send_mouse_mode_change(bool relative);
     bool send_command(uint8_t command);
     bool send_ping_input(uint32_t sequence, uint64_t t1_browser_send_ms);
 

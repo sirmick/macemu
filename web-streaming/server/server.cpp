@@ -304,8 +304,12 @@ static bool send_key_input(int mac_keycode, bool down) {
     return g_ipc.send_key_input(mac_keycode, down);
 }
 
-static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms) {
-    return g_ipc.send_mouse_input(dx, dy, buttons, browser_timestamp_ms);
+static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms, bool absolute = false) {
+    return g_ipc.send_mouse_input(dx, dy, buttons, browser_timestamp_ms, absolute);
+}
+
+static bool send_mouse_mode_change(bool relative) {
+    return g_ipc.send_mouse_mode_change(relative);
 }
 
 static bool send_command(uint8_t command) {
@@ -697,8 +701,8 @@ public:
     }
 
     // Send H.264 frame via RTP video track
-    void send_h264_frame(const std::vector<uint8_t>& data, bool is_keyframe) {
-        if (data.empty() || peer_count_ == 0) return;
+    void send_h264_frame(const EncodedFrame& frame) {
+        if (frame.data.empty() || peer_count_ == 0) return;
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
@@ -711,19 +715,46 @@ public:
         rtc::FrameInfo frameInfo(elapsed);
 
         // Log only IDR frame sends (P frames logged in stats summary)
-        if (is_keyframe) {
-            fprintf(stderr, "[WebRTC] Sending IDR frame: %zu bytes\n", data.size());
+        if (frame.is_keyframe) {
+            fprintf(stderr, "[WebRTC] Sending IDR frame: %zu bytes\n", frame.data.size());
         }
+
+        // T7: Capture send timestamp right before sending
+        struct timespec ts_send;
+        clock_gettime(CLOCK_REALTIME, &ts_send);
+        uint64_t t7_server_send_us = (uint64_t)ts_send.tv_sec * 1000000 + ts_send.tv_nsec / 1000;
+
+        // Encode metadata header for data channel (all metadata in one message)
+        // Format: [cursor_x:2][cursor_y:2][cursor_visible:1][ping_seq:4][t1:8][t2:8][t3:8][t4:8][t5:8][t6:8][t7:8]
+        uint8_t metadata[65];  // 5 cursor + 4 seq + 7*8 timestamps = 65 bytes
+        metadata[0] = frame.cursor_x & 0xFF;
+        metadata[1] = (frame.cursor_x >> 8) & 0xFF;
+        metadata[2] = frame.cursor_y & 0xFF;
+        metadata[3] = (frame.cursor_y >> 8) & 0xFF;
+        metadata[4] = frame.cursor_visible;
+        std::memcpy(&metadata[5], &frame.ping_sequence, 4);
+        std::memcpy(&metadata[9], &frame.t1_browser_ms, 8);
+        std::memcpy(&metadata[17], &frame.t2_server_us, 8);
+        std::memcpy(&metadata[25], &frame.t3_emulator_us, 8);
+        std::memcpy(&metadata[33], &frame.t4_frame_us, 8);
+        std::memcpy(&metadata[41], &frame.t5_server_read_us, 8);
+        std::memcpy(&metadata[49], &frame.t6_encode_done_us, 8);
+        std::memcpy(&metadata[57], &t7_server_send_us, 8);
 
         for (auto& [id, peer] : peers_) {
             if (peer->codec != CodecType::H264) continue;  // Skip non-H264 peers
             if (peer->ready && peer->video_track && peer->video_track->isOpen()) {
                 try {
-                    // sendFrame with FrameInfo provides proper RTP timestamps
+                    // Send video frame via RTP video track
                     peer->video_track->sendFrame(
-                        reinterpret_cast<const std::byte*>(data.data()),
-                        data.size(),
+                        reinterpret_cast<const std::byte*>(frame.data.data()),
+                        frame.data.size(),
                         frameInfo);
+
+                    // Send metadata via data channel
+                    if (peer->data_channel && peer->data_channel->isOpen()) {
+                        peer->data_channel->send(reinterpret_cast<const std::byte*>(metadata), sizeof(metadata));
+                    }
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] Send error to %s: %s\n", id.c_str(), e.what());
                 }
@@ -732,8 +763,8 @@ public:
     }
 
     // Send AV1 frame via RTP video track
-    void send_av1_frame(const std::vector<uint8_t>& data, bool is_keyframe) {
-        if (data.empty() || peer_count_ == 0) return;
+    void send_av1_frame(const EncodedFrame& frame) {
+        if (frame.data.empty() || peer_count_ == 0) return;
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
@@ -741,18 +772,46 @@ public:
         auto elapsed = std::chrono::duration<double>(now - start_time_);
         rtc::FrameInfo frameInfo(elapsed);
 
-        if (is_keyframe) {
-            fprintf(stderr, "[WebRTC] Sending AV1 keyframe: %zu bytes\n", data.size());
+        if (frame.is_keyframe) {
+            fprintf(stderr, "[WebRTC] Sending AV1 keyframe: %zu bytes\n", frame.data.size());
         }
+
+        // T7: Capture send timestamp right before sending
+        struct timespec ts_send;
+        clock_gettime(CLOCK_REALTIME, &ts_send);
+        uint64_t t7_server_send_us = (uint64_t)ts_send.tv_sec * 1000000 + ts_send.tv_nsec / 1000;
+
+        // Encode metadata header for data channel (all metadata in one message)
+        // Format: [cursor_x:2][cursor_y:2][cursor_visible:1][ping_seq:4][t1:8][t2:8][t3:8][t4:8][t5:8][t6:8][t7:8]
+        uint8_t metadata[65];  // 5 cursor + 4 seq + 7*8 timestamps = 65 bytes
+        metadata[0] = frame.cursor_x & 0xFF;
+        metadata[1] = (frame.cursor_x >> 8) & 0xFF;
+        metadata[2] = frame.cursor_y & 0xFF;
+        metadata[3] = (frame.cursor_y >> 8) & 0xFF;
+        metadata[4] = frame.cursor_visible;
+        std::memcpy(&metadata[5], &frame.ping_sequence, 4);
+        std::memcpy(&metadata[9], &frame.t1_browser_ms, 8);
+        std::memcpy(&metadata[17], &frame.t2_server_us, 8);
+        std::memcpy(&metadata[25], &frame.t3_emulator_us, 8);
+        std::memcpy(&metadata[33], &frame.t4_frame_us, 8);
+        std::memcpy(&metadata[41], &frame.t5_server_read_us, 8);
+        std::memcpy(&metadata[49], &frame.t6_encode_done_us, 8);
+        std::memcpy(&metadata[57], &t7_server_send_us, 8);
 
         for (auto& [id, peer] : peers_) {
             if (peer->codec != CodecType::AV1) continue;
             if (peer->ready && peer->video_track && peer->video_track->isOpen()) {
                 try {
+                    // Send video frame via RTP video track
                     peer->video_track->sendFrame(
-                        reinterpret_cast<const std::byte*>(data.data()),
-                        data.size(),
+                        reinterpret_cast<const std::byte*>(frame.data.data()),
+                        frame.data.size(),
                         frameInfo);
+
+                    // Send metadata via data channel
+                    if (peer->data_channel && peer->data_channel->isOpen()) {
+                        peer->data_channel->send(reinterpret_cast<const std::byte*>(metadata), sizeof(metadata));
+                    }
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] AV1 send error to %s: %s\n", id.c_str(), e.what());
                 }
@@ -834,22 +893,27 @@ public:
     // Send PNG frame via DataChannel (binary) with metadata header
     // Frame format: [8-byte t1_frame_ready] [4-byte x] [4-byte y] [4-byte width] [4-byte height]
     //               [4-byte frame_width] [4-byte frame_height] [8-byte t4_send_time]
+    //               [2-byte cursor_x] [2-byte cursor_y] [1-byte cursor_visible]
     //               [4-byte ping_seq] [8-byte ping_t1] [8-byte ping_t2] [8-byte ping_t3]
-    //               [8-byte ping_t4] [8-byte ping_t5] [PNG data]
+    //               [8-byte ping_t4] [8-byte ping_t5] [8-byte ping_t6] [8-byte ping_t7] [PNG data]
+    //   Total header: 113 bytes (40 base + 5 cursor + 68 ping with 7 timestamps)
     //   All values are little-endian uint32/uint64
-    //   t1_frame_ready = emulator frame completion time (from SHM)
-    //   t4_send_time = server send time (captured here)
-    //   x, y, width, height = dirty rect position and size
-    //   frame_width, frame_height = full screen resolution
-    //   ping_* = complete ping roundtrip with timestamps at each layer (0 if no ping)
-    void send_png_frame(const std::vector<uint8_t>& data, uint64_t t1_frame_ready_ms,
+    //   Complete ping/pong round-trip timestamps:
+    //     t1 = browser send (performance.now ms)
+    //     t2 = server receive (CLOCK_REALTIME us)
+    //     t3 = emulator receive (CLOCK_REALTIME us)
+    //     t4 = frame ready in SHM (CLOCK_REALTIME us)
+    //     t5 = server read from SHM (CLOCK_REALTIME us)
+    //     t6 = encoding finished (CLOCK_REALTIME us)
+    //     t7 = server sending (CLOCK_REALTIME us)
+    void send_png_frame(const EncodedFrame& encoded_frame, uint64_t t1_frame_ready_ms,
                         uint32_t x, uint32_t y, uint32_t width, uint32_t height,
                         uint32_t frame_width, uint32_t frame_height) {
-        if (data.empty() || peer_count_ == 0) return;
+        if (encoded_frame.data.empty() || peer_count_ == 0) return;
 
         // Sanity check: PNG data shouldn't be larger than 10MB for 1920x1080
-        if (data.size() > 10 * 1024 * 1024) {
-            fprintf(stderr, "[WebRTC] ERROR: PNG data size %zu is too large, skipping frame\n", data.size());
+        if (encoded_frame.data.size() > 10 * 1024 * 1024) {
+            fprintf(stderr, "[WebRTC] ERROR: PNG data size %zu is too large, skipping frame\n", encoded_frame.data.size());
             return;
         }
 
@@ -859,36 +923,15 @@ public:
         clock_gettime(CLOCK_REALTIME, &ts);
         uint64_t t4_send_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
-        // Read ping echo from SHM (emulator stores last received ping with all timestamps)
-        // OPTIMIZED: Only ping_sequence is atomic - acts as "ready" flag
-        // Read-acquire on ping_sequence ensures all timestamp writes are visible
-        uint32_t ping_seq = 0;
-        uint64_t ping_t1_browser_ms = 0;
-        uint64_t ping_t2_server_us = 0;
-        uint64_t ping_t3_emulator_us = 0;
-        uint64_t ping_t4_frame_ready_us = 0;
-        if (g_ipc_shm) {
-            // Atomic read-acquire: ensures visibility of all previous writes to ping_timestamps
-            ping_seq = ATOMIC_LOAD(g_ipc_shm->ping_sequence);
+        // T7: Capture server send timestamp (for ping/pong)
+        uint64_t t7_server_send_us = t4_send_ms * 1000;  // Convert ms to us
 
-            // If ping available, read timestamp struct (no atomics needed - seq acts as guard)
-            if (ping_seq > 0) {
-                ping_t1_browser_ms = g_ipc_shm->ping_timestamps.t1_browser_ms;
-                ping_t2_server_us = g_ipc_shm->ping_timestamps.t2_server_us;
-                ping_t3_emulator_us = g_ipc_shm->ping_timestamps.t3_emulator_us;
-                ping_t4_frame_ready_us = g_ipc_shm->ping_timestamps.t4_frame_us;
-                // Note: Ping echo logging happens in browser when it receives the echo
-            }
-        }
-        // t5 is server send time (same as t4_send_ms from frame metadata)
-        uint64_t ping_t5_server_send_us = t4_send_ms * 1000;  // Convert ms to us
-
-        // Build frame with metadata header (84 bytes total: 40 base + 44 ping)
+        // Build frame with metadata header (113 bytes total: 40 base + 5 cursor + 68 ping)
         std::vector<uint8_t> frame_with_header;
         try {
-            frame_with_header.resize(84 + data.size());
+            frame_with_header.resize(113 + encoded_frame.data.size());
         } catch (const std::bad_alloc& e) {
-            fprintf(stderr, "[WebRTC] ERROR: Failed to allocate %zu bytes for frame header\n", 84 + data.size());
+            fprintf(stderr, "[WebRTC] ERROR: Failed to allocate %zu bytes for frame header\n", 113 + encoded_frame.data.size());
             return;
         }
 
@@ -924,33 +967,51 @@ public:
         for (int i = 0; i < 8; i++) {
             frame_with_header[32 + i] = (t4_send_ms >> (i * 8)) & 0xFF;
         }
+        // Cursor position (5 bytes: x, y, visible)
+        // 2-byte cursor_x
+        frame_with_header[40] = encoded_frame.cursor_x & 0xFF;
+        frame_with_header[41] = (encoded_frame.cursor_x >> 8) & 0xFF;
+        // 2-byte cursor_y
+        frame_with_header[42] = encoded_frame.cursor_y & 0xFF;
+        frame_with_header[43] = (encoded_frame.cursor_y >> 8) & 0xFF;
+        // 1-byte cursor_visible
+        frame_with_header[44] = encoded_frame.cursor_visible;
+
         // Ping echo with all timestamps (44 bytes: sequence + 5 timestamps)
         // 4-byte ping sequence number (0 if no ping received)
         for (int i = 0; i < 4; i++) {
-            frame_with_header[40 + i] = (ping_seq >> (i * 8)) & 0xFF;
+            frame_with_header[45 + i] = (encoded_frame.ping_sequence >> (i * 8)) & 0xFF;
         }
         // 8-byte t1: browser send time (performance.now() milliseconds)
         for (int i = 0; i < 8; i++) {
-            frame_with_header[44 + i] = (ping_t1_browser_ms >> (i * 8)) & 0xFF;
+            frame_with_header[49 + i] = (encoded_frame.t1_browser_ms >> (i * 8)) & 0xFF;
         }
         // 8-byte t2: server receive time (CLOCK_REALTIME microseconds)
         for (int i = 0; i < 8; i++) {
-            frame_with_header[52 + i] = (ping_t2_server_us >> (i * 8)) & 0xFF;
+            frame_with_header[57 + i] = (encoded_frame.t2_server_us >> (i * 8)) & 0xFF;
         }
         // 8-byte t3: emulator receive time (CLOCK_REALTIME microseconds)
         for (int i = 0; i < 8; i++) {
-            frame_with_header[60 + i] = (ping_t3_emulator_us >> (i * 8)) & 0xFF;
+            frame_with_header[65 + i] = (encoded_frame.t3_emulator_us >> (i * 8)) & 0xFF;
         }
         // 8-byte t4: emulator/frame ready time (CLOCK_REALTIME microseconds)
         for (int i = 0; i < 8; i++) {
-            frame_with_header[68 + i] = (ping_t4_frame_ready_us >> (i * 8)) & 0xFF;
+            frame_with_header[73 + i] = (encoded_frame.t4_frame_us >> (i * 8)) & 0xFF;
         }
-        // 8-byte t5: server send time (CLOCK_REALTIME microseconds)
+        // 8-byte t5: server read from SHM (CLOCK_REALTIME microseconds)
         for (int i = 0; i < 8; i++) {
-            frame_with_header[76 + i] = (ping_t5_server_send_us >> (i * 8)) & 0xFF;
+            frame_with_header[81 + i] = (encoded_frame.t5_server_read_us >> (i * 8)) & 0xFF;
         }
-        // Copy PNG data after 84-byte header
-        memcpy(frame_with_header.data() + 84, data.data(), data.size());
+        // 8-byte t6: encoding finished (CLOCK_REALTIME microseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[89 + i] = (encoded_frame.t6_encode_done_us >> (i * 8)) & 0xFF;
+        }
+        // 8-byte t7: server sending (CLOCK_REALTIME microseconds)
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[97 + i] = (t7_server_send_us >> (i * 8)) & 0xFF;
+        }
+        // Copy PNG data after 113-byte header (was 105, now 113)
+        memcpy(frame_with_header.data() + 113, encoded_frame.data.data(), encoded_frame.data.size());
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
@@ -965,6 +1026,32 @@ public:
                     fprintf(stderr, "[WebRTC] PNG send error to %s: %s\n", id.c_str(), e.what());
                 }
             }
+        }
+    }
+
+    // Populate frame metadata from shared memory (cursor + ping/pong data)
+    // Called after encoding, populates metadata fields in EncodedFrame
+    // t5_read = server read timestamp, t6_encode = encode done timestamp
+    void populate_frame_metadata(EncodedFrame& frame, uint64_t t5_read_us, uint64_t t6_encode_us) {
+        if (!g_ipc.is_connected() || !g_ipc_shm) return;
+
+        // Cursor position (always available)
+        frame.cursor_x = g_ipc_shm->cursor_x;
+        frame.cursor_y = g_ipc_shm->cursor_y;
+        frame.cursor_visible = g_ipc_shm->cursor_visible;
+
+        // Ping/pong timestamps (atomic read-acquire for sequence number)
+        frame.ping_sequence = ATOMIC_LOAD(g_ipc_shm->ping_sequence);
+
+        // If ping available, read timestamp struct (no atomics needed - seq acts as guard)
+        if (frame.ping_sequence > 0) {
+            frame.t1_browser_ms = g_ipc_shm->ping_timestamps.t1_browser_ms;
+            frame.t2_server_us = g_ipc_shm->ping_timestamps.t2_server_us;
+            frame.t3_emulator_us = g_ipc_shm->ping_timestamps.t3_emulator_us;
+            frame.t4_frame_us = g_ipc_shm->ping_timestamps.t4_frame_us;
+            frame.t5_server_read_us = t5_read_us;      // Server read time (passed in)
+            frame.t6_encode_done_us = t6_encode_us;    // Encode done time (passed in)
+            // t7_server_send_us will be set in send functions right before sending
         }
     }
 
@@ -1409,24 +1496,27 @@ private:
 
     // Binary input protocol handler (new, optimized)
     // Format from browser:
-    // Mouse move: [type=1:1] [dx:int16] [dy:int16] [timestamp:float64]
+    // Mouse move (relative): [type=1:1] [dx:int16] [dy:int16] [timestamp:float64]
     // Mouse button: [type=2:1] [button:uint8] [down:uint8] [timestamp:float64]
     // Key: [type=3:1] [keycode:uint16] [down:uint8] [timestamp:float64]
     // Ping: [type=4:1] [sequence:uint32] [timestamp:float64]
+    // Mouse move (absolute): [type=5:1] [x:uint16] [y:uint16] [timestamp:float64]
+    // Mouse mode change: [type=6:1] [mode:uint8] (0=absolute, 1=relative)
     void handle_input_binary(const uint8_t* data, size_t len) {
         if (len < 1) return;
 
         uint8_t type = data[0];
         static uint8_t current_buttons = 0;
+        static bool mouse_mode_relative = false;  // Track current mouse mode
 
         switch (type) {
-            case 1: {  // Mouse move
+            case 1: {  // Mouse move (relative)
                 if (len < 13) return;  // 1 + 2 + 2 + 8
                 int16_t dx = *reinterpret_cast<const int16_t*>(data + 1);
                 int16_t dy = *reinterpret_cast<const int16_t*>(data + 3);
                 double timestamp = *reinterpret_cast<const double*>(data + 5);
                 uint64_t browser_ts = static_cast<uint64_t>(timestamp);
-                send_mouse_input(dx, dy, current_buttons, browser_ts);
+                send_mouse_input(dx, dy, current_buttons, browser_ts, false);  // relative=false for backward compat
                 g_mouse_move_count++;
                 break;
             }
@@ -1470,6 +1560,30 @@ private:
                 if (g_debug_perf) {
                     fprintf(stderr, "[Server] Binary ping #%u (t1=%.1fms) forwarded to emulator: %s\n",
                             sequence, timestamp, success ? "OK" : "FAILED");
+                }
+                break;
+            }
+            case 5: {  // Mouse move (absolute)
+                if (len < 13) return;  // 1 + 2 + 2 + 8
+                uint16_t x = *reinterpret_cast<const uint16_t*>(data + 1);
+                uint16_t y = *reinterpret_cast<const uint16_t*>(data + 3);
+                double timestamp = *reinterpret_cast<const double*>(data + 5);
+                uint64_t browser_ts = static_cast<uint64_t>(timestamp);
+                if (g_debug_connection) {
+                    fprintf(stderr, "[Server] Absolute mouse: x=%u, y=%u\n", x, y);
+                }
+                send_mouse_input(x, y, current_buttons, browser_ts, true);  // absolute=true
+                g_mouse_move_count++;
+                break;
+            }
+            case 6: {  // Mouse mode change
+                if (len < 2) return;  // 1 + 1
+                uint8_t mode = data[1];
+                mouse_mode_relative = (mode == 1);
+                send_mouse_mode_change(mouse_mode_relative);
+                if (g_debug_connection) {
+                    fprintf(stderr, "[Server] Mouse mode changed to: %s\n",
+                            mouse_mode_relative ? "relative" : "absolute");
                 }
                 break;
             }
@@ -1781,10 +1895,12 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         // Plain read - synchronized by eventfd read above
         uint64_t frame_timestamp_us = g_ipc_shm->timestamp_us;
 
+        // T5: Server read timestamp - capture immediately after eventfd read
         // Use CLOCK_REALTIME to match the emulator's timestamp (both in same clock domain)
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        uint64_t server_now_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        uint64_t t5_server_read_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        uint64_t server_now_us = t5_server_read_us;  // Alias for existing latency code
 
         // Read frame dimensions (plain reads - synchronized by eventfd)
         uint32_t width = g_ipc_shm->width;
@@ -1810,8 +1926,15 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         auto encode_start = std::chrono::steady_clock::now();
         if (webrtc.has_codec_peer(CodecType::H264)) {
             EncodedFrame frame = h264_encoder.encode_bgra(frame_data, width, height, stride);
+
+            // T6: Capture encode done timestamp
+            struct timespec ts_enc;
+            clock_gettime(CLOCK_REALTIME, &ts_enc);
+            uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
+
             if (!frame.data.empty()) {
-                webrtc.send_h264_frame(frame.data, frame.is_keyframe);
+                webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+                webrtc.send_h264_frame(frame);
                 frames_encoded++;
             }
         }
@@ -1819,8 +1942,15 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         // Encode and send to AV1 peers
         if (webrtc.has_codec_peer(CodecType::AV1)) {
             EncodedFrame frame = av1_encoder.encode_bgra(frame_data, width, height, stride);
+
+            // T6: Capture encode done timestamp
+            struct timespec ts_enc;
+            clock_gettime(CLOCK_REALTIME, &ts_enc);
+            uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
+
             if (!frame.data.empty()) {
-                webrtc.send_av1_frame(frame.data, frame.is_keyframe);
+                webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+                webrtc.send_av1_frame(frame);
                 frames_encoded++;
             }
         }
@@ -1902,12 +2032,20 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                                                          dirty_x, dirty_y, dirty_width, dirty_height);
                 }
 
+                // T6: Capture encode done timestamp
+                struct timespec ts_enc;
+                clock_gettime(CLOCK_REALTIME, &ts_enc);
+                uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
+
                 if (!frame.data.empty()) {
+                    // Populate cursor and ping/pong metadata
+                    webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+
                     // T1: Frame ready time from emulator (convert from microseconds to milliseconds)
                     uint64_t t1_frame_ready_ms = frame_timestamp_us / 1000;
 
                     // Send PNG with dirty rect metadata, full frame resolution, and timestamps
-                    webrtc.send_png_frame(frame.data, t1_frame_ready_ms,
+                    webrtc.send_png_frame(frame, t1_frame_ready_ms,
                                           dirty_x, dirty_y, dirty_width, dirty_height,
                                           width, height);
                     frames_encoded++;
@@ -1931,6 +2069,9 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             total_encode_latency_us += encode_latency;
             latency_samples++;
         }
+
+        // Cursor updates are now sent with every frame (in frame metadata)
+        // No separate cursor update broadcast needed
 
         // Print stats every 3 seconds
         auto stats_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time);

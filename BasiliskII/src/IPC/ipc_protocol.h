@@ -188,6 +188,13 @@ typedef struct {
     uint32_t dirty_width;        // Width of dirty rect (0 = no changes, same as width = full frame)
     uint32_t dirty_height;       // Height of dirty rect
 
+    // Cursor position (for rendering cursor overlay in browser)
+    // Updated each frame, read by server for sending to browser
+    uint16_t cursor_x;           // Current cursor X position (0 to width-1)
+    uint16_t cursor_y;           // Current cursor Y position (0 to height-1)
+    uint8_t cursor_visible;      // 1 if cursor should be shown, 0 if hidden
+    uint8_t _cursor_reserved[3]; // Padding for alignment
+
     // Triple buffer synchronization
     // Plain fields - synchronized by eventfd (kernel provides memory barriers)
     uint32_t write_index;        // Buffer emulator is writing to (0-2)
@@ -272,6 +279,7 @@ typedef struct {
 #define MACEMU_INPUT_COMMAND   3   // Emulator command (start/stop/reset)
 #define MACEMU_INPUT_PING      4   // Latency measurement ping (echoed in frame metadata)
 #define MACEMU_INPUT_AUDIO_REQUEST  5   // Server requests audio data (pull model)
+#define MACEMU_INPUT_MOUSE_MODE     6   // Mouse mode change (absolute/relative)
 
 // Key event flags
 #define MACEMU_KEY_DOWN        0x01
@@ -281,6 +289,9 @@ typedef struct {
 #define MACEMU_MOUSE_LEFT      0x01
 #define MACEMU_MOUSE_RIGHT     0x02
 #define MACEMU_MOUSE_MIDDLE    0x04
+
+// Mouse mode flags (in MacEmuMouseInput.hdr.flags)
+#define MACEMU_MOUSE_ABSOLUTE  0x10  // If set, x/y are absolute coordinates; else relative deltas
 
 // Command types
 #define MACEMU_CMD_START       1
@@ -339,6 +350,14 @@ typedef struct {
     uint32_t requested_samples;  // Number of samples requested (usually 960 for 20ms @ 48kHz)
 } MacEmuAudioRequestInput;
 
+// Mouse mode change input (8 bytes total)
+// Browser sends this to switch between absolute and relative mouse modes
+typedef struct {
+    MacEmuInputHeader hdr;       // type = MACEMU_INPUT_MOUSE_MODE
+    uint8_t mode;                // 0 = absolute, 1 = relative
+    uint8_t _reserved[3];
+} MacEmuMouseModeInput;
+
 // Union for receiving any input type
 typedef union {
     MacEmuInputHeader hdr;
@@ -347,6 +366,7 @@ typedef union {
     MacEmuCommandInput cmd;
     MacEmuPingInput ping;
     MacEmuAudioRequestInput audio_req;
+    MacEmuMouseModeInput mouse_mode;
 } MacEmuInput;
 
 /*

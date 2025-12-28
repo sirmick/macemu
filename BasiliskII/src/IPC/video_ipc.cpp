@@ -317,6 +317,9 @@ static void process_binary_input(const uint8_t* data, size_t len) {
             if (len < sizeof(MacEmuMouseInput)) return;
             const MacEmuMouseInput* mouse = (const MacEmuMouseInput*)data;
 
+            // Check if absolute or relative mode
+            bool absolute = (mouse->hdr.flags & MACEMU_MOUSE_ABSOLUTE) != 0;
+
             // Measure end-to-end mouse latency
             // Browser sends performance.now() in ms, we compare to our steady_clock
             if (mouse->timestamp_ms > 0) {
@@ -336,10 +339,31 @@ static void process_binary_input(const uint8_t* data, size_t len) {
                 }
             }
 
-            // Call ADBMouseMoved() immediately (like X11 driver does)
-            // ADB handles its own buffering - no need to batch here
-            if (mouse->x != 0 || mouse->y != 0) {
-                ADBMouseMoved(mouse->x, mouse->y);
+            // Call ADBMouseMoved() - behavior depends on absolute flag
+            // IMPORTANT: Set ADB mode based on message flag, not global state!
+            // In absolute mode: x/y are screen coordinates (0 to width/height), reinterpret as unsigned
+            // In relative mode: x/y are signed deltas
+            int x, y;
+            if (absolute) {
+                // Reinterpret int16_t as uint16_t for absolute coordinates
+                x = static_cast<uint16_t>(mouse->x);
+                y = static_cast<uint16_t>(mouse->y);
+                static int abs_log_count = 0;
+                if (abs_log_count++ < 5) {
+                    fprintf(stderr, "IPC: Absolute mouse: x=%d, y=%d (raw: %d, %d)\n", x, y, mouse->x, mouse->y);
+                }
+                // Ensure ADB is in absolute mode for this movement
+                ADBSetRelMouseMode(false);
+            } else {
+                // Use as-is for relative deltas
+                x = mouse->x;
+                y = mouse->y;
+                // Ensure ADB is in relative mode for this movement
+                ADBSetRelMouseMode(true);
+            }
+
+            if (absolute || x != 0 || y != 0) {
+                ADBMouseMoved(x, y);
             }
 
             // Handle button changes
@@ -358,6 +382,14 @@ static void process_binary_input(const uint8_t* data, size_t len) {
                     ADBMouseUp(1);
             }
             last_buttons = mouse->buttons;
+            break;
+        }
+        case MACEMU_INPUT_MOUSE_MODE: {
+            if (len < sizeof(MacEmuMouseModeInput)) return;
+            const MacEmuMouseModeInput* mode_msg = (const MacEmuMouseModeInput*)data;
+            bool relative = (mode_msg->mode == 1);
+            ADBSetRelMouseMode(relative);
+            fprintf(stderr, "IPC: Mouse mode changed to %s\n", relative ? "relative" : "absolute");
             break;
         }
         case MACEMU_INPUT_COMMAND: {
@@ -458,7 +490,8 @@ static void update_ping_on_frame_complete(uint64_t timestamp_us) {
 static void control_socket_thread() {
     uint8_t buffer[256];
 
-    // Use relative mouse mode since browser uses pointer lock
+    // Default to relative mouse mode (matches browser default)
+    // User can switch to absolute mode via UI toggle
     ADBSetRelMouseMode(true);
 
     while (control_thread_running) {
@@ -771,6 +804,13 @@ static void convert_frame_to_bgra() {
         video_shm->dirty_width = dirty_w;
         video_shm->dirty_height = dirty_h;
     }
+
+    // Update cursor position for browser rendering
+    int cursor_x = 0, cursor_y = 0;
+    ADBGetMousePos(&cursor_x, &cursor_y);
+    video_shm->cursor_x = (uint16_t)cursor_x;
+    video_shm->cursor_y = (uint16_t)cursor_y;
+    video_shm->cursor_visible = 1;  // Always visible for now (could check Mac cursor state later)
 
     // Get timestamp and signal frame complete
     // Use CLOCK_REALTIME for Unix epoch timestamp (needed for browser sync)

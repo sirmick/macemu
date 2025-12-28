@@ -275,18 +275,31 @@ bool IPCConnection::send_key_input(int mac_keycode, bool down) {
     return send(control_socket_, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
 
-bool IPCConnection::send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms) {
+bool IPCConnection::send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms, bool absolute) {
     if (control_socket_ < 0) return false;
 
     MacEmuMouseInput msg;
     msg.hdr.type = MACEMU_INPUT_MOUSE;
-    msg.hdr.flags = 0;
+    msg.hdr.flags = absolute ? MACEMU_MOUSE_ABSOLUTE : 0;
     msg.hdr._reserved = 0;
-    msg.x = dx;
+    msg.x = dx;  // Either delta (relative) or coordinate (absolute)
     msg.y = dy;
     msg.buttons = buttons;
     memset(msg._reserved, 0, sizeof(msg._reserved));
     msg.timestamp_ms = browser_timestamp_ms;
+
+    return send(control_socket_, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
+}
+
+bool IPCConnection::send_mouse_mode_change(bool relative) {
+    if (control_socket_ < 0) return false;
+
+    MacEmuMouseModeInput msg;
+    msg.hdr.type = MACEMU_INPUT_MOUSE_MODE;
+    msg.hdr.flags = 0;
+    msg.hdr._reserved = 0;
+    msg.mode = relative ? 1 : 0;
+    memset(msg._reserved, 0, sizeof(msg._reserved));
 
     return send(control_socket_, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
