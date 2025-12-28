@@ -13,6 +13,7 @@
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
+#include "uae_wrapper.h"
 #include "main.h"
 #include "prefs.h"
 #include "video.h"
@@ -33,22 +34,23 @@
 #define DEBUG 1
 #include "debug.h"
 
-// Global variables
-uint8 *RAMBaseHost = NULL;
-uint8 *ROMBaseHost = NULL;
-uint32 RAMSize = 32 * 1024 * 1024;  // 32MB RAM
-uint32 ROMSize = 0;
+// Global variables (defined in basilisk_glue.cpp when using dualcpu backend)
+extern uint8 *RAMBaseHost;
+extern uint8 *ROMBaseHost;
+extern uint32 RAMSize;
+extern uint32 ROMSize;
 
 #if DIRECT_ADDRESSING
-uintptr MEMBaseDiff;
-uint32 RAMBaseMac = 0;
-uint32 ROMBaseMac = 0;
+// MEMBaseDiff, RAMBaseMac, ROMBaseMac are defined in uae_wrapper.cpp/basilisk_glue.cpp
+extern uintptr MEMBaseDiff;
+extern uint32 RAMBaseMac;
+extern uint32 ROMBaseMac;
 #endif
 
-// CPU and FPU type (ROMVersion is defined in rom_patches.cpp)
-int CPUType;
+// CPU and FPU type (CPUType/FPUType defined in uae_wrapper.cpp)
+extern int CPUType;
 bool CPUIs68060;
-int FPUType;
+extern int FPUType;
 bool TwentyFourBitAddressing;
 
 // Error handling (these are defined in main.cpp, but we need const char* versions)
@@ -70,8 +72,8 @@ void QuitEmulator(void)
 	exit(1);
 }
 
-// Interrupt flags (declared in main.h, just define it here)
-uint32 InterruptFlags = 0;
+// Interrupt flags (declared in main.h and defined in uae_wrapper.cpp)
+extern uint32 InterruptFlags;
 
 // Disable interrupts (stub)
 void DisableInterrupt(void)
@@ -148,15 +150,12 @@ void B2_delete_mutex(B2_mutex *m) { delete m; }
 void B2_lock_mutex(B2_mutex *m) {}
 void B2_unlock_mutex(B2_mutex *m) {}
 
-// Interrupt stubs
+// Interrupt stubs (TriggerInterrupt is in basilisk_glue.cpp)
 void SetInterruptFlag(uint32 flag) { InterruptFlags |= flag; }
 void ClearInterruptFlag(uint32 flag) { InterruptFlags &= ~flag; }
-void TriggerInterrupt() {}
 
-// CPU emulation stubs
-bool Init680x0() { return true; }
-void Execute68k(uint32 addr, struct M68kRegisters *r) {}
-void Execute68kTrap(uint16 trap, struct M68kRegisters *r) {}
+// CPU emulation stubs - Init680x0, Execute68k, Execute68kTrap are now in basilisk_glue.cpp
+// (when using dualcpu backend)
 void FlushCodeCache(void *start, uint32 size) {}
 
 // ExtFS stubs
@@ -191,6 +190,9 @@ int main(int argc, char **argv)
 
 	// Initialize random number generator
 	srand(time(NULL));
+
+	// Set RAM size before PrefsInit
+	RAMSize = 32 * 1024 * 1024;  // 32MB
 
 	// Read preferences (minimal)
 	PrefsInit(NULL, argc, argv);
@@ -261,6 +263,21 @@ int main(int argc, char **argv)
 	printf("CPU Type: 680%02d\n", (CPUType == 0) ? 0 : (CPUType * 10 + 20));
 	printf("FPU: %s\n", FPUType ? "Yes" : "No");
 	printf("24-bit addressing: %s\n", TwentyFourBitAddressing ? "Yes" : "No");
+
+	// Execute 5 instructions
+	printf("\n=== Executing 5 Instructions ===\n");
+
+	for (int i = 0; i < 5; i++) {
+		uint32_t pc_before = uae_get_pc();
+		uint16_t sr_before = uae_get_sr();
+
+		printf("Instruction %d: PC=0x%08x SR=0x%04x\n", i + 1, pc_before, sr_before);
+
+		uae_cpu_execute_one();
+
+		uint32_t pc_after = uae_get_pc();
+		printf("              -> PC=0x%08x\n", pc_after);
+	}
 
 	// Clean up
 	printf("\n=== Shutting Down ===\n");
