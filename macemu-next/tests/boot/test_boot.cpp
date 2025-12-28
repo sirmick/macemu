@@ -268,6 +268,20 @@ int main(int argc, char **argv)
 	printf("FPU: %s\n", FPUType ? "Yes" : "No");
 	printf("24-bit addressing: %s\n", TwentyFourBitAddressing ? "Yes" : "No");
 
+#ifdef CPU_EMULATION_DUALCPU
+	// Initialize Unicorn validation (runs Unicorn in lockstep with UAE)
+	extern "C" {
+		bool unicorn_validation_init(void);
+		void unicorn_validation_shutdown(void);
+	}
+
+	printf("\n");
+	if (!unicorn_validation_init()) {
+		fprintf(stderr, "Failed to initialize Unicorn validation\n");
+		return 1;
+	}
+#endif
+
 	// Reset CPU (like BasiliskII's Start680x0() does)
 	// This sets PC to ROMBaseMac + 0x2a and A7 to 0x2000
 	printf("\nResetting CPU (calling m68k_reset)...\n");

@@ -29,6 +29,11 @@ uae_common_args = [
   '-Wno-narrowing',
 ]
 
+# Add flag for dual-CPU validation mode
+if cpu_backend == 'dualcpu'
+  uae_common_args += ['-DCPU_EMULATION_DUALCPU']
+endif
+
 # Compile cpuemu.cpp WITHOUT -DNOFLAGS to get op_xxx_ff functions
 cpuemu_ff_obj = static_library('cpuemu_ff',
   'cpuemu_ff.cpp',

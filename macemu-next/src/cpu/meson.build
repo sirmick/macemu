@@ -20,6 +20,7 @@ endif
 if cpu_backend == 'dualcpu'
   cpu_sources += [
     'dualcpu.c',
+    'unicorn_validation.cpp',
   ]
 endif
 

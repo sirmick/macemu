@@ -54,6 +54,7 @@ void dualcpu_destroy(DualCPU *dcpu);
 /* Memory setup (both CPUs get separate RAM/ROM) */
 bool dualcpu_map_ram(DualCPU *dcpu, uint32_t addr, uint32_t size);
 bool dualcpu_map_rom(DualCPU *dcpu, uint32_t addr, const void *rom_data, uint32_t size);
+bool dualcpu_map_memory(DualCPU *dcpu, uint32_t addr, uint32_t size);  /* Map arbitrary memory region */
 
 /* Write to both CPUs' memory */
 bool dualcpu_mem_write(DualCPU *dcpu, uint32_t addr, const void *data, uint32_t size);

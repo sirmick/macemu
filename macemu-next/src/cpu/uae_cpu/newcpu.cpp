@@ -1406,6 +1406,14 @@ int m68k_do_specialties (void)
 	return 0;
 }
 
+// Unicorn validation hooks (when CPU_BACKEND == dualcpu)
+#ifdef CPU_EMULATION_DUALCPU
+extern "C" {
+	bool unicorn_validation_enabled(void);
+	bool unicorn_validation_step(void);
+}
+#endif
+
 void m68k_do_execute (void)
 {
 	for (;;) {
@@ -1422,20 +1430,30 @@ void m68k_do_execute (void)
 			first_exec = 0;
 		}
 
-		uae_u32 opcode = GET_OPCODE;
+#ifdef CPU_EMULATION_DUALCPU
+		// Dual-CPU validation: execute instruction and compare with Unicorn
+		if (unicorn_validation_enabled()) {
+			unicorn_validation_step();  // Handles execution + validation
+		} else
+#endif
+		{
+			// Normal execution path
+			uae_u32 opcode = GET_OPCODE;
 
-		// DEBUG: Print first opcode value
-		if (first_exec == 0) {
-			fprintf(stderr, "  Fetched opcode: 0x%04x\n", opcode);
-			fprintf(stderr, "  Calling cpufunctbl[0x%04x] = %p\n", opcode, (void*)cpufunctbl[opcode]);
-			fflush(stderr);
-			first_exec = -1;  // Only print once
-		}
+			// DEBUG: Print first opcode value
+			if (first_exec == 0) {
+				fprintf(stderr, "  Fetched opcode: 0x%04x\n", opcode);
+				fprintf(stderr, "  Calling cpufunctbl[0x%04x] = %p\n", opcode, (void*)cpufunctbl[opcode]);
+				fflush(stderr);
+				first_exec = -1;  // Only print once
+			}
 
 #if FLIGHT_RECORDER
-		m68k_record_step(m68k_getpc());
+			m68k_record_step(m68k_getpc());
 #endif
-		(*cpufunctbl[opcode])(opcode);
+			(*cpufunctbl[opcode])(opcode);
+		}
+
 		cpu_check_ticks();
 		if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
 			if (m68k_do_specialties())

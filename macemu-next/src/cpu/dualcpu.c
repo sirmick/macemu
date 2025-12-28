@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
 
 /* UAE CPU interface now in uae_wrapper.h */
 
@@ -188,7 +189,9 @@ void dualcpu_destroy(DualCPU *dcpu) {
         unicorn_destroy(dcpu->unicorn);
     }
 
-    if (dcpu->uae_memory) free(dcpu->uae_memory);
+    if (dcpu->uae_memory) {
+        munmap(dcpu->uae_memory, dcpu->uae_memory_size);
+    }
     if (dcpu->unicorn_ram) free(dcpu->unicorn_ram);
     if (dcpu->unicorn_rom) free(dcpu->unicorn_rom);
 
@@ -226,6 +229,19 @@ bool dualcpu_map_ram(DualCPU *dcpu, uint32_t addr, uint32_t size) {
     return true;
 }
 
+bool dualcpu_map_memory(DualCPU *dcpu, uint32_t addr, uint32_t size) {
+    if (!dcpu) return false;
+
+    /* Map in Unicorn only (UAE handles this via memory.cpp) */
+    if (!unicorn_map_ram(dcpu->unicorn, addr, NULL, size)) {
+        snprintf(dcpu->error, sizeof(dcpu->error),
+                "dualcpu_map_memory: Failed to map memory at 0x%08X (size %u)", addr, size);
+        return false;
+    }
+
+    return true;
+}
+
 bool dualcpu_map_rom(DualCPU *dcpu, uint32_t addr, const void *rom_data, uint32_t size) {
     if (!dcpu || !rom_data) return false;
     if (dcpu->ram_base != 0 || dcpu->ram_size == 0) {
@@ -249,17 +265,24 @@ bool dualcpu_map_rom(DualCPU *dcpu, uint32_t addr, const void *rom_data, uint32_
         return false;
     }
 
-    /* UAE: Allocate single contiguous buffer from 0 to ROM_END */
-    uint32_t rom_end = dcpu->rom_base + dcpu->rom_size;
-    dcpu->uae_memory_size = rom_end;
-    dcpu->uae_memory = calloc(1, dcpu->uae_memory_size);
-    if (!dcpu->uae_memory) {
+    /* UAE: Allocate large buffer to cover entire Mac address space
+     * Mac ROM may access hardware at 0x50000000-0x60000000 range
+     * Use mmap for sparse allocation (only commits pages that are touched)
+     */
+    #define UAE_ADDRESS_SPACE_SIZE 0x60000000UL  /* 1.5GB - covers hardware region */
+    dcpu->uae_memory_size = UAE_ADDRESS_SPACE_SIZE;
+    dcpu->uae_memory = mmap(NULL, dcpu->uae_memory_size,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS,
+                            -1, 0);
+    if (dcpu->uae_memory == MAP_FAILED) {
+        dcpu->uae_memory = NULL;
         return false;
     }
 
     /* Copy ROM data into UAE buffer at the correct offset */
     memcpy(dcpu->uae_memory + dcpu->rom_base, rom_data, size);
-    /* RAM portion is already zeroed by calloc */
+    /* RAM portion is already zeroed by mmap */
 
     /* Tell UAE about the memory layout */
     uae_mem_set_ram_ptr(dcpu->uae_memory, dcpu->uae_memory_size);
