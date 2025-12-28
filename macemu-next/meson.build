@@ -41,6 +41,8 @@ message('  Build SheepShaver: ' + build_sheepshaver.to_string())
 
 # Subdirectories
 subdir('src/cpu')
+subdir('src/core')
+subdir('src/drivers/dummy')
 
 # Tests
 if get_option('tests')
