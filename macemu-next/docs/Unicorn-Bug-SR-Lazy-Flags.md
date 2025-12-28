@@ -86,12 +86,22 @@ uc_reg_read(uc, UC_M68K_REG_SR, &sr);
 
 ## Verification
 
-After fix, dual-CPU validation shows **matching SR values**:
+After fix, dual-CPU validation executes **7 ROM instructions** in perfect lockstep:
 
-```
-[4] BEFORE: PC=0x02004052 opcode=0x9080  UAE_SR=0x2700  UC_SR=0x2700
-[5] BEFORE: PC=0x02004054 opcode=0x08C0  UAE_SR=0x2704  UC_SR=0x2704  ✅
-```
+| # | PC | Opcode | Instruction | UAE SR | Unicorn SR | Status |
+|---|------------|--------|-------------|--------|------------|--------|
+| 0 | 0x0200002A | 0x4EFA | JMP 0x0200008C | 0x2700 | 0x2700 | ✅ |
+| 1 | 0x0200008C | 0x46FC | MOVE #0x2700,SR | 0x2700 | 0x2700 | ✅ |
+| 2 | 0x02000090 | 0x4DFA | LEA (PC+disp),A6 | 0x2700 | 0x2700 | ✅ |
+| 3 | 0x02000094 | 0x6000 | BRA 0x02004052 | 0x2700 | 0x2700 | ✅ |
+| 4 | 0x02004052 | 0x9080 | SUB.B D0,(A0) | 0x2704 | 0x2704 | ✅ |
+| 5 | 0x02004054 | 0x08C0 | BSET #31,D0 | 0x2704 | 0x2704 | ✅ |
+| 6 | 0x02004058 | 0x4E7B | MOVEC D0,CACR | 0x2704 | 0x2704 | ✅ |
+| 7 | 0x0200405C | 0x4E7A | MOVEC CACR,D0 | - | - | ⚠️ Exception |
+
+Execution stops at instruction 7 when Unicorn raises UC_ERR_EXCEPTION for
+MOVEC CACR,D0 (reading Cache Control Register). This is expected - cache
+register emulation is a separate task.
 
 ## Upstream Status
 
