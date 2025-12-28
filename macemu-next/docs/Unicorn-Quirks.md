@@ -172,11 +172,30 @@ void compare_cpu_state(void) {
 
 ## Known Differences
 
-### 1. Undefined Behavior
+### 1. Condition Code Flags
+
+**Most common divergence:** UAE and Unicorn sometimes differ in condition code flag updates (Z, N, C, V flags in SR).
+
+Example from ROM boot test:
+- After 4 instructions, SR diverges
+- UAE: `0x2704` (Z flag set)
+- Unicorn: `0x2700` (no flags)
+- Both CPUs have same PC (0x02004054) and same registers
+
+**Why this happens:**
+- Different instruction implementations may update flags differently
+- Some instructions have undefined flag behavior
+- Both implementations are valid if PC and data registers match
+
+**What to check:**
+- If **only SR differs** and PC/registers match → usually OK
+- If **PC or data registers differ** → real divergence, needs debugging
+
+### 2. Undefined Behavior
 
 Some M68K instructions have undefined behavior (e.g., what happens to unused bits). UAE and Unicorn may differ in these cases - this is OK!
 
-### 2. Exception Handling
+### 3. Exception Handling
 
 Exception priority and timing may differ slightly. We focus on happy-path execution first.
 
