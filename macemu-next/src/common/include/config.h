@@ -19,10 +19,11 @@
 #define DIRECT_ADDRESSING 1
 
 /* Disable features we don't need yet */
-#define ENABLE_MON 0
-#define ENABLE_XF86_DGA 0
-#define ENABLE_VOSF 0
-#define ENABLE_GTK 0
+/* Don't define these at all - use #ifdef checks */
+#undef ENABLE_MON
+#undef ENABLE_XF86_DGA
+#undef ENABLE_VOSF
+#undef ENABLE_GTK
 
 /* Standard features */
 #define HAVE_FCNTL_H 1

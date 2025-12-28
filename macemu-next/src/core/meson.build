@@ -27,6 +27,7 @@ core_inc = include_directories(
   '.',
   '../common/include',
   '../cpu',
+  '../cpu/uae_cpu',
 )
 
 core_lib = static_library('core',

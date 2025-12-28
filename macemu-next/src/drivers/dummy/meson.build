@@ -16,6 +16,8 @@ dummy_inc = include_directories(
   '.',
   '../../common/include',
   '../../core',
+  '../../cpu',
+  '../../cpu/uae_cpu',
 )
 
 dummy_lib = static_library('dummy_drivers',
