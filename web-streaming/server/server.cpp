@@ -2062,6 +2062,11 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
         // 8ms is conservative but still leaves 12ms for resampling/encoding in 20ms budget
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
 
+        // Check again after sleep - emulator could have disconnected during sleep
+        if (!g_emulator_connected || !shm) {
+            continue;
+        }
+
         // Read frame ring buffer indices
         uint32_t read_idx = ATOMIC_LOAD(shm->audio_frame_read_idx);
         uint32_t write_idx = ATOMIC_LOAD(shm->audio_frame_write_idx);
