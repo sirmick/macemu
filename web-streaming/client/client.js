@@ -593,7 +593,7 @@ class PNGDecoder extends VideoDecoder {
                     this.canvas.width = frameWidth;
                     this.canvas.height = frameHeight;
                     if (debugConfig.debug_mode_switch) {
-                        logger.info('Canvas resized', { width: frameWidth, height: frameHeight });
+                        logger.info('Canvas resized to', frameWidth, 'x', frameHeight);
                     }
                 }
                 // Update screen dimensions for absolute mouse mode (if onFrame callback exists)
@@ -1651,8 +1651,9 @@ class BasiliskWebRTC {
                 const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
                 const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
 
+                // Debug logging (avoid object creation unless needed)
                 if (debugConfig.debug_connection) {
-                    console.log('[Browser] Absolute mouse:', { macX: clampedX, macY: clampedY, screenW: this.currentScreenWidth, screenH: this.currentScreenHeight });
+                    console.log('[Browser] Absolute mouse:', macX, clampedX, 'macY', clampedY, 'screenW', this.currentScreenWidth, 'screenH', this.currentScreenHeight);
                 }
 
                 this.sendMouseAbsolute(clampedX, clampedY, performance.now());
@@ -1707,10 +1708,7 @@ class BasiliskWebRTC {
         });
 
         if (debugConfig.debug_connection) {
-            logger.info('Input handlers registered', {
-                element: displayElement.tagName,
-                mouseMode: this.mouseMode
-            });
+            logger.info('Input handlers registered, element:', displayElement.tagName, 'mouseMode:', this.mouseMode);
         }
     }
 

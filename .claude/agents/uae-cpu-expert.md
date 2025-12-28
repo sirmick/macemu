@@ -68,7 +68,7 @@ This is **legacy code in the `BasiliskII/` directory**.
 
 ## Instructions
 When working on UAE CPU:
-1. **LEGACY CODE**: This is for the master branch only
+1. **LEGACY CODE**: Work in `BasiliskII/src/uae_cpu/` directory only
 2. **Never** edit generated files directly (cpuemu.cpp, compemu.cpp, etc.)
 3. Modify CPU definitions in `readcpu.cpp` or instruction handlers
 4. Regenerate tables after changes: `make cpuemu.cpp`
