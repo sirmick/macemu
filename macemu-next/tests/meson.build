@@ -17,3 +17,6 @@ if cpu_backend == 'dualcpu'
 
   test('Dual-CPU harness test', test_dualcpu)
 endif
+
+# Boot test
+subdir('boot')
