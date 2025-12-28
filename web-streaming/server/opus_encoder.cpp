@@ -59,6 +59,30 @@ std::vector<uint8_t> OpusAudioEncoder::encode(const int16_t* pcm, int frame_size
         return {};
     }
 
+    // Validate frame size
+    if (frame_size != frame_size_) {
+        fprintf(stderr, "[Opus] WARNING: Frame size mismatch! Expected %d, got %d\n", frame_size_, frame_size);
+    }
+
+    // Debug: Calculate input energy to detect silence/corruption
+    static bool debug_enabled = (getenv("MACEMU_DEBUG_AUDIO") != nullptr);
+    if (debug_enabled) {
+        static int encode_count = 0;
+        if (encode_count++ % 50 == 0) {  // Log every 50 frames (~1 second)
+            int64_t energy = 0;
+            int16_t max_sample = 0;
+            int16_t min_sample = 0;
+            for (int i = 0; i < frame_size * channels_; i++) {
+                int16_t sample = pcm[i];
+                energy += abs(sample);
+                if (sample > max_sample) max_sample = sample;
+                if (sample < min_sample) min_sample = sample;
+            }
+            fprintf(stderr, "[Opus] Encode #%d: frame_size=%d, energy=%ld, range=[%d, %d]\n",
+                    encode_count, frame_size, energy, min_sample, max_sample);
+        }
+    }
+
     std::vector<uint8_t> output(4000);  // Max Opus packet size
 
     int encoded_bytes = opus_encode(encoder_, pcm, frame_size,
@@ -67,6 +91,15 @@ std::vector<uint8_t> OpusAudioEncoder::encode(const int16_t* pcm, int frame_size
     if (encoded_bytes < 0) {
         fprintf(stderr, "[Opus] Encode error: %s\n", opus_strerror(encoded_bytes));
         return {};
+    }
+
+    // Debug: Log encoded packet info
+    if (debug_enabled) {
+        static int packet_count = 0;
+        if (packet_count++ % 50 == 0) {
+            fprintf(stderr, "[Opus] Encoded packet #%d: %d bytes (input: %d samples)\n",
+                    packet_count, encoded_bytes, frame_size);
+        }
     }
 
     output.resize(encoded_bytes);
