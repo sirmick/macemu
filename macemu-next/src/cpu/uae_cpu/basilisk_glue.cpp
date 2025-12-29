@@ -146,6 +146,37 @@ void Start680x0(void)
 	m68k_execute();
 }
 
+/*
+ *  Start 680x0 emulation until CPU hits STOP instruction
+ *  (for testing minimal ROMs that end with STOP)
+ */
+
+void Start680x0_until_stopped(void)
+{
+	m68k_reset();
+	quit_program = false;
+
+	// Execute until STOP or quit_program
+	while (!regs.stopped && !quit_program) {
+		// Execute one instruction
+		uae_u32 opcode;
+#ifdef HAVE_GET_WORD_UNSWAPPED
+		opcode = *((uae_u16 *)regs.pc_p);
+#else
+		opcode = do_get_mem_word((uae_u16 *)regs.pc_p);
+#endif
+		(*cpufunctbl[opcode])(opcode);
+
+		// Check CPU tick timers
+		cpu_check_ticks();
+
+		// Note: We intentionally do NOT call m68k_do_specialties() here
+		// because it contains an infinite loop waiting for interrupts when
+		// SPCFLAG_STOP is set. For test ROMs, we just want to detect STOP
+		// and exit, which we do via the while() condition above.
+	}
+}
+
 
 /*
  *  Trigger interrupt

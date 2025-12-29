@@ -265,12 +265,12 @@ bool dualcpu_map_rom(DualCPU *dcpu, uint32_t addr, const void *rom_data, uint32_
         return false;
     }
 
-    /* UAE: Allocate large buffer to cover entire Mac address space
-     * Mac ROM may access hardware at 0x50000000-0x60000000 range
-     * Use mmap for sparse allocation (only commits pages that are touched)
+    /* UAE: Allocate buffer from 0 to end of ROM
+     * Note: This won't work for raw ROM that accesses hardware!
+     * Use full BasiliskII init (InitAll) for ROM patching instead.
      */
-    #define UAE_ADDRESS_SPACE_SIZE 0x60000000UL  /* 1.5GB - covers hardware region */
-    dcpu->uae_memory_size = UAE_ADDRESS_SPACE_SIZE;
+    uint32_t rom_end = dcpu->rom_base + dcpu->rom_size;
+    dcpu->uae_memory_size = rom_end;
     dcpu->uae_memory = mmap(NULL, dcpu->uae_memory_size,
                             PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS,
@@ -345,8 +345,16 @@ bool dualcpu_execute_one(DualCPU *dcpu) {
 
     /* Execute on Unicorn */
     if (!unicorn_execute_one(dcpu->unicorn)) {
+        /* Save states so they can be inspected */
+        capture_uae_state(dcpu, &uae_after);
+        capture_unicorn_state(dcpu, &unicorn_after);
+        dcpu->uae_last = uae_after;
+        dcpu->unicorn_last = unicorn_after;
+        dcpu->stats.divergences++;
+
         snprintf(dcpu->error, sizeof(dcpu->error),
-                "Unicorn execution failed: %s", unicorn_get_error(dcpu->unicorn));
+                "Unicorn execution failed at PC=0x%08X: %s",
+                unicorn_before.pc, unicorn_get_error(dcpu->unicorn));
         return false;
     }
 

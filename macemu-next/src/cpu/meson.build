@@ -1,28 +1,17 @@
-cpu_sources = []
-cpu_deps = []
+# Always compile ALL CPU backends (runtime selection via platform API)
+cpu_sources = [
+  'cpu_uae.c',                # UAE backend for platform API
+  'cpu_unicorn.c',            # Unicorn backend for platform API
+  'cpu_dualcpu.c',            # DualCPU backend for platform API
+  'uae_wrapper.cpp',          # UAE CPU wrapper
+  'unicorn_wrapper.c',        # Unicorn wrapper
+  'unicorn_validation.cpp',   # Validation module (used by dualcpu)
+]
 
-if cpu_backend == 'unicorn' or cpu_backend == 'dualcpu'
-  cpu_sources += [
-    'unicorn_wrapper.c',
-  ]
-  cpu_deps += unicorn_dep
-endif
+# Build UAE CPU (always)
+subdir('uae_cpu')
 
-if cpu_backend == 'uae' or cpu_backend == 'dualcpu'
-  # Build UAE CPU
-  subdir('uae_cpu')
-  cpu_sources += [
-    'uae_wrapper.cpp',
-  ]
-  cpu_deps += uae_dep
-endif
-
-if cpu_backend == 'dualcpu'
-  cpu_sources += [
-    'dualcpu.c',
-    'unicorn_validation.cpp',
-  ]
-endif
+cpu_deps = [unicorn_dep, uae_dep]
 
 # Build CPU library
 cpu_lib = static_library('cpu',

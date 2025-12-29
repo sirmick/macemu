@@ -14,8 +14,6 @@
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
-#include "cpu_backend.h"
-#include "uae_wrapper.h"
 #include "newcpu.h"
 #include "readcpu.h"
 #include "memory.h"
@@ -37,10 +35,6 @@
 #include "user_strings.h"
 #include "platform.h"
 #include "extfs.h"
-
-#ifdef CPU_EMULATION_DUALCPU
-#include "unicorn_validation.h"
-#endif
 
 #define DEBUG 1
 #include "debug.h"
@@ -340,83 +334,90 @@ int main(int argc, char **argv)
 	printf("24-bit addressing: %s\n", TwentyFourBitAddressing ? "Yes" : "No");
 
 	// ============================================================
-	// Start Execution (Unified CPU Backend)
+	// Start Execution (Platform CPU API)
 	// ============================================================
 	printf("\n=== Starting Emulation ===\n");
 
-	// Get the CPU backend
-	CPUBackend *cpu = cpu_backend_get();
-	if (!cpu) {
-		fprintf(stderr, "Failed to get CPU backend\n");
+	// Select CPU backend via environment variable
+	const char *cpu_backend = getenv("CPU_BACKEND");
+	if (!cpu_backend) {
+		cpu_backend = "uae";  // Default
+	}
+
+	if (strcmp(cpu_backend, "unicorn") == 0) {
+		cpu_unicorn_install(&g_platform);
+	} else if (strcmp(cpu_backend, "dualcpu") == 0) {
+		cpu_dualcpu_install(&g_platform);
+	} else {
+		cpu_uae_install(&g_platform);  // Default to UAE
+	}
+
+	printf("CPU Backend: %s\n", g_platform.cpu_name);
+
+	// Initialize CPU
+	if (!g_platform.cpu_init()) {
+		fprintf(stderr, "Failed to initialize CPU\n");
 		return 1;
 	}
 
-	printf("Using CPU backend: %s\n", cpu->name);
-
 	// Reset CPU to ROM entry point
-	cpu->reset();
-	printf("CPU reset to PC=0x%08x\n", cpu->get_pc());
+	g_platform.cpu_reset();
+	printf("CPU reset to PC=0x%08x\n", g_platform.cpu_get_pc());
 
-#ifdef CPU_EMULATION_DUALCPU
-	// Initialize Unicorn validation (runs in lockstep with UAE)
-	if (!is_test_rom) {  // Only validate real ROMs
-		if (unicorn_validation_init()) {
-			printf("Unicorn validation enabled\n");
-		} else {
-			fprintf(stderr, "Warning: Failed to initialize Unicorn validation\n");
-		}
-	}
-#endif
-
-	// Execution loop - UNIFIED for both test and real ROMs!
-	// The loop is here at the top level, not buried in the backend.
-	CPUExecResult result;
+	// Execution loop - uses platform CPU API
+	int result;
 	uint64_t instruction_count = 0;
 
 	for (;;) {
-		result = cpu->execute_one();
+		result = g_platform.cpu_execute_one();
 		instruction_count++;
 
 		// Handle execution results
+		// 0=ok, 1=stopped, 2=breakpoint, 3=exception, 4=emulop, 5=divergence
 		switch (result) {
-			case CPU_EXEC_OK:
+			case 0:  // CPU_EXEC_OK
 				// Normal execution, continue
 				continue;
 
-			case CPU_EXEC_STOPPED:
+			case 1:  // CPU_EXEC_STOPPED
 				// CPU hit STOP instruction
 				printf("\n=== CPU Stopped ===\n");
 				printf("Instructions executed: %lu\n", instruction_count);
 				printf("Final CPU state:\n");
-				printf("  PC = 0x%08X  SR = 0x%04X\n", cpu->get_pc(), cpu->get_sr());
+				printf("  PC = 0x%08X  SR = 0x%04X\n",
+					g_platform.cpu_get_pc(), g_platform.cpu_get_sr());
 				printf("  D0 = 0x%08X  D1 = 0x%08X  D2 = 0x%08X  D3 = 0x%08X\n",
-					cpu->get_dreg(0), cpu->get_dreg(1), cpu->get_dreg(2), cpu->get_dreg(3));
+					g_platform.cpu_get_dreg(0), g_platform.cpu_get_dreg(1),
+					g_platform.cpu_get_dreg(2), g_platform.cpu_get_dreg(3));
 				printf("  D4 = 0x%08X  D5 = 0x%08X  D6 = 0x%08X  D7 = 0x%08X\n",
-					cpu->get_dreg(4), cpu->get_dreg(5), cpu->get_dreg(6), cpu->get_dreg(7));
+					g_platform.cpu_get_dreg(4), g_platform.cpu_get_dreg(5),
+					g_platform.cpu_get_dreg(6), g_platform.cpu_get_dreg(7));
 				printf("  A0 = 0x%08X  A1 = 0x%08X  A2 = 0x%08X  A3 = 0x%08X\n",
-					cpu->get_areg(0), cpu->get_areg(1), cpu->get_areg(2), cpu->get_areg(3));
+					g_platform.cpu_get_areg(0), g_platform.cpu_get_areg(1),
+					g_platform.cpu_get_areg(2), g_platform.cpu_get_areg(3));
 				printf("  A4 = 0x%08X  A5 = 0x%08X  A6 = 0x%08X  A7 = 0x%08X\n",
-					cpu->get_areg(4), cpu->get_areg(5), cpu->get_areg(6), cpu->get_areg(7));
+					g_platform.cpu_get_areg(4), g_platform.cpu_get_areg(5),
+					g_platform.cpu_get_areg(6), g_platform.cpu_get_areg(7));
 				goto exit_loop;
 
-			case CPU_EXEC_EMULOP:
+			case 4:  // CPU_EXEC_EMULOP
 				// EmulOp executed and returned
 				// This is normal for BasiliskII - EmulOp handles Mac OS traps
 				// Keep running
 				continue;
 
-			case CPU_EXEC_EXCEPTION:
+			case 3:  // CPU_EXEC_EXCEPTION
 				fprintf(stderr, "\n=== Unhandled Exception ===\n");
 				fprintf(stderr, "Instructions executed: %lu\n", instruction_count);
-				fprintf(stderr, "PC = 0x%08x\n", cpu->get_pc());
+				fprintf(stderr, "PC = 0x%08x\n", g_platform.cpu_get_pc());
 				goto exit_loop;
 
-			case CPU_EXEC_BREAKPOINT:
+			case 2:  // CPU_EXEC_BREAKPOINT
 				printf("\n=== Breakpoint Hit ===\n");
-				printf("PC = 0x%08x\n", cpu->get_pc());
+				printf("PC = 0x%08x\n", g_platform.cpu_get_pc());
 				goto exit_loop;
 
-			case CPU_EXEC_DIVERGENCE:
+			case 5:  // CPU_EXEC_DIVERGENCE
 				fprintf(stderr, "\n=== DualCPU Divergence ===\n");
 				fprintf(stderr, "Instructions executed: %lu\n", instruction_count);
 				goto exit_loop;

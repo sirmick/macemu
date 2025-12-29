@@ -1,0 +1,219 @@
+/*
+ *  platform.h - Platform adapter layer
+ *
+ *  Function pointer table for runtime driver selection.
+ *  All pointers initialized to null drivers (safe no-ops).
+ *
+ *  No changes to core BasiliskII code needed - adapters defer to these pointers.
+ */
+
+#ifndef PLATFORM_H
+#define PLATFORM_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ *  Platform Structure - All driver function pointers
+ */
+typedef struct {
+    /*
+     *  SCSI Driver
+     */
+    void (*scsi_init)(void);
+    void (*scsi_exit)(void);
+    void (*scsi_set_cmd)(int cmd_length, uint8_t *cmd);
+    bool (*scsi_is_target_present)(int id);
+    bool (*scsi_set_target)(int id, int lun);
+    bool (*scsi_send_cmd)(size_t data_length, bool reading, int sg_index,
+                          uint8_t **sg_ptr, uint32_t *sg_len, uint16_t *stat, uint32_t timeout);
+
+    /*
+     *  Video Driver
+     */
+    bool (*video_init)(bool classic);
+    void (*video_exit)(void);
+    void (*video_refresh)(void);
+
+    /*
+     *  Disk Driver
+     */
+    void (*disk_init)(void);
+    void (*disk_exit)(void);
+
+    /*
+     *  Audio Driver
+     */
+    void (*audio_init)(void);
+    void (*audio_exit)(void);
+
+    /*
+     *  Serial Driver
+     */
+    void (*serial_init)(void);
+    void (*serial_exit)(void);
+
+    /*
+     *  Ethernet Driver
+     */
+    bool (*ether_init)(void);
+    void (*ether_exit)(void);
+    void (*ether_reset)(void);
+    int16_t (*ether_add_multicast)(uint32_t pb);
+    int16_t (*ether_del_multicast)(uint32_t pb);
+    int16_t (*ether_attach_ph)(uint16_t type, uint32_t handler);
+    int16_t (*ether_detach_ph)(uint16_t type);
+    int16_t (*ether_write)(uint32_t wds);
+    bool (*ether_start_udp_thread)(int socket_fd);
+    void (*ether_stop_udp_thread)(void);
+
+    /*
+     *  Host Platform - File/Disk System
+     */
+    void (*mount_volume)(const char *path);
+    void (*file_disk_layout)(int64_t size, int64_t *start, int64_t *length);
+    void (*floppy_init)(void);
+    void (*sys_add_serial_prefs)(void);
+    void (*sys_add_floppy_prefs)(void);
+    void (*sys_add_disk_prefs)(void);
+    void (*sys_add_cdrom_prefs)(void);
+
+    // File operations
+    void* (*sys_open)(const char *path, bool read_only, bool no_cache);
+    void (*sys_close)(void *fh);
+    size_t (*sys_read)(void *fh, void *buf, int64_t offset, size_t length);
+    size_t (*sys_write)(void *fh, void *buf, int64_t offset, size_t length);
+    bool (*sys_is_readonly)(void *fh);
+    bool (*sys_is_disk_inserted)(void *fh);
+    bool (*sys_is_fixed_disk)(void *fh);
+    int64_t (*sys_get_file_size)(void *fh);
+    void (*sys_eject)(void *fh);
+    void (*sys_allow_removal)(void *fh);
+    void (*sys_prevent_removal)(void *fh);
+    bool (*sys_format)(void *fh);
+
+    // CD-ROM operations
+    bool (*sys_cd_get_volume)(void *fh, uint8_t *left, uint8_t *right);
+    bool (*sys_cd_set_volume)(void *fh, uint8_t left, uint8_t right);
+    void (*sys_cd_pause)(void *fh);
+    void (*sys_cd_resume)(void *fh);
+    bool (*sys_cd_play)(void *fh, uint8_t m1, uint8_t s1, uint8_t f1, uint8_t m2, uint8_t s2, uint8_t f2);
+    bool (*sys_cd_stop)(void *fh, uint8_t m, uint8_t s, uint8_t f);
+    bool (*sys_cd_get_position)(void *fh, uint8_t *pos);
+    bool (*sys_cd_scan)(void *fh, uint8_t m, uint8_t s, uint8_t f, bool reverse);
+    bool (*sys_cd_read_toc)(void *fh, uint8_t *toc);
+
+    /*
+     *  Memory (for tests to override)
+     */
+    uint8_t *ram;
+    uint8_t *rom;
+    uint32_t ram_size;
+    uint32_t rom_size;
+
+    /*
+     *  CPU Emulation Backend
+     */
+    const char *cpu_name;  // Backend name: "UAE", "Unicorn", "DualCPU"
+
+    // Lifecycle
+    bool (*cpu_init)(void);
+    void (*cpu_reset)(void);
+    void (*cpu_destroy)(void);
+
+    // Execution - returns: 0=ok, 1=stopped, 2=breakpoint, 3=exception, 4=emulop, 5=divergence
+    int (*cpu_execute_one)(void);
+    void (*cpu_execute_fast)(void);  // Optional: run until stopped (NULL if not supported)
+
+    // State query
+    bool (*cpu_is_stopped)(void);
+    uint32_t (*cpu_get_pc)(void);
+    uint16_t (*cpu_get_sr)(void);
+    uint32_t (*cpu_get_dreg)(int n);
+    uint32_t (*cpu_get_areg)(int n);
+
+    // State modification
+    void (*cpu_set_pc)(uint32_t pc);
+    void (*cpu_set_sr)(uint16_t sr);
+    void (*cpu_set_dreg)(int n, uint32_t val);
+    void (*cpu_set_areg)(int n, uint32_t val);
+
+    // Memory access (for dual-CPU sync)
+    void (*cpu_mem_read)(uint32_t addr, void *data, uint32_t size);
+    void (*cpu_mem_write)(uint32_t addr, const void *data, uint32_t size);
+
+    // Interrupts
+    void (*cpu_trigger_interrupt)(int level);
+} Platform;
+
+/*
+ *  Global platform instance
+ */
+extern Platform g_platform;
+
+/*
+ *  Platform initialization
+ *  Sets all function pointers to null drivers (safe defaults)
+ */
+void platform_init(void);
+
+/*
+ *  Null driver function declarations
+ *  These are the default implementations (no-ops)
+ */
+
+// SCSI null driver
+extern void scsi_null_init(void);
+extern void scsi_null_exit(void);
+extern void scsi_null_set_cmd(int cmd_length, uint8_t *cmd);
+extern bool scsi_null_is_target_present(int id);
+extern bool scsi_null_set_target(int id, int lun);
+extern bool scsi_null_send_cmd(size_t data_length, bool reading, int sg_index,
+                                uint8_t **sg_ptr, uint32_t *sg_len, uint16_t *stat, uint32_t timeout);
+
+// Video null driver
+extern bool video_null_init(bool classic);
+extern void video_null_exit(void);
+extern void video_null_refresh(void);
+
+// Disk null driver
+extern void disk_null_init(void);
+extern void disk_null_exit(void);
+
+// Audio null driver
+extern void audio_null_init(void);
+extern void audio_null_exit(void);
+
+// Serial null driver
+extern void serial_null_init(void);
+extern void serial_null_exit(void);
+
+// Ether null driver
+extern bool ether_null_init(void);
+extern void ether_null_exit(void);
+extern void ether_null_reset(void);
+extern int16_t ether_null_add_multicast(uint32_t pb);
+extern int16_t ether_null_del_multicast(uint32_t pb);
+extern int16_t ether_null_attach_ph(uint16_t type, uint32_t handler);
+extern int16_t ether_null_detach_ph(uint16_t type);
+extern int16_t ether_null_write(uint32_t wds);
+extern bool ether_null_start_udp_thread(int socket_fd);
+extern void ether_null_stop_udp_thread(void);
+
+/*
+ *  CPU Backend Installation Functions
+ */
+extern void cpu_uae_install(Platform *p);
+extern void cpu_unicorn_install(Platform *p);
+extern void cpu_dualcpu_install(Platform *p);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PLATFORM_H */

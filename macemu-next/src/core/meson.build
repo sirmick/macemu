@@ -21,6 +21,7 @@ core_sources = [
   'user_strings.cpp',
   'video.cpp',
   'xpram.cpp',
+  '../common/platform.cpp',  # Platform initialization
 ]
 
 core_inc = include_directories(

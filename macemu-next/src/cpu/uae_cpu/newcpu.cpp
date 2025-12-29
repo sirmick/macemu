@@ -1406,32 +1406,18 @@ int m68k_do_specialties (void)
 	return 0;
 }
 
-// Unicorn validation hooks (when CPU_BACKEND == dualcpu)
-#ifdef CPU_EMULATION_DUALCPU
-extern "C" {
-	bool unicorn_validation_enabled(void);
-	bool unicorn_validation_step(void);
-}
-#endif
-
+// NOTE: This function is legacy - not used by platform CPU API
+// Platform API uses uae_cpu_execute_one() directly instead
 void m68k_do_execute (void)
 {
 	for (;;) {
-#ifdef CPU_EMULATION_DUALCPU
-		// Dual-CPU validation: execute instruction and compare with Unicorn
-		if (unicorn_validation_enabled()) {
-			unicorn_validation_step();  // Handles execution + validation
-		} else
-#endif
-		{
-			// Normal execution path
-			uae_u32 opcode = GET_OPCODE;
+		// Normal execution path
+		uae_u32 opcode = GET_OPCODE;
 
 #if FLIGHT_RECORDER
-			m68k_record_step(m68k_getpc());
+		m68k_record_step(m68k_getpc());
 #endif
-			(*cpufunctbl[opcode])(opcode);
-		}
+		(*cpufunctbl[opcode])(opcode);
 
 		cpu_check_ticks();
 		if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {

@@ -284,6 +284,71 @@ regs.regs[8..15]  // A0-A7 (address registers)
 
 A7 (stack pointer) is at `regs.regs[15]`.
 
+## STOP Instruction Behavior
+
+The STOP instruction (`0x4E72`) **does not terminate execution** - it puts the CPU in a stopped state waiting for an interrupt.
+
+### What STOP Does
+
+1. Sets `regs.stopped = 1`
+2. Sets `SPCFLAG_STOP` flag
+3. Loads immediate value into Status Register (SR)
+
+### Execution Loop Behavior
+
+In `m68k_do_execute()` ([newcpu.cpp:1376-1386](newcpu.cpp#L1376-L1386)):
+
+```c
+while (SPCFLAGS_TEST( SPCFLAG_STOP )) {
+    if (SPCFLAGS_TEST( SPCFLAG_INT | SPCFLAG_DOINT )){
+        int intr = intlev();
+        if (intr != -1 && intr > regs.intmask) {
+            Interrupt(intr);
+            regs.stopped = 0;
+            SPCFLAG_CLEAR( SPCFLAG_STOP );
+        }
+    }
+}
+```
+
+**The CPU loops forever** waiting for `SPCFLAG_INT` or `SPCFLAG_DOINT` to be set with an interrupt level higher than `regs.intmask`.
+
+### How To Exit STOP
+
+Three options:
+
+1. **Generate an interrupt** - Set `SPCFLAG_INT` and ensure interrupt level > `regs.intmask`
+2. **Check regs.stopped** - External code can check `regs.stopped` flag and break out of `m68k_execute()`
+3. **Set quit_program** - The outer `m68k_execute()` loop checks this flag
+
+### For Testing: Detecting STOP
+
+To test a minimal ROM that ends with STOP:
+
+```c
+// Execute ROM
+Start680x0();  // Runs forever!
+
+// Better approach - check if stopped
+Init680x0();
+m68k_reset();
+
+// Run until STOP
+while (!regs.stopped && !quit_program) {
+    m68k_do_execute();
+}
+
+printf("CPU stopped: %d\n", regs.stopped);
+```
+
+### Real-World Usage
+
+In BasiliskII, STOP is used when the Mac OS has nothing to do. The main loop:
+1. Calls `m68k_execute()` which runs until STOP
+2. Waits for host timer interrupts
+3. Triggers M68K interrupt via `TriggerInterrupt()`
+4. CPU wakes from STOP and handles the interrupt
+
 ## See Also
 
 - [Memory Layout](Memory.md) - How Mac addresses map to host pointers

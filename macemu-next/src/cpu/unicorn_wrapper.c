@@ -141,11 +141,15 @@ bool unicorn_map_ram(UnicornCPU *cpu, uint64_t addr, void *host_ptr, uint64_t si
     if (!cpu || !cpu->uc) return false;
 
     /* First map the memory region */
+    fprintf(stderr, "DEBUG unicorn_map_ram: addr=0x%08llX size=0x%08llX\n",
+            (unsigned long long)addr, (unsigned long long)size);
     uc_err err = uc_mem_map(cpu->uc, addr, size, UC_PROT_ALL);
     if (err != UC_ERR_OK) {
+        fprintf(stderr, "DEBUG unicorn_map_ram: uc_mem_map FAILED: %s\n", uc_strerror(err));
         set_error(cpu, err);
         return false;
     }
+    fprintf(stderr, "DEBUG unicorn_map_ram: SUCCESS\n");
 
     /* Then write the host data into it (if host_ptr is not NULL) */
     if (host_ptr) {

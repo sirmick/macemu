@@ -10,13 +10,13 @@ boot_test_inc = include_directories(
   '../../src/core',
   '../../src/cpu',
   '../../src/cpu/uae_cpu',
-  '../../src/drivers/dummy',
+  '../../src/drivers',
 )
 
 boot_test = executable('test_boot',
   boot_test_sources,
   include_directories: boot_test_inc,
-  link_with: [core_lib, dummy_lib, cpu_lib],
+  link_with: [core_lib, driver_lib, cpu_lib],
   dependencies: [unicorn_dep, threads_dep, m_dep],
 )
 

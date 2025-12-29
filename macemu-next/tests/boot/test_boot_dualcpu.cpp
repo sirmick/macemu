@@ -98,18 +98,10 @@ int main(int argc, char **argv)
 	}
 	printf("✓ ROM mapped for both CPUs\n");
 
-	// Map dummy hardware region (0x50000000-0x60000000) to catch hardware accesses
-	// Mac ROM accesses VIA, SCSI, and other hardware in this range
-	#define HW_BASE 0x50000000
-	#define HW_SIZE (16 * 1024 * 1024)  // 16MB should cover all hardware
-	printf("Mapping dummy hardware region (16 MB at 0x%08X)...\n", HW_BASE);
-	if (!dualcpu_map_memory(dcpu, HW_BASE, HW_SIZE)) {
-		fprintf(stderr, "Failed to map hardware region: %s\n", dualcpu_get_error(dcpu));
-		dualcpu_destroy(dcpu);
-		free(rom_data);
-		return 1;
-	}
-	printf("✓ Dummy hardware region mapped\n");
+	// NOTE: This test runs RAW ROM without BasiliskII's ROM patching
+	// The ROM will try to access hardware (VIA, SCSI, etc.) at 0x50000000+ which doesn't exist
+	// It will crash when it hits the first hardware access
+	// For full boot, use test_boot instead which calls InitAll() to patch the ROM
 
 	// Set initial CPU state (like Mac ROM boot)
 	// According to 68k spec, reset vector is at ROM+0 (SP) and ROM+4 (PC)

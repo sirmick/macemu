@@ -9,7 +9,6 @@ project('macemu-next', ['c', 'cpp'],
 )
 
 # Options
-cpu_backend = get_option('cpu_backend')  # 'unicorn', 'uae', 'dualcpu'
 build_basilisk = get_option('basilisk')
 build_sheepshaver = get_option('sheepshaver')
 
@@ -17,12 +16,12 @@ build_sheepshaver = get_option('sheepshaver')
 cc = meson.get_compiler('c')
 cpp = meson.get_compiler('cpp')
 
-# Unicorn dependency (static library we just built)
+# Unicorn dependency (always required - all CPUs compiled)
 unicorn_inc = include_directories('external/unicorn/include')
 unicorn_lib = cc.find_library('unicorn',
   dirs: [meson.current_source_dir() / 'external/unicorn/build'],
   static: true,
-  required: (cpu_backend in ['unicorn', 'dualcpu'])
+  required: true
 )
 unicorn_dep = declare_dependency(
   include_directories: unicorn_inc,
@@ -33,14 +32,9 @@ unicorn_dep = declare_dependency(
 threads_dep = dependency('threads', required: true)
 m_dep = cc.find_library('m', required: true)  # Math library for Unicorn
 
-# Compiler flags based on backend
-if cpu_backend == 'dualcpu'
-  add_project_arguments('-DCPU_EMULATION_DUALCPU', language: ['c', 'cpp'])
-endif
-
 # Build info
 message('Build configuration:')
-message('  CPU backend: ' + cpu_backend)
+message('  All CPU backends compiled (runtime selection via CPU_BACKEND env var)')
 message('  Build BasiliskII: ' + build_basilisk.to_string())
 message('  Build SheepShaver: ' + build_sheepshaver.to_string())
 

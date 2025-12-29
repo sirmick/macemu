@@ -40,13 +40,8 @@ void idle_resume(void) {
     // Stub
 }
 
-// EmulOp handler - will be implemented when we integrate EmulOp system
-void EmulOp(uint16 opcode, struct M68kRegisters *r) {
-    // Stub - just print for now
-    (void)opcode;
-    (void)r;
-    printf("EmulOp: opcode=0x%04x (not implemented)\n", opcode);
-}
+// EmulOp handler - now using real implementation from src/core/emul_op.cpp
+// (removed stub - the real EmulOp is linked from libcore.a)
 
 
 // Instruction table definitions
