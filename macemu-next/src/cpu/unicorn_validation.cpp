@@ -68,14 +68,9 @@ bool unicorn_validation_init(void) {
     }
     printf("✓ ROM mapped (0x%08X, %u KB)\n", ROMBaseMac, ROMSize / 1024);
 
-    // Sync initial CPU state from UAE
-    for (int i = 0; i < 8; i++) {
-        unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
-        unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
-    }
-    unicorn_set_pc(validation_state.unicorn, uae_get_pc());
-    unicorn_set_sr(validation_state.unicorn, uae_get_sr());
-    printf("✓ CPU state synced from UAE\n");
+    // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
+    // State will be synced on first instruction execution in unicorn_validation_step()
+    printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
 
     // Open log file
     validation_state.log_file = fopen("cpu_validation.log", "w");
@@ -151,6 +146,19 @@ static uint16_t read_word_be(uint32_t addr) {
 bool unicorn_validation_step(void) {
     if (!validation_state.initialized || !validation_state.enabled) {
         return true;  // Validation disabled, no divergence
+    }
+
+    // Sync state on first instruction (UAE CPU is initialized after reset)
+    if (validation_state.instruction_count == 0) {
+        // IMPORTANT: Set PC and SR first, THEN registers
+        // Setting PC clears A7 in Unicorn (bug or feature?), so A7 must be set after PC
+        unicorn_set_pc(validation_state.unicorn, uae_get_pc());
+        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
+
+        for (int i = 0; i < 8; i++) {
+            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
+            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+        }
     }
 
     validation_state.instruction_count++;
