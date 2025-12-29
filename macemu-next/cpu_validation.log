@@ -1,0 +1,7 @@
+=== BasiliskII Dual-CPU Validation Log ===
+UAE vs Unicorn instruction-by-instruction comparison
+
+
+[1] UNICORN EXECUTION FAILED
+PC: 0x0200002A, Opcode: 0x4E72
+Error: Invalid memory fetch (UC_ERR_FETCH_UNMAPPED)

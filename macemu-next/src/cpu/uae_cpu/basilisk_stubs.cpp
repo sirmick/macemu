@@ -692,3 +692,11 @@ void REGPARAM2 fpuop_restore(uae_u32 opcode) {
     fprintf(stderr, "FPU restore not implemented: opcode=0x%04x\n", opcode);
     abort();
 }
+
+// EmulOp stub - required by newcpu.cpp when executing 0x71xx illegal instructions
+// Real implementation is in src/core/emul_op.cpp (part of BasiliskII core)
+void EmulOp(uint16 opcode, M68kRegisters *r) {
+    fprintf(stderr, "EmulOp not implemented in stub mode: opcode=0x%04x\n", opcode);
+    fprintf(stderr, "This test should link against BasiliskII core for full EmulOp support\n");
+    abort();
+}

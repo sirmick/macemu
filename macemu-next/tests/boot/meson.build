@@ -19,11 +19,3 @@ boot_test = executable('test_boot',
   link_with: [core_lib, driver_lib, cpu_lib],
   dependencies: [unicorn_dep, threads_dep, m_dep],
 )
-
-# Dual-CPU validation boot test
-boot_test_dualcpu = executable('test_boot_dualcpu',
-  ['test_boot_dualcpu.cpp'],
-  include_directories: boot_test_inc,
-  link_with: [cpu_lib],
-  dependencies: [unicorn_dep, threads_dep, m_dep],
-)

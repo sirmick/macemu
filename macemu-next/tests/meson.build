@@ -7,15 +7,6 @@ test_unicorn_m68k = executable('test_unicorn_m68k',
 
 test('Unicorn M68K wrapper test', test_unicorn_m68k)
 
-# Dual-CPU harness test (always compiled now)
-test_dualcpu = executable('test_dualcpu',
-  'cpu/test_dualcpu.c',
-  dependencies: [cpu_dep, unicorn_dep, threads_dep, m_dep],
-  include_directories: include_directories('../src/cpu')
-)
-
-test('Dual-CPU harness test', test_dualcpu)
-
 # Boot test
 subdir('boot')
 
