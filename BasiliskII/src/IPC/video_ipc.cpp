@@ -76,6 +76,7 @@
 #ifdef ENABLE_IPC_AUDIO
 #include "audio_ipc.h"
 #endif
+#include "control_ipc.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -118,19 +119,12 @@ static std::atomic<bool> video_thread_running(false);
 
 // IPC handles - emulator creates and owns these
 static int video_shm_fd = -1;
-static int listen_socket = -1;             // Listening socket for server connections
-static int control_socket = -1;            // Connected server
 static MacEmuIPCBuffer* video_shm = nullptr;
 static std::string shm_name;
-static std::string socket_path;
 
 // Ping tracking - NOT in shared memory, purely emulator-side state
 static uint32_t last_echoed_ping_seq = 0;  // Last ping seq we've set t4 for
 static uint32_t ping_echo_frames_remaining = 0;  // How many more frames to echo this ping (0 = no echo)
-
-// Control socket thread
-static std::thread control_thread;
-static std::atomic<bool> control_thread_running(false);
 
 // Mouse latency tracking (browser timestamp → emulator receive)
 static std::atomic<uint64_t> mouse_latency_total_ms(0);
@@ -224,244 +218,6 @@ static void destroy_video_shm() {
  *  Create Unix socket for input (emulator owns this)
  */
 
-static bool create_control_socket() {
-    pid_t pid = getpid();
-    socket_path = std::string(MACEMU_CONTROL_SOCK_PREFIX) + std::to_string(pid) +
-                  std::string(MACEMU_CONTROL_SOCK_SUFFIX);
-
-    // Remove any stale socket
-    unlink(socket_path.c_str());
-
-    listen_socket = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (listen_socket < 0) {
-        fprintf(stderr, "IPC: Failed to create socket: %s\n", strerror(errno));
-        return false;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (bind(listen_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "IPC: Failed to bind socket: %s\n", strerror(errno));
-        close(listen_socket);
-        listen_socket = -1;
-        return false;
-    }
-
-    if (listen(listen_socket, 1) < 0) {
-        fprintf(stderr, "IPC: Failed to listen: %s\n", strerror(errno));
-        close(listen_socket);
-        unlink(socket_path.c_str());
-        listen_socket = -1;
-        return false;
-    }
-
-    // Set non-blocking for accept
-    int flags = fcntl(listen_socket, F_GETFL, 0);
-    if (flags < 0) {
-        fprintf(stderr, "IPC: Failed to get socket flags: %s\n", strerror(errno));
-        close(listen_socket);
-        unlink(socket_path.c_str());
-        listen_socket = -1;
-        return false;
-    }
-    if (fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-        fprintf(stderr, "IPC: Failed to set non-blocking mode: %s\n", strerror(errno));
-        close(listen_socket);
-        unlink(socket_path.c_str());
-        listen_socket = -1;
-        return false;
-    }
-
-    fprintf(stderr, "IPC: Listening for server on '%s'\n", socket_path.c_str());
-    return true;
-}
-
-static void destroy_control_socket() {
-    if (control_socket >= 0) {
-        close(control_socket);
-        control_socket = -1;
-    }
-    if (listen_socket >= 0) {
-        close(listen_socket);
-        listen_socket = -1;
-    }
-    if (!socket_path.empty()) {
-        unlink(socket_path.c_str());
-    }
-}
-
-
-/*
- *  Process binary input from server
- */
-
-static void process_binary_input(const uint8_t* data, size_t len) {
-    if (len < sizeof(MacEmuInputHeader)) return;
-
-    const MacEmuInputHeader* hdr = (const MacEmuInputHeader*)data;
-
-    switch (hdr->type) {
-        case MACEMU_INPUT_KEY: {
-            if (len < sizeof(MacEmuKeyInput)) return;
-            const MacEmuKeyInput* key = (const MacEmuKeyInput*)data;
-            if (hdr->flags & MACEMU_KEY_DOWN) {
-                ADBKeyDown(key->mac_keycode);
-            } else {
-                ADBKeyUp(key->mac_keycode);
-            }
-            break;
-        }
-        case MACEMU_INPUT_MOUSE: {
-            if (len < sizeof(MacEmuMouseInput)) return;
-            const MacEmuMouseInput* mouse = (const MacEmuMouseInput*)data;
-
-            // Check if absolute or relative mode
-            bool absolute = (mouse->hdr.flags & MACEMU_MOUSE_ABSOLUTE) != 0;
-
-            // Measure end-to-end mouse latency
-            // Browser sends performance.now() in ms, we compare to our steady_clock
-            if (mouse->timestamp_ms > 0) {
-                // Set epoch on first message to sync browser and emulator clocks
-                if (!latency_epoch_set) {
-                    latency_epoch = std::chrono::steady_clock::now() -
-                                    std::chrono::milliseconds(mouse->timestamp_ms);
-                    latency_epoch_set = true;
-                }
-                // Calculate latency: current time - (epoch + browser_timestamp)
-                auto now = std::chrono::steady_clock::now();
-                auto browser_time = latency_epoch + std::chrono::milliseconds(mouse->timestamp_ms);
-                auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - browser_time);
-                if (latency.count() >= 0 && latency.count() < 1000) {  // Sanity check
-                    mouse_latency_total_ms.fetch_add(latency.count());
-                    mouse_latency_samples.fetch_add(1);
-                }
-            }
-
-            // Call ADBMouseMoved() - behavior depends on absolute flag
-            // IMPORTANT: Set ADB mode based on message flag, not global state!
-            // In absolute mode: x/y are screen coordinates (0 to width/height), reinterpret as unsigned
-            // In relative mode: x/y are signed deltas
-            int x, y;
-            if (absolute) {
-                // Reinterpret int16_t as uint16_t for absolute coordinates
-                x = static_cast<uint16_t>(mouse->x);
-                y = static_cast<uint16_t>(mouse->y);
-                if (g_debug_mouse) {
-                    static int abs_log_count = 0;
-                    if (abs_log_count++ < 5) {
-                        fprintf(stderr, "IPC: Absolute mouse: x=%d, y=%d (raw: %d, %d)\n", x, y, mouse->x, mouse->y);
-                    }
-                }
-                // Ensure ADB is in absolute mode for this movement
-                ADBSetRelMouseMode(false);
-            } else {
-                // Use as-is for relative deltas
-                x = mouse->x;
-                y = mouse->y;
-                // Ensure ADB is in relative mode for this movement
-                ADBSetRelMouseMode(true);
-            }
-
-            if (absolute || x != 0 || y != 0) {
-                ADBMouseMoved(x, y);
-            }
-
-            // Handle button changes
-            static uint8_t last_buttons = 0;
-            uint8_t changed = mouse->buttons ^ last_buttons;
-            if (changed & MACEMU_MOUSE_LEFT) {
-                if (mouse->buttons & MACEMU_MOUSE_LEFT)
-                    ADBMouseDown(0);
-                else
-                    ADBMouseUp(0);
-            }
-            if (changed & MACEMU_MOUSE_RIGHT) {
-                if (mouse->buttons & MACEMU_MOUSE_RIGHT)
-                    ADBMouseDown(1);
-                else
-                    ADBMouseUp(1);
-            }
-            last_buttons = mouse->buttons;
-            break;
-        }
-        case MACEMU_INPUT_MOUSE_MODE: {
-            if (len < sizeof(MacEmuMouseModeInput)) return;
-            const MacEmuMouseModeInput* mode_msg = (const MacEmuMouseModeInput*)data;
-            bool relative = (mode_msg->mode == 1);
-            ADBSetRelMouseMode(relative);
-            fprintf(stderr, "IPC: Mouse mode changed to %s\n", relative ? "relative" : "absolute");
-            break;
-        }
-        case MACEMU_INPUT_COMMAND: {
-            if (len < sizeof(MacEmuCommandInput)) return;
-            const MacEmuCommandInput* cmd = (const MacEmuCommandInput*)data;
-            switch (cmd->command) {
-                case MACEMU_CMD_START:
-                    // Already running
-                    break;
-                case MACEMU_CMD_STOP:
-                    fprintf(stderr, "IPC: Stop command received, triggering clean shutdown\n");
-                    // Detach control thread so QuitEmulator() won't try to join it
-                    // (we're running IN the control thread, can't join ourselves!)
-                    if (control_thread.joinable()) {
-                        control_thread.detach();
-                    }
-                    // Now safe to call QuitEmulator from this thread
-                    QuitEmulator();
-                    // Will never reach here
-                    break;
-                case MACEMU_CMD_RESET:
-                    fprintf(stderr, "IPC: Reset command received\n");
-                    // For restart, we still use exit() with special code
-                    // Main will detect this and restart
-                    exit(75);
-                    break;
-                case MACEMU_CMD_PAUSE:
-                    if (video_shm) video_shm->state = MACEMU_STATE_PAUSED;
-                    break;
-                case MACEMU_CMD_RESUME:
-                    if (video_shm) video_shm->state = MACEMU_STATE_RUNNING;
-                    break;
-            }
-            break;
-        }
-        case MACEMU_INPUT_PING: {
-            if (len < sizeof(MacEmuPingInput)) return;
-            const MacEmuPingInput* ping = (const MacEmuPingInput*)data;
-
-            // Add emulator receive timestamp (t3)
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            uint64_t t3_emulator_recv_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-
-            // OPTIMIZED: Write timestamps to regular struct, then publish with atomic seq write
-            // Memory ordering: write-release ensures all timestamp writes visible when server reads seq
-            if (video_shm) {
-                video_shm->ping_timestamps.t1_browser_ms = ping->t1_browser_send_ms;
-                video_shm->ping_timestamps.t2_server_us = ping->t2_server_recv_us;
-                video_shm->ping_timestamps.t3_emulator_us = t3_emulator_recv_us;
-                video_shm->ping_timestamps.t4_frame_us = 0;  // Clear t4, will be set by next frame
-
-                // Atomic write-release: publishes all above writes to any thread doing atomic read-acquire
-                ATOMIC_STORE(video_shm->ping_sequence, ping->sequence);
-                // Note: Detailed ping logging happens when t4 is set and in browser
-            }
-            break;
-        }
-        case MACEMU_INPUT_AUDIO_REQUEST: {
-            // Pull model: Server requests audio data
-            if (len < sizeof(MacEmuAudioRequestInput)) return;
-            const MacEmuAudioRequestInput* audio_req = (const MacEmuAudioRequestInput*)data;
-#ifdef ENABLE_IPC_AUDIO
-            audio_request_data(audio_req->requested_samples);
-#endif
-            break;
-        }
-    }
-}
 
 
 /*
@@ -491,121 +247,6 @@ static void update_ping_on_frame_complete(uint64_t timestamp_us) {
     } else if (ping_echo_frames_remaining > 0) {
         // Still echoing previous ping - silently decrement counter
         ping_echo_frames_remaining--;
-    }
-}
-
-
-/*
- *  Control socket thread - handles server connections and input
- */
-
-static void control_socket_thread() {
-    uint8_t buffer[256];
-
-    // Default to relative mouse mode (matches browser default)
-    // User can switch to absolute mode via UI toggle
-    ADBSetRelMouseMode(true);
-
-    while (control_thread_running) {
-        // Accept new connection if none active
-        if (control_socket < 0 && listen_socket >= 0) {
-            struct sockaddr_un addr;
-            socklen_t len = sizeof(addr);
-            int fd = accept(listen_socket, (struct sockaddr*)&addr, &len);
-            if (fd >= 0) {
-                // Set non-blocking
-                int flags = fcntl(fd, F_GETFL, 0);
-                if (flags < 0) {
-                    fprintf(stderr, "IPC: Failed to get socket flags: %s\n", strerror(errno));
-                    close(fd);
-                    continue;
-                }
-                if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-                    fprintf(stderr, "IPC: Failed to set non-blocking mode: %s\n", strerror(errno));
-                    close(fd);
-                    continue;
-                }
-                control_socket = fd;
-                fprintf(stderr, "IPC: Server connected\n");
-
-                // Send eventfds to server via SCM_RIGHTS for low-latency notification
-                // Send both video and audio eventfds in one message
-                if (video_shm && video_shm->frame_ready_eventfd >= 0) {
-                    int fds[2];
-                    int num_fds = 0;
-
-                    // Always send video eventfd
-                    fds[num_fds++] = video_shm->frame_ready_eventfd;
-
-                    // Add audio eventfd if available
-                    if (video_shm->audio_ready_eventfd >= 0) {
-                        fds[num_fds++] = video_shm->audio_ready_eventfd;
-                    }
-
-                    struct msghdr msg = {};
-                    struct cmsghdr *cmsg;
-                    char buf[CMSG_SPACE(sizeof(int) * 2)];  // Space for 2 fds
-                    char data = 'E';  // 'E' for eventfd
-                    struct iovec iov = { &data, 1 };
-
-                    msg.msg_iov = &iov;
-                    msg.msg_iovlen = 1;
-                    msg.msg_control = buf;
-                    msg.msg_controllen = sizeof(buf);
-
-                    cmsg = CMSG_FIRSTHDR(&msg);
-                    cmsg->cmsg_level = SOL_SOCKET;
-                    cmsg->cmsg_type = SCM_RIGHTS;
-                    cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fds);
-                    memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * num_fds);
-
-                    if (sendmsg(control_socket, &msg, 0) > 0) {
-                        fprintf(stderr, "IPC: Sent eventfd %d to server for low-latency sync\n",
-                                video_shm->frame_ready_eventfd);
-                        if (num_fds > 1) {
-                            fprintf(stderr, "IPC: Sent audio eventfd %d to server\n",
-                                    video_shm->audio_ready_eventfd);
-                        }
-                    } else {
-                        fprintf(stderr, "IPC: Failed to send eventfd: %s\n", strerror(errno));
-                    }
-                }
-            }
-        }
-
-        // Read input from server
-        if (control_socket >= 0) {
-            ssize_t n = recv(control_socket, buffer, sizeof(buffer), MSG_DONTWAIT);
-            if (n > 0) {
-                // Process complete messages (they're fixed-size binary)
-                size_t offset = 0;
-                while (offset < (size_t)n) {
-                    // Peek at header to determine message size
-                    if (offset + sizeof(MacEmuInputHeader) > (size_t)n) break;
-                    const MacEmuInputHeader* hdr = (const MacEmuInputHeader*)(buffer + offset);
-                    size_t msg_size = 0;
-                    switch (hdr->type) {
-                        case MACEMU_INPUT_KEY:     msg_size = sizeof(MacEmuKeyInput); break;
-                        case MACEMU_INPUT_MOUSE:   msg_size = sizeof(MacEmuMouseInput); break;
-                        case MACEMU_INPUT_COMMAND: msg_size = sizeof(MacEmuCommandInput); break;
-                        case MACEMU_INPUT_PING:    msg_size = sizeof(MacEmuPingInput); break;
-                        case MACEMU_INPUT_AUDIO_REQUEST: msg_size = sizeof(MacEmuAudioRequestInput); break;
-                        default: msg_size = sizeof(MacEmuInputHeader); break;
-                    }
-                    if (offset + msg_size > (size_t)n) break;
-                    process_binary_input(buffer + offset, msg_size);
-                    offset += msg_size;
-                }
-            } else if (n == 0) {
-                // Connection closed
-                fprintf(stderr, "IPC: Server disconnected\n");
-                close(control_socket);
-                control_socket = -1;
-            }
-        }
-
-        // Small sleep to avoid busy-waiting
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -883,11 +524,12 @@ static void video_refresh_thread()
             }
 
             if (g_debug_perf) {
+                int sock = ControlIPCGetSocket();
                 fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
                         fps, frames_sent,
                         avg_mouse_ms,
                         dirty_rect_frames, full_frames, skipped_frames, bandwidth_saved_pct,
-                        control_socket >= 0 ? "connected" : "waiting");
+                        sock >= 0 ? "connected" : "waiting");
             }
 
             frames_sent = 0;
@@ -1131,7 +773,7 @@ static bool IPC_VideoInit(bool classic)
         return false;
     }
 
-    if (!create_control_socket()) {
+    if (!ControlIPCInit(video_shm)) {
         destroy_video_shm();
         return false;
     }
@@ -1142,7 +784,7 @@ static bool IPC_VideoInit(bool classic)
     the_buffer = (uint8*)vm_acquire(the_buffer_size);
     if (!the_buffer) {
         fprintf(stderr, "IPC: Failed to allocate frame buffer\n");
-        destroy_control_socket();
+        ControlIPCExit();
         destroy_video_shm();
         return false;
     }
@@ -1193,9 +835,8 @@ static bool IPC_VideoInit(bool classic)
     video_thread_running = true;
     video_thread = std::thread(video_refresh_thread);
 
-    // Start control socket thread (input handling)
-    control_thread_running = true;
-    control_thread = std::thread(control_socket_thread);
+    // Start control socket thread (input handling - zero-latency epoll)
+    ControlIPCStart();
 
     fprintf(stderr, "IPC: Video initialized (%dx%d @ %d bpp)\n",
             default_width, default_height, frame_depth);
@@ -1220,16 +861,13 @@ static void IPC_VideoExit(void)
 {
     // Stop threads
     video_thread_running = false;
-    control_thread_running = false;
 
     if (video_thread.joinable()) {
         video_thread.join();
     }
-    // Control thread may have been detached if QuitEmulator() was called from within it
-    // (e.g., via MACEMU_CMD_STOP command)
-    if (control_thread.joinable()) {
-        control_thread.join();
-    }
+
+    // Stop control socket thread
+    ControlIPCExit();
 
     if (the_monitor) {
         the_monitor->video_close();
@@ -1243,7 +881,6 @@ static void IPC_VideoExit(void)
     the_buffer_size = 0;
 
     // Clean up IPC resources
-    destroy_control_socket();
     destroy_video_shm();
 
     VideoModes.clear();

@@ -960,7 +960,7 @@ fi
 dnl Video source selection - IPC video is mutually exclusive with SDL/X11
 if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
   dnl IPC video mode - shared memory video for standalone WebRTC server
-  VIDEOSRCS="../IPC/video_ipc.cpp"
+  VIDEOSRCS="../IPC/video_ipc.cpp ../IPC/control_ipc.cpp"
   KEYCODES="../SDL/keycodes"
   EXTRASYSSRCS="$EXTRASYSSRCS ../dummy/clip_dummy.cpp"
   dnl Set audio source for IPC audio if enabled
