@@ -13,6 +13,7 @@
 #include "codec.h"
 #include "h264_encoder.h"
 #include "av1_encoder.h"
+#include "vp9_encoder.h"
 #include "png_encoder.h"
 #include "opus_encoder.h"
 #include "audio_config.h"
@@ -32,6 +33,7 @@
 #include <rtc/rtppacketizer.hpp>
 #include <rtc/h264rtppacketizer.hpp>
 #include <rtc/av1rtppacketizer.hpp>
+#include <rtc/vp9rtppacketizer.hpp>
 #include <rtc/rtppacketizationconfig.hpp>
 #include <rtc/rtcpsrreporter.hpp>
 #include <rtc/rtcpnackresponder.hpp>
@@ -270,7 +272,8 @@ static void crash_handler(int sig, siginfo_t *info, void *context) {
     }
     fprintf(stderr, "  Codec:              %s\n",
         g_server_codec == CodecType::H264 ? "H.264" :
-        g_server_codec == CodecType::AV1 ? "AV1" : "PNG");
+        g_server_codec == CodecType::AV1 ? "AV1" :
+        g_server_codec == CodecType::VP9 ? "VP9" : "PNG");
     fprintf(stderr, "=== END SERVER STATE ===\n\n");
 
     fprintf(stderr, "Crash report complete. Generating core dump...\n");
@@ -844,6 +847,68 @@ public:
         }
     }
 
+    // Send VP9 frame via RTP video track
+    void send_vp9_frame(const EncodedFrame& frame) {
+        if (frame.data.empty() || peer_count_ == 0) return;
+
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+
+        // Calculate frame timestamp using chrono for precise timing
+        // VP9 clock rate is 90000 Hz
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - start_time_);
+
+        // Use the sendFrame method with FrameInfo for proper RTP timestamps
+        rtc::FrameInfo frameInfo(elapsed);
+
+        // Log only keyframe sends
+        if (frame.is_keyframe) {
+            fprintf(stderr, "[WebRTC] Sending VP9 keyframe: %zu bytes\n", frame.data.size());
+        }
+
+        // T7: Capture send timestamp right before sending
+        struct timespec ts_send;
+        clock_gettime(CLOCK_REALTIME, &ts_send);
+        uint64_t t7_server_send_us = (uint64_t)ts_send.tv_sec * 1000000 + ts_send.tv_nsec / 1000;
+
+        // Encode metadata header for data channel (all metadata in one message)
+        // Format: [cursor_x:2][cursor_y:2][cursor_visible:1][ping_seq:4][t1:8][t2:8][t3:8][t4:8][t5:8][t6:8][t7:8]
+        uint8_t metadata[65];  // 5 cursor + 4 seq + 7*8 timestamps = 65 bytes
+        metadata[0] = frame.cursor_x & 0xFF;
+        metadata[1] = (frame.cursor_x >> 8) & 0xFF;
+        metadata[2] = frame.cursor_y & 0xFF;
+        metadata[3] = (frame.cursor_y >> 8) & 0xFF;
+        metadata[4] = frame.cursor_visible;
+        std::memcpy(&metadata[5], &frame.ping_sequence, 4);
+        std::memcpy(&metadata[9], &frame.t1_browser_ms, 8);
+        std::memcpy(&metadata[17], &frame.t2_server_us, 8);
+        std::memcpy(&metadata[25], &frame.t3_emulator_us, 8);
+        std::memcpy(&metadata[33], &frame.t4_frame_us, 8);
+        std::memcpy(&metadata[41], &frame.t5_server_read_us, 8);
+        std::memcpy(&metadata[49], &frame.t6_encode_done_us, 8);
+        std::memcpy(&metadata[57], &t7_server_send_us, 8);
+
+        for (auto& [id, peer] : peers_) {
+            if (peer->codec != CodecType::VP9) continue;  // Skip non-VP9 peers
+            if (peer->ready && peer->video_track && peer->video_track->isOpen()) {
+                try {
+                    // Send video frame via RTP video track
+                    peer->video_track->sendFrame(
+                        reinterpret_cast<const std::byte*>(frame.data.data()),
+                        frame.data.size(),
+                        frameInfo);
+
+                    // Send metadata via data channel
+                    if (peer->data_channel && peer->data_channel->isOpen()) {
+                        peer->data_channel->send(reinterpret_cast<const std::byte*>(metadata), sizeof(metadata));
+                    }
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[WebRTC] VP9 send error to %s: %s\n", id.c_str(), e.what());
+                }
+            }
+        }
+    }
+
     // Send Opus audio frame via RTP audio track
     void send_audio_to_all_peers(const std::vector<uint8_t>& opus_data, uint64_t frame_number) {
         if (opus_data.empty()) {
@@ -1105,6 +1170,7 @@ public:
     struct CodecPeerCounts {
         int h264 = 0;
         int av1 = 0;
+        int vp9 = 0;
         int png = 0;
     };
 
@@ -1116,6 +1182,7 @@ public:
             switch (peer->codec) {
                 case CodecType::H264: counts.h264++; break;
                 case CodecType::AV1: counts.av1++; break;
+                case CodecType::VP9: counts.vp9++; break;
                 case CodecType::PNG: counts.png++; break;
             }
         }
@@ -1152,7 +1219,8 @@ public:
     // Send "reconnect" message to all clients (for codec changes)
     void notify_codec_change(CodecType new_codec) {
         const char* codec_name = (new_codec == CodecType::H264) ? "h264" :
-                                 (new_codec == CodecType::AV1) ? "av1" : "png";
+                                 (new_codec == CodecType::AV1) ? "av1" :
+                                 (new_codec == CodecType::VP9) ? "vp9" : "png";
 
         json msg = {
             {"type", "reconnect"},
@@ -1181,7 +1249,9 @@ public:
 private:
     // Helper: Check if codec needs RTP video track (vs DataChannel)
     bool needs_video_track(CodecType codec) {
-        return codec == CodecType::H264 || codec == CodecType::AV1;
+        // H.264, AV1, and VP9 all use RTP video tracks
+        // PNG uses DataChannel for dirty-rect support
+        return codec == CodecType::H264 || codec == CodecType::AV1 || codec == CodecType::VP9;
     }
 
     // Helper: Setup AV1 video track with RTP packetizer
@@ -1199,6 +1269,38 @@ private:
             rtc::AV1RtpPacketizer::Packetization::TemporalUnit,
             rtpConfig
         );
+        peer->video_track->setMediaHandler(packetizer);
+
+        peer->video_track->onOpen([peer]() {
+            if (g_debug_connection) {
+                fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
+            }
+            peer->ready = true;
+            g_request_keyframe.store(true);
+        });
+
+        peer->video_track->onClosed([peer]() {
+            fprintf(stderr, "[WebRTC] Video track CLOSED for %s\n", peer->id.c_str());
+            peer->ready = false;
+        });
+
+        peer->video_track->onError([peer](std::string error) {
+            fprintf(stderr, "[WebRTC] Video track ERROR for %s: %s\n", peer->id.c_str(), error.c_str());
+        });
+    }
+
+    // Helper: Setup VP9 video track with RTP packetizer
+    void setup_vp9_track(std::shared_ptr<PeerConnection> peer) {
+        rtc::Description::Video media("video-stream", rtc::Description::Direction::SendOnly);
+        media.addVP9Codec(96);  // VP9 uses payload type 96
+        media.addSSRC(ssrc_, "video-stream", "stream1", "video-stream");
+        peer->video_track = peer->pc->addTrack(media);
+
+        // Set up VP9 RTP packetizer (handles VP9 frame fragmentation per RFC 7741)
+        auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+            ssrc_, "video-stream", 96, rtc::VP9RtpPacketizer::ClockRate
+        );
+        auto packetizer = std::make_shared<rtc::VP9RtpPacketizer>(rtpConfig);
         peer->video_track->setMediaHandler(packetizer);
 
         peer->video_track->onOpen([peer]() {
@@ -1313,7 +1415,8 @@ private:
             // Use server-side codec preference (from prefs file)
             peer->codec = g_server_codec;
             const char* codec_name = (g_server_codec == CodecType::H264) ? "h264" :
-                                     (g_server_codec == CodecType::AV1) ? "av1" : "png";
+                                     (g_server_codec == CodecType::AV1) ? "av1" :
+                                     (g_server_codec == CodecType::VP9) ? "vp9" : "png";
             if (g_debug_connection) {
                 fprintf(stderr, "[WebRTC] Peer %s using %s codec (server-configured)\n",
                         peer_id.c_str(), codec_name);
@@ -1379,6 +1482,8 @@ private:
                     setup_h264_track(peer);
                 } else if (peer->codec == CodecType::AV1) {
                     setup_av1_track(peer);
+                } else if (peer->codec == CodecType::VP9) {
+                    setup_vp9_track(peer);
                 }
             } else {
                 // PNG codec uses DataChannel for video, mark as ready immediately
@@ -1879,7 +1984,7 @@ static void connection_manager_loop(WebRTCServer& webrtc,
  * This thread just waits for frames, encodes them, and sends to WebRTC
  */
 
-static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, PNGEncoder& png_encoder) {
+static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, VP9Encoder& vp9_encoder, PNGEncoder& png_encoder) {
     auto last_stats_time = std::chrono::steady_clock::now();
     int frames_encoded = 0;
 
@@ -2029,6 +2134,22 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             if (!frame.data.empty()) {
                 webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
                 webrtc.send_av1_frame(frame);
+                frames_encoded++;
+            }
+        }
+
+        // Encode and send to VP9 peers
+        if (webrtc.has_codec_peer(CodecType::VP9)) {
+            EncodedFrame frame = vp9_encoder.encode_bgra(frame_data, width, height, stride);
+
+            // T6: Capture encode done timestamp
+            struct timespec ts_enc;
+            clock_gettime(CLOCK_REALTIME, &ts_enc);
+            uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
+
+            if (!frame.data.empty()) {
+                webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+                webrtc.send_vp9_frame(frame);
                 frames_encoded++;
             }
         }
@@ -2539,6 +2660,7 @@ int main(int argc, char* argv[]) {
     // Create encoders
     H264Encoder h264_encoder;
     AV1Encoder av1_encoder;
+    VP9Encoder vp9_encoder;
     PNGEncoder png_encoder;
     g_audio_encoder = std::make_unique<OpusAudioEncoder>();
 
@@ -2581,7 +2703,7 @@ int main(int argc, char* argv[]) {
 
     // Launch worker threads
     std::thread audio_thread(audio_loop, std::ref(webrtc));
-    std::thread video_thread(video_loop, std::ref(webrtc), std::ref(h264_encoder), std::ref(av1_encoder), std::ref(png_encoder));
+    std::thread video_thread(video_loop, std::ref(webrtc), std::ref(h264_encoder), std::ref(av1_encoder), std::ref(vp9_encoder), std::ref(png_encoder));
 
     // Run connection manager in main thread
     // This handles scanning, connecting, disconnecting, process management, restarts

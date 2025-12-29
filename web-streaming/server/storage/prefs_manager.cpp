@@ -71,7 +71,7 @@ void create_minimal_prefs_if_needed(const std::string& prefs_path) {
         "jit true\n"
         "nosound false\n"
         "\n"
-        "# Video codec for web streaming (png or h264)\n"
+        "# Video codec for web streaming (png, h264, av1, or vp9)\n"
         "webcodec png\n"
         "\n"
         "# JIT settings\n"
@@ -139,6 +139,9 @@ CodecType read_webcodec_pref(const std::string& prefs_path) {
             } else if (value == "av1" || value == "AV1") {
                 fprintf(stderr, "Config: webcodec = av1\n");
                 return CodecType::AV1;
+            } else if (value == "vp9" || value == "VP9") {
+                fprintf(stderr, "Config: webcodec = vp9\n");
+                return CodecType::VP9;
             } else if (value == "png" || value == "PNG") {
                 fprintf(stderr, "Config: webcodec = png\n");
                 return CodecType::PNG;

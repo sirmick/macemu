@@ -16,6 +16,7 @@
 enum class CodecType {
     H264,       // WebRTC video track with H.264
     AV1,        // WebRTC video track with AV1 (best for dithered content)
+    VP9,        // WebRTC video track with VP9 (great for UI/screen content)
     PNG         // PNG over DataChannel (good for dithered, supports dirty rects)
 };
 

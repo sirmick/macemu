@@ -345,10 +345,12 @@ Response APIRouter::handle_codec_post(const Request& req) {
         new_codec = CodecType::H264;
     } else if (codec_str == "av1" || codec_str == "AV1") {
         new_codec = CodecType::AV1;
+    } else if (codec_str == "vp9" || codec_str == "VP9") {
+        new_codec = CodecType::VP9;
     } else if (codec_str == "png" || codec_str == "PNG") {
         new_codec = CodecType::PNG;
     } else {
-        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, or png\"}");
+        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, vp9, or png\"}");
     }
 
     // Update codec

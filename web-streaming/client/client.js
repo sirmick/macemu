@@ -247,6 +247,7 @@ const connectionSteps = new ConnectionSteps();
 const CodecType = {
     H264: 'h264',   // WebRTC video track with H.264
     AV1: 'av1',     // WebRTC video track with AV1
+    VP9: 'vp9',     // WebRTC video track with VP9
     PNG: 'png'      // PNG over DataChannel
 };
 
@@ -360,6 +361,39 @@ class AV1Decoder extends VideoDecoder {
 
     handleData(data) {
         logger.warn('AV1Decoder.handleData called - this should not happen');
+    }
+}
+
+// VP9 decoder using native WebRTC video track (same as H.264/AV1, browser handles it)
+class VP9Decoder extends VideoDecoder {
+    constructor(videoElement) {
+        super(videoElement);
+        this.videoElement = videoElement;
+    }
+
+    get type() { return CodecType.VP9; }
+    get name() { return 'VP9 (WebRTC)'; }
+
+    init() {
+        logger.info('VP9Decoder initialized');
+        return true;
+    }
+
+    cleanup() {
+        if (this.videoElement) {
+            this.videoElement.srcObject = null;
+        }
+    }
+
+    attachTrack(stream) {
+        this.videoElement.srcObject = stream;
+        this.videoElement.play().catch(e => {
+            logger.warn('Video play() failed', { error: e.message });
+        });
+    }
+
+    handleData(data) {
+        logger.warn('VP9Decoder.handleData called - this should not happen');
     }
 }
 
@@ -493,13 +527,12 @@ class PNGDecoder extends VideoDecoder {
             cursorY = view.getUint16(42, true);
             cursorVisible = view.getUint8(44);
 
-            // Update cursor state
+            // Update cursor state - DON'T render it in absolute mode, just track for debugging
             this.currentCursorX = cursorX;
             this.currentCursorY = cursorY;
             this.cursorVisible = (cursorVisible !== 0);
-            if (this.mouseMode === 'absolute') {
-                this.renderCursor();
-            }
+            // In absolute mode, we use the browser's native cursor, not the overlay
+            // The overlay cursor is only for debugging/visualization
 
             // Read ping echo with full roundtrip timestamps
             const pingSeq = view.getUint32(45, true);
@@ -733,6 +766,8 @@ function createDecoder(codecType, element) {
             return new H264Decoder(element);
         case CodecType.AV1:
             return new AV1Decoder(element);
+        case CodecType.VP9:
+            return new VP9Decoder(element);
         case CodecType.PNG:
             return new PNGDecoder(element);
         default:
@@ -746,6 +781,7 @@ function parseCodecString(codecStr) {
     switch (codecStr) {
         case 'h264': return CodecType.H264;
         case 'av1': return CodecType.AV1;
+        case 'vp9': return CodecType.VP9;
         case 'png': return CodecType.PNG;
         default:
             logger.warn('Unknown codec string, defaulting to PNG', { codec: codecStr });
@@ -758,6 +794,7 @@ function getCodecLabel(codecType) {
     switch (codecType) {
         case CodecType.H264: return 'H.264';
         case CodecType.AV1: return 'AV1';
+        case CodecType.VP9: return 'VP9';
         case CodecType.PNG: return 'PNG';
         default: return 'Unknown';
     }
@@ -858,8 +895,10 @@ class BasiliskWebRTC {
             this.decoder.cleanup();
         }
 
-        // AV1 and H.264 use video element, PNG uses canvas
-        const usesVideoElement = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
+        // H.264, AV1, and VP9 use video element; PNG uses canvas
+        const usesVideoElement = (this.codecType === CodecType.H264 ||
+                                   this.codecType === CodecType.AV1 ||
+                                   this.codecType === CodecType.VP9);
         const element = usesVideoElement ? this.video : this.canvas;
         if (!element) {
             logger.error('No display element for codec', { codec: this.codecType });
@@ -1690,6 +1729,32 @@ class BasiliskWebRTC {
             // In absolute mode, always handle
             if (this.mouseMode === 'absolute' || document.pointerLockElement === displayElement) {
                 e.preventDefault();
+
+                // In absolute mode, update position before sending click
+                if (this.mouseMode === 'absolute') {
+                    if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
+                        console.warn('[Browser] Absolute mouse: screen dimensions not set yet');
+                        return;
+                    }
+
+                    // Calculate position using same logic as mousemove
+                    if (!this.cachedMouseRect) {
+                        this.cachedMouseRect = displayElement.getBoundingClientRect();
+                        this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
+                        this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
+                    }
+
+                    const rect = this.cachedMouseRect;
+                    const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
+                    const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
+
+                    const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
+                    const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
+
+                    // Send position update first, then button press
+                    this.sendMouseAbsolute(clampedX, clampedY, performance.now());
+                }
+
                 this.sendMouseButton(e.button, true, performance.now());
             }
         };
@@ -1698,6 +1763,31 @@ class BasiliskWebRTC {
 
             if (this.mouseMode === 'absolute' || document.pointerLockElement === displayElement) {
                 e.preventDefault();
+
+                // In absolute mode, update position before sending click release
+                if (this.mouseMode === 'absolute') {
+                    if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
+                        console.warn('[Browser] Absolute mouse: screen dimensions not set yet');
+                        return;
+                    }
+
+                    if (!this.cachedMouseRect) {
+                        this.cachedMouseRect = displayElement.getBoundingClientRect();
+                        this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
+                        this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
+                    }
+
+                    const rect = this.cachedMouseRect;
+                    const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
+                    const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
+
+                    const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
+                    const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
+
+                    // Send position update first, then button release
+                    this.sendMouseAbsolute(clampedX, clampedY, performance.now());
+                }
+
                 this.sendMouseButton(e.button, false, performance.now());
             }
         };
@@ -1813,13 +1903,11 @@ class BasiliskWebRTC {
         const cursorY = view.getUint16(2, true);
         const cursorVisible = view.getUint8(4);
 
-        // Update cursor state
+        // Update cursor state - DON'T render it in absolute mode
         this.currentCursorX = cursorX;
         this.currentCursorY = cursorY;
         this.cursorVisible = (cursorVisible !== 0);
-        if (this.mouseMode === 'absolute') {
-            this.renderCursor();
-        }
+        // In absolute mode, we use the browser's native cursor, not the overlay
 
         // Read ping echo data
         const pingSeq = view.getUint32(5, true);
@@ -1884,11 +1972,7 @@ class BasiliskWebRTC {
         this.currentCursorX = x;
         this.currentCursorY = y;
         this.cursorVisible = (visible !== 0);
-
-        // Render cursor overlay if in absolute mode
-        if (this.mouseMode === 'absolute') {
-            this.renderCursor();
-        }
+        // In absolute mode, we use the browser's native cursor, not the overlay
     }
 
     // Render cursor on overlay canvas
@@ -2130,8 +2214,8 @@ class BasiliskWebRTC {
         // Header stats
         const fpsEl = document.getElementById('fps-display');
         const bitrateEl = document.getElementById('bitrate-display');
-        if (fpsEl) fpsEl.textContent = `FPS: ${this.stats.fps}`;
-        if (bitrateEl) bitrateEl.textContent = `${this.stats.bitrate} kbps`;
+        if (fpsEl) fpsEl.querySelector('span:last-child').textContent = `${this.stats.fps}`;
+        if (bitrateEl) bitrateEl.querySelector('span:last-child').textContent = `${this.stats.bitrate} kbps`;
 
         // Get resolution from appropriate element
         let width = 0, height = 0;
@@ -2218,13 +2302,19 @@ class BasiliskWebRTC {
 
     // UI helpers
     updateStatus(text, type = '') {
-        const statusEl = document.getElementById('connection-status');
-        const dotEl = document.getElementById('status-dot');
+        const iconEl = document.getElementById('connection-icon');
 
-        if (statusEl) statusEl.textContent = text;
-        if (dotEl) {
-            dotEl.className = 'status-dot';
-            if (type) dotEl.classList.add(type);
+        if (iconEl) {
+            iconEl.className = '';
+            if (type === 'connected') {
+                iconEl.classList.remove('inactive', 'connecting');
+            } else if (type === 'connecting') {
+                iconEl.classList.add('connecting');
+                iconEl.classList.remove('inactive');
+            } else {
+                iconEl.classList.add('inactive');
+                iconEl.classList.remove('connecting');
+            }
         }
     }
 
@@ -3224,31 +3314,30 @@ async function pollEmulatorStatus() {
         }
 
         // Update emulator status in header status bar
-        const emuStatusDot = document.getElementById('emulator-status-dot');
-        const emuStatusText = document.getElementById('emulator-status-text');
+        const emuIcon = document.getElementById('emulator-icon');
         const displayContainer = document.getElementById('display-container');
 
-        if (emuStatusDot && emuStatusText) {
+        if (emuIcon) {
+            emuIcon.className = '';
             if (data.emulator_running && data.emulator_connected) {
-                emuStatusDot.style.background = '#4CAF50';  // Green
-                emuStatusText.textContent = 'ON';
-                emuStatusText.style.color = '#4CAF50';
+                // Emulator fully running - show active icon
+                emuIcon.classList.remove('inactive', 'connecting');
                 // Remove disconnected state when emulator is fully running
                 if (displayContainer) {
                     displayContainer.classList.remove('disconnected');
                 }
             } else if (data.emulator_running) {
-                emuStatusDot.style.background = '#FF9800';  // Orange
-                emuStatusText.textContent = 'STARTING';
-                emuStatusText.style.color = '#FF9800';
+                // Emulator starting - show pulsing icon
+                emuIcon.classList.add('connecting');
+                emuIcon.classList.remove('inactive');
                 // Keep disconnected state while starting
                 if (displayContainer) {
                     displayContainer.classList.add('disconnected');
                 }
             } else {
-                emuStatusDot.style.background = '#666';  // Gray
-                emuStatusText.textContent = 'OFF';
-                emuStatusText.style.color = '#999';
+                // Emulator off - show inactive icon
+                emuIcon.classList.add('inactive');
+                emuIcon.classList.remove('connecting');
                 // Add disconnected state when emulator is off
                 if (displayContainer) {
                     displayContainer.classList.add('disconnected');

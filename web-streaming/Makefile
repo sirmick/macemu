@@ -18,8 +18,8 @@ HAVE_LIBDATACHANNEL = yes
 CMAKE = 
 
 # Compiler and linker flags from configure
-SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include -Ilibdatachannel/deps/json/include -Iserver   -msse4.1 -mpclmul -I/usr/include/svt-av1 -DEB_DLL
-SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lpthread -lrt -lopus -lSvtAv1Enc
+SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include -Ilibdatachannel/deps/json/include -Iserver  -I/usr/include/svt-av1 -DEB_DLL   -msse4.1 -mpclmul -I/usr/include/svt-av1 -DEB_DLL
+SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lpthread -lrt -lopus  -lSvtAv1Enc  -lvpx -lm  -lopus -lSvtAv1Enc
 FPNG_CFLAGS = -msse4.1 -mpclmul
 
 # Source files
@@ -52,6 +52,7 @@ SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/static_files.o \
               $(BUILD_DIR)/h264_encoder.o \
               $(BUILD_DIR)/av1_encoder.o \
+              $(BUILD_DIR)/vp9_encoder.o \
               $(BUILD_DIR)/opus_encoder.o \
               $(BUILD_DIR)/png_encoder.o \
               $(BUILD_DIR)/fpng.o
@@ -102,6 +103,12 @@ $(BUILD_DIR)/h264_encoder.o: $(SERVER_DIR)/h264_encoder.cpp \
 # Compile AV1 encoder
 $(BUILD_DIR)/av1_encoder.o: $(SERVER_DIR)/av1_encoder.cpp \
                              $(SERVER_DIR)/av1_encoder.h \
+                             $(SERVER_DIR)/codec.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+# Compile VP9 encoder
+$(BUILD_DIR)/vp9_encoder.o: $(SERVER_DIR)/vp9_encoder.cpp \
+                             $(SERVER_DIR)/vp9_encoder.h \
                              $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
