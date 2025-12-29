@@ -403,12 +403,21 @@ static void process_binary_input(const uint8_t* data, size_t len) {
                     // Already running
                     break;
                 case MACEMU_CMD_STOP:
-                    fprintf(stderr, "IPC: Stop command received\n");
-                    exit(0);
+                    fprintf(stderr, "IPC: Stop command received, triggering clean shutdown\n");
+                    // Detach control thread so QuitEmulator() won't try to join it
+                    // (we're running IN the control thread, can't join ourselves!)
+                    if (control_thread.joinable()) {
+                        control_thread.detach();
+                    }
+                    // Now safe to call QuitEmulator from this thread
+                    QuitEmulator();
+                    // Will never reach here
                     break;
                 case MACEMU_CMD_RESET:
                     fprintf(stderr, "IPC: Reset command received\n");
-                    exit(75);  // Special exit code for restart
+                    // For restart, we still use exit() with special code
+                    // Main will detect this and restart
+                    exit(75);
                     break;
                 case MACEMU_CMD_PAUSE:
                     if (video_shm) video_shm->state = MACEMU_STATE_PAUSED;
@@ -1216,6 +1225,8 @@ static void IPC_VideoExit(void)
     if (video_thread.joinable()) {
         video_thread.join();
     }
+    // Control thread may have been detached if QuitEmulator() was called from within it
+    // (e.g., via MACEMU_CMD_STOP command)
     if (control_thread.joinable()) {
         control_thread.join();
     }

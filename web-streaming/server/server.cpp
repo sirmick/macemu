@@ -103,6 +103,7 @@ bool g_debug_png = false;
 static std::atomic<bool> g_running(true);
 static std::atomic<bool> g_emulator_connected(false);
 static std::atomic<bool> g_restart_emulator_requested(false);
+static std::atomic<bool> g_user_stopped_emulator(false);  // User explicitly stopped via web UI
 static pid_t g_emulator_pid = -1;
 static CodecType g_previous_codec = CodecType::PNG;  // Track codec changes for peer disconnection
 
@@ -326,6 +327,8 @@ static bool try_connect_to_emulator(pid_t pid) {
     if (success) {
         g_emulator_pid = pid;
         g_emulator_connected = true;
+        // Request keyframe so browser gets a full frame from new emulator
+        g_request_keyframe.store(true);
     }
     return success;
 }
@@ -450,30 +453,50 @@ static void stop_emulator() {
     fprintf(stderr, "Emulator: Stopping PID %d\n", g_started_emulator_pid);
 
     // Try graceful shutdown first via control socket
+    bool sent_graceful_stop = false;
     if (g_control_socket >= 0) {
-        send_command(MACEMU_CMD_STOP);
+        sent_graceful_stop = send_command(MACEMU_CMD_STOP);
+        if (sent_graceful_stop) {
+            fprintf(stderr, "Emulator: Sent graceful stop command via socket\n");
+        }
     }
 
-    // Also send SIGTERM
+    // Wait up to 2 seconds for graceful shutdown
+    if (sent_graceful_stop) {
+        for (int i = 0; i < 20; i++) {
+            int status;
+            pid_t result = waitpid(g_started_emulator_pid, &status, WNOHANG);
+            if (result != 0) {
+                g_started_emulator_pid = -1;
+                fprintf(stderr, "Emulator: Stopped gracefully\n");
+                return;
+            }
+            usleep(100000);  // 100ms
+        }
+        fprintf(stderr, "Emulator: Graceful shutdown timed out, sending SIGTERM\n");
+    }
+
+    // Graceful shutdown failed or not attempted - send SIGTERM
     kill(g_started_emulator_pid, SIGTERM);
 
-    // Wait up to 3 seconds
+    // Wait up to 3 seconds for SIGTERM
     for (int i = 0; i < 30; i++) {
         int status;
         pid_t result = waitpid(g_started_emulator_pid, &status, WNOHANG);
         if (result != 0) {
             g_started_emulator_pid = -1;
-            fprintf(stderr, "Emulator: Stopped\n");
+            fprintf(stderr, "Emulator: Stopped via SIGTERM\n");
             return;
         }
         usleep(100000);  // 100ms
     }
 
-    // Force kill
-    fprintf(stderr, "Emulator: Force killing\n");
+    // Force kill with SIGKILL
+    fprintf(stderr, "Emulator: SIGTERM timed out, force killing with SIGKILL\n");
     kill(g_started_emulator_pid, SIGKILL);
     waitpid(g_started_emulator_pid, nullptr, 0);
     g_started_emulator_pid = -1;
+    fprintf(stderr, "Emulator: Force killed\n");
 }
 
 // Returns: 0 if still running, -1 if not running/error, positive if exited with code
@@ -495,7 +518,7 @@ static int check_emulator_status() {
             fprintf(stderr, "Emulator: Killed by signal %d\n", WTERMSIG(status));
         }
         g_started_emulator_pid = -1;
-        g_emulator_connected = false;
+        // disconnect_from_emulator() will set g_emulator_connected to false
         disconnect_from_emulator();
         return exit_code >= 0 ? exit_code : -1;
     } else if (result == 0) {
@@ -591,6 +614,7 @@ private:
         api_ctx_.emulator_pid = g_emulator_pid;
         api_ctx_.started_emulator_pid = g_started_emulator_pid;
         api_ctx_.ipc_shm = g_ipc_shm;
+        api_ctx_.user_stopped_emulator = &g_user_stopped_emulator;
 
         // Codec state (set once in constructor)
         // api_ctx_.server_codec and notify_codec_change_fn are already set
@@ -1699,11 +1723,29 @@ private:
 // Stdin monitor removed - was debug feature for synchronized audio capture
 // Capture functionality can be triggered via API endpoint if needed in future
 
+// Track last disconnection time to prevent immediate reconnection
+static std::chrono::steady_clock::time_point g_last_disconnect_time;
+
 // Implementation of disconnect_from_emulator (needs WebRTCServer definition)
+// NOTE: With new threading model, this is called from connection manager (main thread)
+// Worker threads (video/audio) check g_emulator_connected and go idle when false
 static void disconnect_from_emulator(WebRTCServer* webrtc, bool disconnect_peers) {
-    g_ipc.disconnect();
+    // Set disconnected flag - worker threads will see this and stop processing
     g_emulator_connected = false;
     g_emulator_pid = -1;
+
+    // Record disconnection time for reconnection grace period
+    g_last_disconnect_time = std::chrono::steady_clock::now();
+
+    // Wait for worker threads to notice flag and go idle
+    // Audio loop: 20ms iterations, Video loop: blocks on epoll_wait with 5ms timeout
+    // 200ms ensures both threads have fully exited their processing loops
+    fprintf(stderr, "IPC: Waiting for worker threads to stop accessing shared memory...\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // Now safe to unmap - threads are idle waiting on g_emulator_connected check
+    g_ipc.disconnect();
+    fprintf(stderr, "IPC: Disconnected and unmapped shared memory\n");
 
     // Disconnect WebRTC peers if requested (e.g., when codec changes)
     // Otherwise, keep peers connected for seamless restarts (resolution changes)
@@ -1723,13 +1765,122 @@ void HTTPServer::set_webrtc_server(WebRTCServer* webrtc) {
 }
 
 /*
- * Main video processing loop
+ * Connection management loop - runs in main thread
+ * Handles: scanning, connecting, disconnecting, process management, restarts
+ */
+
+static void connection_manager_loop(WebRTCServer& webrtc,
+                                    std::thread* video_thread,
+                                    std::thread* audio_thread) {
+    auto last_scan_time = std::chrono::steady_clock::now();
+    auto last_emu_check = std::chrono::steady_clock::now();
+
+    fprintf(stderr, "Connection: Starting connection manager\n");
+
+    while (g_running) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Periodically scan for emulators if not connected
+        // BUT: Don't reconnect if user explicitly stopped the emulator
+        if (!g_emulator_connected && !g_user_stopped_emulator) {
+            auto scan_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scan_time);
+            if (scan_elapsed.count() >= 500) {
+                last_scan_time = now;
+
+                // Grace period after disconnect: wait for emulator to finish cleanup
+                // Emulator needs time to: join threads, munmap SHM, unlink socket
+                // 500ms should be sufficient for clean shutdown
+                auto disconnect_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_last_disconnect_time);
+                if (disconnect_elapsed.count() < 500) {
+                    continue;  // Still in grace period, skip connection attempts
+                }
+
+                // Priority 1: If we started an emulator, ONLY try to connect to that one
+                // This prevents connecting to stray emulators from previous sessions
+                if (g_started_emulator_pid > 0) {
+                    if (try_connect_to_emulator(g_started_emulator_pid)) {
+                        fprintf(stderr, "Connection: Connected to our emulator PID %d\n", g_started_emulator_pid);
+                    }
+                }
+                // Priority 2: If target PID specified via command line, try that
+                else if (g_target_emulator_pid > 0) {
+                    if (try_connect_to_emulator(g_target_emulator_pid)) {
+                        fprintf(stderr, "Connection: Connected to target emulator PID %d\n", g_target_emulator_pid);
+                    }
+                }
+                // Priority 3: No specific emulator - scan for any running emulator
+                else {
+                    auto pids = scan_for_emulators();
+                    for (pid_t pid : pids) {
+                        if (try_connect_to_emulator(pid)) {
+                            fprintf(stderr, "Connection: Found and connected to emulator PID %d\n", pid);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if we started an emulator and it exited
+        auto emu_check_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_emu_check);
+        if (emu_check_elapsed.count() >= 500) {
+            last_emu_check = now;
+
+            int exit_code = check_emulator_status();
+            if (exit_code > 0 && g_auto_start_emulator) {
+                // Emulator we started exited - check if restart requested (exit code 75)
+                if (exit_code == 75) {
+                    fprintf(stderr, "Connection: Auto-restarting emulator...\n");
+                    disconnect_from_emulator(&webrtc);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    start_emulator();
+                    g_previous_codec = g_server_codec;
+                }
+            }
+
+            // Handle restart request from web UI
+            if (g_restart_emulator_requested.exchange(false)) {
+                fprintf(stderr, "Connection: Restart requested from web UI\n");
+
+                if (g_started_emulator_pid > 0) {
+                    stop_emulator();
+                } else {
+                    send_command(MACEMU_CMD_RESET);
+                }
+                disconnect_from_emulator(&webrtc, false);  // Don't disconnect peers
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (g_auto_start_emulator) {
+                    start_emulator();
+                }
+            }
+        }
+
+        // Check if emulator disconnected (socket closed)
+        if (g_emulator_connected && g_control_socket >= 0) {
+            char buf;
+            ssize_t n = recv(g_control_socket, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0) {
+                // Connection closed
+                fprintf(stderr, "Connection: Emulator disconnected\n");
+                disconnect_from_emulator(&webrtc);
+            }
+        }
+
+        // Sleep to avoid busy-looping
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    fprintf(stderr, "Connection: Exiting connection manager\n");
+}
+
+/*
+ * Simplified video processing loop - ONLY processes frames
+ * Connection management has been moved to connection_manager_loop() in main thread
+ * This thread just waits for frames, encodes them, and sends to WebRTC
  */
 
 static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, PNGEncoder& png_encoder) {
     auto last_stats_time = std::chrono::steady_clock::now();
-    auto last_emu_check = std::chrono::steady_clock::now();
-    auto last_scan_time = std::chrono::steady_clock::now();
     int frames_encoded = 0;
 
     // Track input counts between stats intervals
@@ -1750,87 +1901,15 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
     while (g_running) {
         auto now = std::chrono::steady_clock::now();
 
-        // Periodically scan for emulators if not connected
-        if (!g_emulator_connected) {
-            auto scan_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scan_time);
-            if (scan_elapsed.count() >= 500) {
-                last_scan_time = now;
-
-                // If target PID specified, try that
-                if (g_target_emulator_pid > 0) {
-                    if (try_connect_to_emulator(g_target_emulator_pid)) {
-                        fprintf(stderr, "Video: Connected to emulator PID %d\n", g_target_emulator_pid);
-                    }
-                } else {
-                    // Scan for any running emulator
-                    auto pids = scan_for_emulators();
-                    for (pid_t pid : pids) {
-                        if (try_connect_to_emulator(pid)) {
-                            fprintf(stderr, "Video: Found and connected to emulator PID %d\n", pid);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check if we started an emulator and it exited
-        auto emu_check_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_emu_check);
-        if (emu_check_elapsed.count() >= 500) {
-            last_emu_check = now;
-
-            int exit_code = check_emulator_status();
-            if (exit_code > 0 && g_auto_start_emulator) {
-                // Emulator we started exited - check if restart requested (exit code 75)
-                if (exit_code == 75) {
-                    fprintf(stderr, "Video: Auto-restarting emulator...\n");
-                    disconnect_from_emulator(&webrtc);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    start_emulator();
-                    g_previous_codec = g_server_codec;  // Update codec after restart
-                }
-            }
-
-            // Handle restart request from web UI
-            if (g_restart_emulator_requested.exchange(false)) {
-                fprintf(stderr, "Video: Restart requested from web UI\n");
-
-                // Note: Codec change is now independent of emulator restart
-                // Peers are kept connected for seamless restart
-
-                if (g_started_emulator_pid > 0) {
-                    stop_emulator();
-                } else {
-                    send_command(MACEMU_CMD_RESET);
-                }
-                disconnect_from_emulator(&webrtc, false);  // Don't disconnect peers
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                if (g_auto_start_emulator) {
-                    start_emulator();
-                }
-            }
-        }
-
-        // Check if emulator disconnected
-        if (g_emulator_connected && g_control_socket >= 0) {
-            char buf;
-            ssize_t n = recv(g_control_socket, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (n == 0) {
-                // Connection closed
-                fprintf(stderr, "Video: Emulator disconnected\n");
-                disconnect_from_emulator(&webrtc);
-            }
-        }
-
-        // Wait for frames
-        if (!g_ipc_shm) {
+        // Wait for emulator connection (managed by main thread)
+        if (!g_emulator_connected || !g_ipc_shm) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
-        // Register eventfd with epoll when emulator PID changes (new connection or restart)
+        // Register eventfd with epoll when emulator PID changes (new connection)
         // Kernel may reuse same fd number, so we check PID to detect new emulator
-        if (g_emulator_connected && current_emulator_pid != g_emulator_pid) {
+        if (current_emulator_pid != g_emulator_pid) {
             // Remove old eventfd from epoll if any
             if (current_eventfd >= 0) {
                 fprintf(stderr, "Video: Removing old eventfd %d from epoll (PID %d->%d)\n",
@@ -1853,10 +1932,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
                     fprintf(stderr, "Video: Registered eventfd %d with epoll for PID %d\n",
                             current_eventfd, current_emulator_pid);
                 } else {
-                    fprintf(stderr, "Video: FATAL: Failed to add eventfd %d to epoll: %s\n",
+                    fprintf(stderr, "Video: ERROR: Failed to add eventfd %d to epoll: %s\n",
                             g_frame_ready_eventfd, strerror(errno));
-                    // This is fatal - can't proceed without eventfd
-                    disconnect_from_emulator(&webrtc);
                     continue;
                 }
             }
@@ -2167,9 +2244,8 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
     while (g_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
-        // Cache SHM pointer locally to avoid race conditions with disconnect
-        MacEmuIPCBuffer* shm = g_ipc_shm;
-        if (!shm || !g_emulator_connected) {
+        // Check connection status
+        if (!g_ipc_shm || !g_emulator_connected) {
             std::this_thread::sleep_for(frame_duration);
             continue;
         }
@@ -2200,14 +2276,14 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
         // 8ms is conservative but still leaves 12ms for resampling/encoding in 20ms budget
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
 
-        // Check again after sleep - emulator could have disconnected during sleep
-        if (!g_emulator_connected || !shm) {
+        // Read frame ring buffer indices
+        // Note: Use g_ipc_shm directly (don't cache) - it can change when reconnecting to new emulator
+        // The 200ms grace period in disconnect_from_emulator() ensures old SHM stays valid during disconnect
+        if (!g_ipc_shm || !g_emulator_connected) {
             continue;
         }
-
-        // Read frame ring buffer indices
-        uint32_t read_idx = ATOMIC_LOAD(shm->audio_frame_read_idx);
-        uint32_t write_idx = ATOMIC_LOAD(shm->audio_frame_write_idx);
+        uint32_t read_idx = ATOMIC_LOAD(g_ipc_shm->audio_frame_read_idx);
+        uint32_t write_idx = ATOMIC_LOAD(g_ipc_shm->audio_frame_write_idx);
 
         // Select frame to consume
         const MacEmuAudioFrame* frame;
@@ -2215,7 +2291,7 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
 
         if (read_idx == write_idx) {
             // Ring buffer empty - underrun! Use silence frame
-            frame = &shm->audio_silence_frame;
+            frame = &g_ipc_shm->audio_silence_frame;
             is_silence = true;
             frames_underrun++;
 
@@ -2225,7 +2301,7 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
             }
         } else {
             // Normal case - consume frame from ring buffer
-            frame = &shm->audio_frame_ring[read_idx];
+            frame = &g_ipc_shm->audio_frame_ring[read_idx];
             is_silence = false;
         }
 
@@ -2350,9 +2426,9 @@ static void audio_loop_mac_ipc(WebRTCServer& webrtc) {
         }
 
         // Advance read index (only if we didn't use silence frame)
-        if (!is_silence) {
+        if (!is_silence && g_ipc_shm) {
             uint32_t next_read_idx = (read_idx + 1) % MACEMU_AUDIO_FRAME_RING_SIZE;
-            ATOMIC_STORE(shm->audio_frame_read_idx, next_read_idx);
+            ATOMIC_STORE(g_ipc_shm->audio_frame_read_idx, next_read_idx);
             frames_consumed++;
         }
 
@@ -2503,20 +2579,27 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
     }
 
-    // Launch audio thread
+    // Launch worker threads
     std::thread audio_thread(audio_loop, std::ref(webrtc));
+    std::thread video_thread(video_loop, std::ref(webrtc), std::ref(h264_encoder), std::ref(av1_encoder), std::ref(png_encoder));
 
-    // Run video loop in main thread
-    video_loop(webrtc, h264_encoder, av1_encoder, png_encoder);
+    // Run connection manager in main thread
+    // This handles scanning, connecting, disconnecting, process management, restarts
+    connection_manager_loop(webrtc, &video_thread, &audio_thread);
 
-    // Wait for audio thread to finish
+    // Signal shutdown happened - wait for worker threads to exit cleanly
+    fprintf(stderr, "Server: Waiting for worker threads to exit...\n");
+    video_thread.join();
     audio_thread.join();
+    fprintf(stderr, "Server: All worker threads exited\n");
 
     // Stop emulator if we started it
     stop_emulator();
 
-    // Disconnect from emulator
-    disconnect_from_emulator();
+    // Disconnect from emulator (if not already disconnected)
+    if (g_emulator_connected) {
+        disconnect_from_emulator();
+    }
 
     // Cleanup
     webrtc.shutdown();

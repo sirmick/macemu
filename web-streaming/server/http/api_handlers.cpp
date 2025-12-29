@@ -199,6 +199,11 @@ Response APIRouter::handle_status(const Request& req) {
 }
 
 Response APIRouter::handle_emulator_start(const Request& req) {
+    // Clear the "user stopped" flag - allow connection manager to scan/connect
+    if (ctx_->user_stopped_emulator) {
+        *ctx_->user_stopped_emulator = false;
+    }
+
     std::string json_body;
     if (ctx_->started_emulator_pid > 0) {
         json_body = "{\"success\": false, \"message\": \"Emulator already running\", \"pid\": " +
@@ -213,6 +218,11 @@ Response APIRouter::handle_emulator_start(const Request& req) {
 }
 
 Response APIRouter::handle_emulator_stop(const Request& req) {
+    // Set flag to prevent connection manager from auto-reconnecting
+    if (ctx_->user_stopped_emulator) {
+        *ctx_->user_stopped_emulator = true;
+    }
+
     std::string json_body;
     if (ctx_->started_emulator_pid <= 0 && ctx_->emulator_pid <= 0) {
         json_body = "{\"success\": false, \"message\": \"Emulator not running\"}";
@@ -236,6 +246,11 @@ Response APIRouter::handle_emulator_stop(const Request& req) {
 }
 
 Response APIRouter::handle_emulator_restart(const Request& req) {
+    // Clear the "user stopped" flag - restart is an intentional start action
+    if (ctx_->user_stopped_emulator) {
+        *ctx_->user_stopped_emulator = false;
+    }
+
     if (ctx_->request_restart_fn) {
         ctx_->request_restart_fn(true);
     }

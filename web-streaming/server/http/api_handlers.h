@@ -35,6 +35,7 @@ struct APIContext {
     int emulator_pid;
     int started_emulator_pid;
     MacEmuIPCBuffer* ipc_shm;  // Shared memory for video and audio IPC
+    std::atomic<bool>* user_stopped_emulator;  // Flag: user explicitly stopped via web UI
 
     // Codec state
     CodecType* server_codec;  // Pointer to g_server_codec
