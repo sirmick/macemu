@@ -33,6 +33,11 @@ unicorn_dep = declare_dependency(
 threads_dep = dependency('threads', required: true)
 m_dep = cc.find_library('m', required: true)  # Math library for Unicorn
 
+# Compiler flags based on backend
+if cpu_backend == 'dualcpu'
+  add_project_arguments('-DCPU_EMULATION_DUALCPU', language: ['c', 'cpp'])
+endif
+
 # Build info
 message('Build configuration:')
 message('  CPU backend: ' + cpu_backend)
@@ -42,7 +47,21 @@ message('  Build SheepShaver: ' + build_sheepshaver.to_string())
 # Subdirectories
 subdir('src/cpu')
 subdir('src/core')
-subdir('src/drivers/dummy')
+subdir('src/drivers')
+
+# Main executable
+macemu_next = executable('macemu-next',
+  'src/main.cpp',
+  link_with: [core_lib, driver_lib, cpu_lib],
+  dependencies: [unicorn_dep, threads_dep, m_dep],
+  include_directories: [
+    include_directories('src/common/include'),
+    include_directories('src/core'),
+    include_directories('src/cpu'),
+    include_directories('src/cpu/uae_cpu'),
+    include_directories('src/drivers'),
+  ]
+)
 
 # Tests
 if get_option('tests')

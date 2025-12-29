@@ -38,6 +38,10 @@
 #include "platform.h"
 #include "extfs.h"
 
+#ifdef CPU_EMULATION_DUALCPU
+#include "unicorn_validation.h"
+#endif
+
 #define DEBUG 1
 #include "debug.h"
 
@@ -352,6 +356,17 @@ int main(int argc, char **argv)
 	// Reset CPU to ROM entry point
 	cpu->reset();
 	printf("CPU reset to PC=0x%08x\n", cpu->get_pc());
+
+#ifdef CPU_EMULATION_DUALCPU
+	// Initialize Unicorn validation (runs in lockstep with UAE)
+	if (!is_test_rom) {  // Only validate real ROMs
+		if (unicorn_validation_init()) {
+			printf("Unicorn validation enabled\n");
+		} else {
+			fprintf(stderr, "Warning: Failed to initialize Unicorn validation\n");
+		}
+	}
+#endif
 
 	// Execution loop - UNIFIED for both test and real ROMs!
 	// The loop is here at the top level, not buried in the backend.
