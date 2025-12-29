@@ -225,14 +225,12 @@ void uae_cpu_execute_one(void) {
         cpu_trace_init();
     }
 
-    /* Capture PC before execution (for trace) */
-    uae_u32 pc_before = m68k_getpc();
-
     /* Execute one instruction */
     uae_u32 opcode = GET_OPCODE;
 
     // Optional trace output (enabled via CPU_TRACE env var)
     if (cpu_trace_enabled && cpu_trace_count < cpu_trace_max) {
+        uae_u32 pc_before = m68k_getpc();
         fprintf(stderr, "[%04lu] PC=%08X OP=%04X | D0=%08X D1=%08X A0=%08X A7=%08X SR=%04X\n",
             (unsigned long)cpu_trace_count,
             (unsigned int)pc_before,
