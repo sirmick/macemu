@@ -1417,19 +1417,6 @@ extern "C" {
 void m68k_do_execute (void)
 {
 	for (;;) {
-		// DEBUG: Check if HAVE_GET_WORD_UNSWAPPED is defined
-		static int first_exec = 1;
-		if (first_exec) {
-			fprintf(stderr, "DEBUG m68k_do_execute:\n");
-#ifdef HAVE_GET_WORD_UNSWAPPED
-			fprintf(stderr, "  HAVE_GET_WORD_UNSWAPPED IS DEFINED!\n");
-#else
-			fprintf(stderr, "  HAVE_GET_WORD_UNSWAPPED is NOT defined (good)\n");
-#endif
-			fflush(stderr);
-			first_exec = 0;
-		}
-
 #ifdef CPU_EMULATION_DUALCPU
 		// Dual-CPU validation: execute instruction and compare with Unicorn
 		if (unicorn_validation_enabled()) {
@@ -1439,14 +1426,6 @@ void m68k_do_execute (void)
 		{
 			// Normal execution path
 			uae_u32 opcode = GET_OPCODE;
-
-			// DEBUG: Print first opcode value
-			if (first_exec == 0) {
-				fprintf(stderr, "  Fetched opcode: 0x%04x\n", opcode);
-				fprintf(stderr, "  Calling cpufunctbl[0x%04x] = %p\n", opcode, (void*)cpufunctbl[opcode]);
-				fflush(stderr);
-				first_exec = -1;  // Only print once
-			}
 
 #if FLIGHT_RECORDER
 			m68k_record_step(m68k_getpc());

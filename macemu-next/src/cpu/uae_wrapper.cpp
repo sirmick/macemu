@@ -197,29 +197,57 @@ void uae_set_sr(uint16_t value) {
 }
 
 /* Execution */
+
+// Debug trace control (set CPU_TRACE=1 environment variable to enable)
+static int cpu_trace_enabled = -1;  // -1 = uninitialized
+static uint64_t cpu_trace_count = 0;
+static uint64_t cpu_trace_max = 10;  // Default: trace first 10 instructions
+
+static void cpu_trace_init(void) {
+    const char *env = getenv("CPU_TRACE");
+    if (env && atoi(env) > 0) {
+        cpu_trace_enabled = 1;
+        // Optional: CPU_TRACE=N to trace first N instructions
+        int n = atoi(env);
+        if (n > 1) {
+            cpu_trace_max = n;
+        }
+        fprintf(stderr, "[CPU trace enabled: will trace first %lu instructions]\n",
+                (unsigned long)cpu_trace_max);
+    } else {
+        cpu_trace_enabled = 0;
+    }
+}
+
 void uae_cpu_execute_one(void) {
+    /* Initialize trace on first call */
+    if (cpu_trace_enabled == -1) {
+        cpu_trace_init();
+    }
+
+    /* Capture PC before execution (for trace) */
+    uae_u32 pc_before = m68k_getpc();
+
     /* Execute one instruction */
-    static int first = 1;
-    if (first) {
-        fprintf(stderr, "DEBUG uae_cpu_execute_one BEFORE opcode fetch:\n");
-        fprintf(stderr, "  regs.pc = 0x%08X\n", (unsigned int)regs.pc);
-        fprintf(stderr, "  regs.pc_p = %p\n", (void*)regs.pc_p);
-        fprintf(stderr, "  RAMBaseHost = %p\n", (void*)RAMBaseHost);
-        fprintf(stderr, "  ROMBaseHost = %p\n", (void*)ROMBaseHost);
-        fprintf(stderr, "  RAMBaseMac = 0x%08X\n", RAMBaseMac);
-        fprintf(stderr, "  ROMBaseMac = 0x%08X\n", ROMBaseMac);
-        fprintf(stderr, "  MEMBaseDiff = 0x%lX\n", (unsigned long)MEMBaseDiff);
-        if (regs.pc_p) {
-            uint8_t *p = (uint8_t*)regs.pc_p;
-            fprintf(stderr, "  Bytes at regs.pc_p: %02X %02X %02X %02X\n", p[0], p[1], p[2], p[3]);
+    uae_u32 opcode = GET_OPCODE;
+
+    // Optional trace output (enabled via CPU_TRACE env var)
+    if (cpu_trace_enabled && cpu_trace_count < cpu_trace_max) {
+        fprintf(stderr, "[%04lu] PC=%08X OP=%04X | D0=%08X D1=%08X A0=%08X A7=%08X SR=%04X\n",
+            (unsigned long)cpu_trace_count,
+            (unsigned int)pc_before,
+            (unsigned int)opcode,
+            (unsigned int)regs.regs[0],   // D0
+            (unsigned int)regs.regs[1],   // D1
+            (unsigned int)regs.regs[8],   // A0
+            (unsigned int)regs.regs[15],  // A7
+            (unsigned int)regs.sr);
+        cpu_trace_count++;
+        if (cpu_trace_count == cpu_trace_max) {
+            fprintf(stderr, "[Trace limit reached, disabling trace]\n");
         }
     }
-    uae_u32 opcode = GET_OPCODE;
-    if (first) {
-        fprintf(stderr, "  Fetched opcode: 0x%04X\n", opcode);
-        fprintf(stderr, "  Handler: %p\n", (void*)cpufunctbl[opcode]);
-        first = 0;
-    }
+
     (*cpufunctbl[opcode])(opcode);
 }
 

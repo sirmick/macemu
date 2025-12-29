@@ -31,6 +31,7 @@
 #include "audio.h"
 #include "rom_patches.h"
 #include "user_strings.h"
+#include "platform.h"
 
 #define DEBUG 1
 #include "debug.h"
@@ -81,106 +82,20 @@ void DisableInterrupt(void)
 {
 }
 
-// Enable interrupts (stub)
+// Enable interrupts (stub - specific to test)
 void EnableInterrupt(void)
 {
 }
 
-// Platform-specific stubs
-void MountVolume(const char *path) {}
-void FileDiskLayout(loff_t size, loff_t *start, loff_t *length) {}
-void FloppyInit() {}
-// XPRAMInit and XPRAMExit are in xpram.cpp, we don't need to define them
-
-// System stubs
-void SysAddSerialPrefs() {}
-void SysAddFloppyPrefs() {}
-void SysAddDiskPrefs() {}
-void SysAddCDROMPrefs() {}
-void *Sys_open(const char *path, bool read_only, bool no_cache) { return NULL; }
-void Sys_close(void *fh) {}
-size_t Sys_read(void *fh, void *buf, loff_t offset, size_t length) { return 0; }
-size_t Sys_write(void *fh, void *buf, loff_t offset, size_t length) { return 0; }
-bool SysIsReadOnly(void *fh) { return true; }
-bool SysIsDiskInserted(void *fh) { return false; }
-bool SysIsFixedDisk(void *fh) { return false; }
-loff_t SysGetFileSize(void *fh) { return 0; }
-void SysEject(void *fh) {}
-void SysAllowRemoval(void *fh) {}
-void SysPreventRemoval(void *fh) {}
-bool SysCDGetVolume(void *fh, uint8 &left, uint8 &right) { left = 255; right = 255; return true; }
-bool SysCDSetVolume(void *fh, uint8 left, uint8 right) { return true; }
-void SysCDPause(void *fh) {}
-void SysCDResume(void *fh) {}
-bool SysCDPlay(void *fh, uint8 m1, uint8 s1, uint8 f1, uint8 m2, uint8 s2, uint8 f2) { return false; }
-bool SysCDStop(void *fh, uint8 m, uint8 s, uint8 f) { return true; }
-bool SysCDGetPosition(void *fh, uint8 *pos) { return false; }
-bool SysCDScan(void *fh, uint8 m, uint8 s, uint8 f, bool reverse) { return false; }
-bool SysCDReadTOC(void *fh, uint8 *toc) { return false; }
-bool SysFormat(void *fh) { return false; }
-
-// Timer stubs
-void timer_current_time(struct timeval &tv) { gettimeofday(&tv, NULL); }
-void timer_add_time(struct timeval &res, struct timeval a, struct timeval b) {
-	res.tv_sec = a.tv_sec + b.tv_sec;
-	res.tv_usec = a.tv_usec + b.tv_usec;
-	if (res.tv_usec >= 1000000) { res.tv_sec++; res.tv_usec -= 1000000; }
-}
-void timer_sub_time(struct timeval &res, struct timeval a, struct timeval b) {
-	res.tv_sec = a.tv_sec - b.tv_sec;
-	res.tv_usec = a.tv_usec - b.tv_usec;
-	if (res.tv_usec < 0) { res.tv_sec--; res.tv_usec += 1000000; }
-}
-int32 timer_host2mac_time(struct timeval tv) { return tv.tv_sec * 1000000 + tv.tv_usec; }
-void timer_mac2host_time(struct timeval &tv, int32 mac_time) {
-	tv.tv_sec = mac_time / 1000000;
-	tv.tv_usec = mac_time % 1000000;
-}
-int timer_cmp_time(struct timeval a, struct timeval b) {
-	if (a.tv_sec < b.tv_sec) return -1;
-	if (a.tv_sec > b.tv_sec) return 1;
-	if (a.tv_usec < b.tv_usec) return -1;
-	if (a.tv_usec > b.tv_usec) return 1;
-	return 0;
-}
-
-// Mutex stubs (not used in minimal test)
-struct B2_mutex { int dummy; };
-B2_mutex *B2_create_mutex() { return new B2_mutex(); }
-void B2_delete_mutex(B2_mutex *m) { delete m; }
-void B2_lock_mutex(B2_mutex *m) {}
-void B2_unlock_mutex(B2_mutex *m) {}
-
-// Interrupt stubs (TriggerInterrupt is in basilisk_glue.cpp)
-void SetInterruptFlag(uint32 flag) { InterruptFlags |= flag; }
-void ClearInterruptFlag(uint32 flag) { InterruptFlags &= ~flag; }
-
-// CPU emulation stubs - Init680x0, Execute68k, Execute68kTrap are now in basilisk_glue.cpp
-// (when using dualcpu backend)
-void FlushCodeCache(void *start, uint32 size) {}
-
-// ExtFS stubs
-ssize_t extfs_read(int fd, void *buf, size_t len) { return -1; }
-ssize_t extfs_write(int fd, void *buf, size_t len) { return -1; }
-int extfs_remove(const char *path) { return -1; }
-int extfs_rename(const char *old_path, const char *new_path) { return -1; }
-void get_finfo(const char *path, uint32 finfo, uint32 fxinfo, bool is_dir) {}
-void set_finfo(const char *path, uint32 finfo, uint32 fxinfo, bool is_dir) {}
-void close_rfork(const char *path, int fd) {}
-int open_rfork(const char *path, int flag) { return -1; }
-off_t get_rfork_size(const char *path) { return 0; }
-const char *host_encoding_to_macroman(const char *str) { return str; }
-const char *macroman_to_host_encoding(const char *str) { return str; }
-void add_path_component(char *path, const char *component) {}
-void extfs_init() {}
-void extfs_exit() {}
-
-// Scratch memory (not used in minimal test)
-uint8 *ScratchMem = NULL;
+// NOTE: Most stubs have been moved to platform_null.cpp and are linked from libdrivers.a
+// Only test-specific overrides remain here.
 
 int main(int argc, char **argv)
 {
 	printf("=== macemu-next Boot Test ===\n\n");
+
+	// Initialize platform with null drivers
+	platform_init();
 
 	// Check for ROM file argument
 	if (argc < 2) {
