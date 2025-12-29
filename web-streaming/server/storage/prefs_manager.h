@@ -41,6 +41,21 @@ void create_minimal_prefs_if_needed(const std::string& prefs_path);
  */
 CodecType read_webcodec_pref(const std::string& prefs_path);
 
+/**
+ * Read mousemode preference from prefs file
+ * @param prefs_path Path to prefs file
+ * @return Mouse mode string: "relative" or "absolute" (defaults to "absolute")
+ */
+std::string read_mousemode_pref(const std::string& prefs_path);
+
+/**
+ * Write mousemode preference to prefs file
+ * @param prefs_path Path to prefs file
+ * @param mousemode Mouse mode: "relative" or "absolute"
+ * @return true if successful, false otherwise
+ */
+bool write_mousemode_pref(const std::string& prefs_path, const std::string& mousemode);
+
 } // namespace storage
 
 #endif // PREFS_MANAGER_H

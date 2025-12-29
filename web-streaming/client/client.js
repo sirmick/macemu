@@ -2672,7 +2672,7 @@ function clearLog() {
     logger.clear();
 }
 
-function changeMouseMode() {
+async function changeMouseMode() {
     const select = document.getElementById('mouse-mode-select');
     if (!select || !client) return;
 
@@ -2688,6 +2688,23 @@ function changeMouseMode() {
 
     // Send mode change notification to server/emulator
     client.sendMouseModeChange(newMode);
+
+    // Save to config file
+    try {
+        const response = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mousemode: newMode })
+        });
+        const result = await response.json();
+        if (result.success) {
+            logger.info('Mouse mode saved to config', { mode: newMode });
+        } else {
+            logger.warn('Failed to save mouse mode to config', { error: result.error });
+        }
+    } catch (e) {
+        logger.warn('Error saving mouse mode to config', { error: e.message });
+    }
 }
 
 // Known ROM database with checksums and recommendations

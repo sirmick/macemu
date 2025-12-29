@@ -74,6 +74,9 @@ void create_minimal_prefs_if_needed(const std::string& prefs_path) {
         "# Video codec for web streaming (png, h264, av1, or vp9)\n"
         "webcodec png\n"
         "\n"
+        "# Mouse mode for web streaming (relative or absolute)\n"
+        "mousemode absolute\n"
+        "\n"
         "# JIT settings\n"
         "jitfpu true\n"
         "jitcachesize 8192\n"
@@ -155,6 +158,99 @@ CodecType read_webcodec_pref(const std::string& prefs_path) {
     // Not found - default to PNG
     fprintf(stderr, "Config: webcodec not set, defaulting to PNG\n");
     return CodecType::PNG;
+}
+
+// Read mousemode preference from prefs file
+std::string read_mousemode_pref(const std::string& prefs_path) {
+    std::ifstream file(prefs_path);
+    if (!file) {
+        fprintf(stderr, "Config: No prefs file, defaulting to absolute mouse mode\n");
+        return "absolute";
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#') continue;
+
+        // Look for "mousemode" preference
+        if (line.rfind("mousemode ", 0) == 0) {
+            std::string value = line.substr(10);
+            // Trim whitespace
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r')) {
+                value.pop_back();
+            }
+
+            if (value == "relative" || value == "absolute") {
+                fprintf(stderr, "Config: mousemode = %s\n", value.c_str());
+                return value;
+            } else {
+                fprintf(stderr, "Config: Unknown mousemode '%s', defaulting to absolute\n", value.c_str());
+                return "absolute";
+            }
+        }
+    }
+
+    // Not found - default to absolute
+    fprintf(stderr, "Config: mousemode not set, defaulting to absolute\n");
+    return "absolute";
+}
+
+// Write mousemode preference to prefs file
+bool write_mousemode_pref(const std::string& prefs_path, const std::string& mousemode) {
+    // Validate mousemode
+    if (mousemode != "relative" && mousemode != "absolute") {
+        fprintf(stderr, "Config: Invalid mousemode '%s', must be 'relative' or 'absolute'\n", mousemode.c_str());
+        return false;
+    }
+
+    // Read entire file
+    std::string content = read_prefs_file(prefs_path);
+    if (content.empty()) {
+        fprintf(stderr, "Config: No prefs file to update\n");
+        return false;
+    }
+
+    // Parse lines and update mousemode
+    std::stringstream input(content);
+    std::stringstream output;
+    std::string line;
+    bool found = false;
+
+    while (std::getline(input, line)) {
+        if (line.rfind("mousemode ", 0) == 0) {
+            // Update existing mousemode line
+            output << "mousemode " << mousemode << "\n";
+            found = true;
+        } else {
+            output << line << "\n";
+        }
+    }
+
+    // If mousemode wasn't found, add it after webcodec
+    if (!found) {
+        std::stringstream input2(content);
+        output.str("");
+        output.clear();
+
+        while (std::getline(input2, line)) {
+            output << line << "\n";
+            if (line.rfind("webcodec ", 0) == 0) {
+                output << "\n# Mouse mode for web streaming (relative or absolute)\n";
+                output << "mousemode " << mousemode << "\n";
+                found = true;
+            }
+        }
+    }
+
+    // Write back to file
+    if (!write_prefs_file(prefs_path, output.str())) {
+        fprintf(stderr, "Config: Failed to write mousemode preference\n");
+        return false;
+    }
+
+    fprintf(stderr, "Config: Updated mousemode = %s\n", mousemode.c_str());
+    return true;
 }
 
 } // namespace storage

@@ -33,6 +33,9 @@ Response APIRouter::handle(const Request& req, bool* handled) {
     if (req.path == "/api/config" && req.method == "GET") {
         return handle_config(req);
     }
+    if (req.path == "/api/config" && req.method == "POST") {
+        return handle_config_post(req);
+    }
     if (req.path == "/api/storage" && req.method == "GET") {
         return handle_storage(req);
     }
@@ -134,6 +137,28 @@ Response APIRouter::handle_config(const Request& req) {
     json << ", \"resolution\": \"" << storage::json_escape(resolution) << "\"";
     json << "}";
     return Response::json(json.str());
+}
+
+Response APIRouter::handle_config_post(const Request& req) {
+    // Parse JSON body
+    auto j = json_utils::parse(req.body);
+
+    // Check if mousemode is being updated
+    if (j.contains("mousemode")) {
+        std::string mousemode = json_utils::get_string(j, "mousemode");
+        if (mousemode == "relative" || mousemode == "absolute") {
+            if (storage::write_mousemode_pref(ctx_->prefs_path, mousemode)) {
+                fprintf(stderr, "Config: Updated mousemode to '%s'\n", mousemode.c_str());
+                return Response::json("{\"success\": true}");
+            } else {
+                return Response::json("{\"success\": false, \"error\": \"Failed to write mousemode\"}");
+            }
+        } else {
+            return Response::json("{\"success\": false, \"error\": \"Invalid mousemode value\"}");
+        }
+    }
+
+    return Response::json("{\"success\": false, \"error\": \"No valid config parameter provided\"}");
 }
 
 Response APIRouter::handle_storage(const Request& req) {

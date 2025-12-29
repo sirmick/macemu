@@ -63,6 +63,7 @@ public:
 
 private:
     Response handle_config(const Request& req);
+    Response handle_config_post(const Request& req);
     Response handle_storage(const Request& req);
     Response handle_prefs_get(const Request& req);
     Response handle_prefs_post(const Request& req);
