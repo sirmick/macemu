@@ -24,8 +24,7 @@ struct UnicornCPU {
     void *memory_user_data;
     uc_hook mem_hook_handle;
 
-    uc_hook invalid_insn_hook;  // UNUSED - UC_HOOK_INSN_INVALID doesn't work for M68K exceptions
-    uc_hook code_hook;           // UC_HOOK_CODE to intercept EmulOps before exception
+    uc_hook invalid_insn_hook;  // UC_HOOK_INSN_INVALID (now works with m68k_stop_interrupt)
 };
 
 /* Helper: Convert uc_err to string and store in cpu->error */
@@ -35,54 +34,9 @@ static void set_error(UnicornCPU *cpu, uc_err err) {
     }
 }
 
-/* Code hook for EmulOp/trap interception (called BEFORE execution) */
-static void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-    UnicornCPU *cpu = (UnicornCPU *)user_data;
-    uint32_t pc = (uint32_t)address;
-    uint16_t opcode;
-
-    /* Read the opcode at this address */
-    uc_mem_read(uc, pc, &opcode, sizeof(opcode));
-
-    /* M68K is big-endian, swap if needed */
-    #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    opcode = __builtin_bswap16(opcode);
-    #endif
-
-    /* Check if EmulOp (0x71xx for M68K) */
-    if ((opcode & 0xFF00) == 0x7100) {
-        if (g_platform.emulop_handler) {
-            bool pc_advanced = g_platform.emulop_handler(opcode, false);
-            if (!pc_advanced) {
-                pc += 2;
-                uc_reg_write(uc, UC_M68K_REG_PC, &pc);
-            }
-            /* Stop execution after handling EmulOp */
-            uc_emu_stop(uc);
-            return;
-        }
-    }
-
-    /* Check for A-line trap (0xAxxx) */
-    if ((opcode & 0xF000) == 0xA000) {
-        if (g_platform.trap_handler) {
-            g_platform.trap_handler(0xA, opcode, false);
-            uc_emu_stop(uc);
-            return;
-        }
-    }
-
-    /* Check for F-line trap (0xFxxx) */
-    if ((opcode & 0xF000) == 0xF000) {
-        if (g_platform.trap_handler) {
-            g_platform.trap_handler(0xB, opcode, false);
-            uc_emu_stop(uc);
-            return;
-        }
-    }
-}
-
-/* Invalid instruction hook for EmulOp handling (UNUSED - see hook_code instead) */
+/* Invalid instruction hook for EmulOp/trap handling
+ * NOTE: Requires m68k_stop_interrupt() patch in Unicorn (see external/unicorn/qemu/target/m68k/unicorn.c)
+ */
 static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
     UnicornCPU *cpu = (UnicornCPU *)user_data;
     uint32_t pc;
@@ -500,15 +454,13 @@ void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *us
     cpu->emulop_handler = handler;
     cpu->emulop_user_data = user_data;
 
-    if (handler && !cpu->code_hook) {
-        /* Use UC_HOOK_CODE to intercept ALL instructions BEFORE execution */
-        /* This allows us to catch EmulOps before Unicorn throws an exception */
-        /* NOTE: UC_HOOK_INSN_INVALID doesn't work for M68K - exceptions are thrown first */
-        uc_hook_add(cpu->uc, &cpu->code_hook, UC_HOOK_CODE,
-                   (void *)hook_code, cpu, 1, 0);
-    } else if (!handler && !cpu->exception_handler && cpu->code_hook) {
-        uc_hook_del(cpu->uc, cpu->code_hook);
-        cpu->code_hook = 0;
+    if (handler && !cpu->invalid_insn_hook) {
+        /* Use UC_HOOK_INSN_INVALID - now works with m68k_stop_interrupt() */
+        uc_hook_add(cpu->uc, &cpu->invalid_insn_hook, UC_HOOK_INSN_INVALID,
+                   (void *)hook_invalid_insn, cpu, 1, 0);
+    } else if (!handler && !cpu->exception_handler && cpu->invalid_insn_hook) {
+        uc_hook_del(cpu->uc, cpu->invalid_insn_hook);
+        cpu->invalid_insn_hook = 0;
     }
 }
 
