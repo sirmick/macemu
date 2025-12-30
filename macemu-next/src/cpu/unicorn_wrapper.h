@@ -28,6 +28,9 @@ typedef enum {
 /* EmulOp handler callback - called when illegal instruction (0x71xx) is executed */
 typedef void (*EmulOpHandler)(uint16_t opcode, void *user_data);
 
+/* Exception handler callback - called for A-line/F-line traps */
+typedef void (*ExceptionHandler)(UnicornCPU *cpu, int vector_nr, uint16_t opcode);
+
 /* Memory access hook callback */
 typedef enum {
     UCPU_MEM_READ,
@@ -82,7 +85,11 @@ void unicorn_set_msr(UnicornCPU *cpu, uint32_t value);
 
 /* Hooks */
 void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *user_data);
+void unicorn_set_exception_handler(UnicornCPU *cpu, ExceptionHandler handler);
 void unicorn_set_memory_hook(UnicornCPU *cpu, MemoryHookCallback callback, void *user_data);
+
+/* Internal access (for exception handler) */
+void* unicorn_get_uc(UnicornCPU *cpu);  /* Returns uc_engine* - for exception.c only */
 
 /* Error handling */
 const char* unicorn_get_error(UnicornCPU *cpu);

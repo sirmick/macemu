@@ -17,6 +17,8 @@ struct UnicornCPU {
     EmulOpHandler emulop_handler;
     void *emulop_user_data;
 
+    ExceptionHandler exception_handler;
+
     MemoryHookCallback memory_hook;
     void *memory_user_data;
     uc_hook mem_hook_handle;
@@ -56,7 +58,23 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
         }
     }
 
-    return false;  /* Not an EmulOp, raise exception */
+    /* Check for A-line trap (0xAxxx) */
+    if ((opcode & 0xF000) == 0xA000) {
+        if (cpu->exception_handler) {
+            cpu->exception_handler(cpu, 10, opcode);
+            return true;  /* Handled */
+        }
+    }
+
+    /* Check for F-line trap (0xFxxx) */
+    if ((opcode & 0xF000) == 0xF000) {
+        if (cpu->exception_handler) {
+            cpu->exception_handler(cpu, 11, opcode);
+            return true;  /* Handled */
+        }
+    }
+
+    return false;  /* Not handled, raise exception */
 }
 
 /* Memory access hook */
@@ -359,10 +377,24 @@ void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *us
     cpu->emulop_handler = handler;
     cpu->emulop_user_data = user_data;
 
-    if (handler) {
+    if (handler && !cpu->invalid_insn_hook) {
         uc_hook_add(cpu->uc, &cpu->invalid_insn_hook, UC_HOOK_INSN_INVALID,
                    (void *)hook_invalid_insn, cpu, 1, 0);
-    } else if (cpu->invalid_insn_hook) {
+    } else if (!handler && !cpu->exception_handler && cpu->invalid_insn_hook) {
+        uc_hook_del(cpu->uc, cpu->invalid_insn_hook);
+        cpu->invalid_insn_hook = 0;
+    }
+}
+
+void unicorn_set_exception_handler(UnicornCPU *cpu, ExceptionHandler handler) {
+    if (!cpu || !cpu->uc) return;
+
+    cpu->exception_handler = handler;
+
+    if (handler && !cpu->invalid_insn_hook) {
+        uc_hook_add(cpu->uc, &cpu->invalid_insn_hook, UC_HOOK_INSN_INVALID,
+                   (void *)hook_invalid_insn, cpu, 1, 0);
+    } else if (!handler && !cpu->emulop_handler && cpu->invalid_insn_hook) {
         uc_hook_del(cpu->uc, cpu->invalid_insn_hook);
         cpu->invalid_insn_hook = 0;
     }
@@ -382,6 +414,11 @@ void unicorn_set_memory_hook(UnicornCPU *cpu, MemoryHookCallback callback, void 
         uc_hook_del(cpu->uc, cpu->mem_hook_handle);
         cpu->mem_hook_handle = 0;
     }
+}
+
+/* Internal access (for exception handler) */
+void* unicorn_get_uc(UnicornCPU *cpu) {
+    return cpu ? cpu->uc : NULL;
 }
 
 /* Error handling */

@@ -5,6 +5,7 @@ cpu_sources = [
   'cpu_dualcpu.c',            # DualCPU backend for platform API
   'uae_wrapper.cpp',          # UAE CPU wrapper
   'unicorn_wrapper.c',        # Unicorn wrapper
+  'unicorn_exception.c',      # Exception simulation for Unicorn
   'unicorn_validation.cpp',   # Validation module (used by dualcpu)
 ]
 

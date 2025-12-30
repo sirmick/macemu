@@ -7,6 +7,7 @@
 #include <string.h>
 #include "unicorn_validation.h"
 #include "unicorn_wrapper.h"
+#include "unicorn_exception.h"
 #include "uae_wrapper.h"
 #include "sysdeps.h"
 #include "cpu_emulation.h"
@@ -71,6 +72,10 @@ bool unicorn_validation_init(void) {
     // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
     // State will be synced on first instruction execution in unicorn_validation_step()
     printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
+
+    // Register exception handler for A-line/F-line traps
+    unicorn_set_exception_handler(validation_state.unicorn, unicorn_simulate_exception);
+    printf("✓ Exception handler registered (A-line/F-line)\n");
 
     // Open log file
     validation_state.log_file = fopen("cpu_validation.log", "w");
@@ -187,6 +192,30 @@ bool unicorn_validation_step(void) {
 
         validation_state.last_good_pc = uae_get_pc();
         return true;  // EMUL_OP handled, no divergence to report
+    }
+
+    // Check if this is an A-line or F-line trap
+    bool is_aline = (opcode & 0xF000) == 0xA000;
+    bool is_fline = (opcode & 0xF000) == 0xF000;
+
+    if (is_aline || is_fline) {
+        // Execute on UAE (it will handle the exception)
+        uae_cpu_execute_one();
+
+        // For now, just sync state from UAE to Unicorn without executing on Unicorn
+        // TODO: Make Unicorn handle A-line/F-line exceptions properly
+        for (int i = 0; i < 8; i++) {
+            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
+            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+        }
+        unicorn_set_pc(validation_state.unicorn, uae_get_pc());
+        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
+
+        // Sync all RAM (exception handlers write to stack, etc.)
+        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+
+        validation_state.last_good_pc = uae_get_pc();
+        return true;  // Exception handled, no divergence to report
     }
 
     // Normal instruction - capture state before

@@ -7,6 +7,7 @@
 
 #include "platform.h"
 #include "unicorn_wrapper.h"
+#include "unicorn_exception.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -26,6 +27,9 @@ static bool unicorn_backend_init(void) {
 		fprintf(stderr, "Failed to create Unicorn CPU\n");
 		return false;
 	}
+
+	// Register exception handler for A-line/F-line traps
+	unicorn_set_exception_handler(unicorn_cpu, unicorn_simulate_exception);
 
 	return true;
 }
