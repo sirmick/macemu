@@ -1278,6 +1278,7 @@ void m68k_emulop(uae_u32 opcode)
 	/* Check if platform handler is registered (g_platform declared in platform.h) */
 	if (g_platform.emulop_handler) {
 		/* Platform handler takes over - pass is_primary=true for UAE */
+		/* UAE always advances PC in caller, so we ignore the return value */
 		g_platform.emulop_handler((uint16_t)opcode, true);
 		return;
 	}

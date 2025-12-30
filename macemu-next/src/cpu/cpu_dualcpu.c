@@ -182,10 +182,11 @@ void cpu_dualcpu_install(Platform *p) {
 	// Interrupts
 	p->cpu_trigger_interrupt = dualcpu_backend_trigger_interrupt;
 
-	// EmulOp/Trap handlers - called by both CPUs with is_primary flag
-	// UAE is always primary in dual-CPU validation mode
-	extern void unicorn_validation_uae_emulop_primary(uint16_t opcode, bool is_primary);
-	extern void unicorn_validation_uae_trap_primary(int vector, uint16_t opcode, bool is_primary);
-	p->emulop_handler = unicorn_validation_uae_emulop_primary;
-	p->trap_handler = unicorn_validation_uae_trap_primary;
+	// EmulOp/Trap handlers - unified handlers that check DUALCPU_MASTER env var
+	// to determine which CPU is primary (UAE or Unicorn)
+	// Returns true if PC was advanced, false if caller should advance
+	extern bool unicorn_validation_unified_emulop(uint16_t opcode, bool is_primary);
+	extern bool unicorn_validation_unified_trap(int vector, uint16_t opcode, bool is_primary);
+	p->emulop_handler = unicorn_validation_unified_emulop;
+	p->trap_handler = unicorn_validation_unified_trap;
 }

@@ -44,11 +44,11 @@ static struct {
     uint32_t last_good_pc;
 } validation_state = {0};
 
-/* Forward declarations for hook handlers */
-static void uae_emulop_hook(uint16_t opcode, void *user_data);
-static void uae_trap_hook(int vector, uint16_t opcode, void *user_data);
-static void unicorn_emulop_hook(uint16_t opcode, void *user_data);
-static void unicorn_exception_hook(UnicornCPU *cpu, int vector_nr, uint16_t opcode);
+/* Dummy handler to trigger invalid instruction hook registration */
+static void dummy_emulop(uint16_t opcode, void *user_data) {
+    (void)opcode;
+    (void)user_data;
+}
 
 /* Initialize validation */
 bool unicorn_validation_init(void) {
@@ -142,7 +142,12 @@ bool unicorn_validation_init(void) {
     printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
 
     // NOTE: EmulOp/trap handlers are now registered by cpu_dualcpu_install() via platform API
-    // No need to register hooks here - the CPU wrappers will call platform handlers automatically
+    // However, we still need to install the invalid instruction hook on Unicorn so it can
+    // check the platform handlers. Install a dummy handler to trigger hook registration
+    // (the hook checks g_platform first, so the dummy is never actually called)
+    printf("Installing Unicorn invalid instruction hook...\n");
+    unicorn_set_emulop_handler(validation_state.unicorn, dummy_emulop, NULL);
+    printf("✓ Unicorn invalid instruction hook installed\n");
     printf("✓ Platform handlers configured by CPU backend\n");
 
     // Open log file
@@ -215,12 +220,28 @@ static uint16_t read_word_be(uint32_t addr) {
     return 0;
 }
 
-/* Hook Handlers - UAE is Master */
+/* Unified Hook Handlers - Check master_cpu to determine behavior */
 
-static void uae_emulop_hook(uint16_t opcode, bool is_primary) {
+static bool unified_emulop_handler(uint16_t opcode, bool is_uae_calling) {
     validation_state.emulop_count++;
 
-    if (is_primary) {
+    // Determine if this CPU should execute based on who's calling and who's master
+    // is_uae_calling: true = UAE is calling, false = Unicorn is calling
+    bool should_execute = false;
+
+    if (is_uae_calling && validation_state.master_cpu == MASTER_CPU_UAE) {
+        should_execute = true;  // UAE is calling and UAE is master
+    } else if (!is_uae_calling && validation_state.master_cpu == MASTER_CPU_UNICORN) {
+        should_execute = true;  // Unicorn is calling and Unicorn is master
+    }
+
+    if (!should_execute) {
+        // This CPU is secondary: Skip execution, state will be synced from primary
+        return false;  // Caller should advance PC
+    }
+
+    // This CPU is primary: Execute and sync to secondary
+    if (validation_state.master_cpu == MASTER_CPU_UAE) {
         // UAE is primary: Execute EmulOp and sync to Unicorn
         struct M68kRegisters regs;
         for (int i = 0; i < 8; i++) {
@@ -253,16 +274,65 @@ static void uae_emulop_hook(uint16_t opcode, bool is_primary) {
 
         // Sync all RAM (EmulOp can write anywhere)
         unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        return false;  // UAE advances PC in caller
     } else {
-        // Unicorn is secondary: Just skip the instruction, state will be synced from UAE
-        // (PC is advanced by Unicorn wrapper, no further action needed)
+        // Unicorn is primary: Execute EmulOp and sync to UAE
+        struct M68kRegisters regs;
+        for (int i = 0; i < 8; i++) {
+            regs.d[i] = unicorn_get_dreg(validation_state.unicorn, i);
+            regs.a[i] = unicorn_get_areg(validation_state.unicorn, i);
+        }
+        regs.sr = unicorn_get_sr(validation_state.unicorn);
+
+        // Call EmulOp handler
+        extern void EmulOp(uint16 opcode, struct M68kRegisters *r);
+        EmulOp(opcode, &regs);
+
+        // Write registers back to Unicorn
+        for (int i = 0; i < 8; i++) {
+            unicorn_set_dreg(validation_state.unicorn, i, regs.d[i]);
+            unicorn_set_areg(validation_state.unicorn, i, regs.a[i]);
+        }
+        unicorn_set_sr(validation_state.unicorn, regs.sr);
+
+        // Advance PC past EmulOp
+        uint32_t current_pc = unicorn_get_pc(validation_state.unicorn);
+        unicorn_set_pc(validation_state.unicorn, current_pc + 2);
+
+        // Sync entire state from Unicorn to UAE
+        for (int i = 0; i < 8; i++) {
+            uae_set_dreg(i, regs.d[i]);
+            uae_set_areg(i, regs.a[i]);
+        }
+        uint32_t new_pc = unicorn_get_pc(validation_state.unicorn);
+        uae_set_pc(new_pc);
+        uae_set_sr(regs.sr);
+
+        // Sync all RAM (EmulOp can write anywhere)
+        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        return true;  // We advanced PC ourselves
     }
 }
 
-static void uae_trap_hook(int vector, uint16_t opcode, bool is_primary) {
+static bool unified_trap_handler(int vector, uint16_t opcode, bool is_uae_calling) {
     (void)opcode;
 
-    if (is_primary) {
+    // Determine if this CPU should execute based on who's calling and who's master
+    bool should_execute = false;
+
+    if (is_uae_calling && validation_state.master_cpu == MASTER_CPU_UAE) {
+        should_execute = true;  // UAE is calling and UAE is master
+    } else if (!is_uae_calling && validation_state.master_cpu == MASTER_CPU_UNICORN) {
+        should_execute = true;  // Unicorn is calling and Unicorn is master
+    }
+
+    if (!should_execute) {
+        // This CPU is secondary: Skip execution, state will be synced from primary
+        return false;  // Caller advances PC (though traps may change it)
+    }
+
+    // This CPU is primary: Execute and sync to secondary
+    if (validation_state.master_cpu == MASTER_CPU_UAE) {
         // UAE is primary: Execute trap and sync to Unicorn
         extern void Exception(int nr, uaecptr oldpc);
         Exception(vector, 0);
@@ -277,69 +347,27 @@ static void uae_trap_hook(int vector, uint16_t opcode, bool is_primary) {
 
         // Sync all RAM
         unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        return false;  // UAE's Exception() advances PC
     } else {
-        // Unicorn is secondary: Skip, state will be synced from UAE
+        // Unicorn is primary: Execute trap and sync to UAE
+        // Unicorn handles the exception via unicorn_exception.c
+        extern void unicorn_simulate_exception(UnicornCPU *cpu, int vector_nr, uint16_t opcode);
+        unicorn_simulate_exception(validation_state.unicorn, vector, opcode);
+
+        // Sync entire state from Unicorn to UAE
+        for (int i = 0; i < 8; i++) {
+            uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
+            uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
+        }
+        uae_set_pc(unicorn_get_pc(validation_state.unicorn));
+        uae_set_sr(unicorn_get_sr(validation_state.unicorn));
+
+        // Sync all RAM
+        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        return true;  // unicorn_simulate_exception advances PC
     }
 }
 
-/* Hook Handlers - Unicorn is Master */
-
-static void unicorn_emulop_hook(uint16_t opcode, void *user_data) {
-    (void)user_data;
-    validation_state.emulop_count++;
-
-    // Build M68kRegisters struct from Unicorn state
-    struct M68kRegisters regs;
-    for (int i = 0; i < 8; i++) {
-        regs.d[i] = unicorn_get_dreg(validation_state.unicorn, i);
-        regs.a[i] = unicorn_get_areg(validation_state.unicorn, i);
-    }
-    regs.sr = unicorn_get_sr(validation_state.unicorn);
-
-    // Call EmulOp handler
-    extern void EmulOp(uint16 opcode, struct M68kRegisters *r);
-    EmulOp(opcode, &regs);
-
-    // Write registers back to Unicorn
-    for (int i = 0; i < 8; i++) {
-        unicorn_set_dreg(validation_state.unicorn, i, regs.d[i]);
-        unicorn_set_areg(validation_state.unicorn, i, regs.a[i]);
-    }
-    unicorn_set_sr(validation_state.unicorn, regs.sr);
-
-    // Note: Unicorn wrapper already advances PC by 2
-
-    // Sync entire state from Unicorn to UAE
-    for (int i = 0; i < 8; i++) {
-        uae_set_dreg(i, regs.d[i]);
-        uae_set_areg(i, regs.a[i]);
-    }
-    uint32_t new_pc = unicorn_get_pc(validation_state.unicorn);
-    uae_set_pc(new_pc);
-    uae_set_sr(regs.sr);
-
-    // Sync all RAM (EmulOp can write anywhere)
-    unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-}
-
-static void unicorn_exception_hook(UnicornCPU *cpu, int vector_nr, uint16_t opcode) {
-    (void)cpu;
-    (void)opcode;
-
-    // Unicorn handles the exception via unicorn_exception.c
-    // We just need to sync state to UAE after exception handling
-
-    // Sync entire state from Unicorn to UAE
-    for (int i = 0; i < 8; i++) {
-        uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
-        uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
-    }
-    uae_set_pc(unicorn_get_pc(validation_state.unicorn));
-    uae_set_sr(unicorn_get_sr(validation_state.unicorn));
-
-    // Sync all RAM
-    unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-}
 
 /* Validate one instruction */
 bool unicorn_validation_step(void) {
@@ -366,11 +394,17 @@ bool unicorn_validation_step(void) {
 
     validation_state.instruction_count++;
 
-    // Get current PC and opcode (hooks will handle EmulOps and traps automatically)
+    // Get current PC and opcode
     uint32_t pc = uae_get_pc();
     uint16_t opcode = read_word_be(pc);
 
-    // Normal instruction - capture state before
+    // Detect EmulOps (0x71xx) and Traps (0xAxxx, 0xFxxx)
+    bool is_emulop = (opcode & 0xFF00) == 0x7100;
+    bool is_a_trap = (opcode & 0xF000) == 0xA000;
+    bool is_f_trap = (opcode & 0xF000) == 0xF000;
+    bool is_special = is_emulop || is_a_trap || is_f_trap;
+
+    // Capture state before
     uint32_t uae_pc_before = pc;
     uint32_t uae_dregs_before[8], uae_aregs_before[8];
     uint16_t uae_sr_before = uae_get_sr();
@@ -380,7 +414,7 @@ bool unicorn_validation_step(void) {
         uae_aregs_before[i] = uae_get_areg(i);
     }
 
-    // Execute on UAE
+    // Execute on UAE (platform handler will be called for EmulOps/traps)
     uae_cpu_execute_one();
 
     // Capture state after
@@ -398,7 +432,30 @@ bool unicorn_validation_step(void) {
     unicorn_set_cacr(validation_state.unicorn, uae_get_cacr());
     unicorn_set_vbr(validation_state.unicorn, uae_get_vbr());
 
-    // Execute on Unicorn
+    // For EmulOps/traps when UAE is primary: Skip Unicorn execution
+    // The unified handler already executed on UAE and synced state to Unicorn
+    if (is_special && validation_state.master_cpu == MASTER_CPU_UAE) {
+        // State already synced by unified handler, just validate
+        validation_state.last_good_pc = uae_pc_after;
+        return true;
+    }
+
+    // For EmulOps/traps when Unicorn is primary: Skip UAE execution result, run on Unicorn
+    // The UAE execution was just to keep it in sync, Unicorn will execute and sync back
+    if (is_special && validation_state.master_cpu == MASTER_CPU_UNICORN) {
+        // Execute on Unicorn (platform handler will execute and sync to UAE)
+        if (!unicorn_execute_one(validation_state.unicorn)) {
+            fprintf(stderr, "\n❌ Unicorn execution failed at PC=0x%08X\n", uae_pc_before);
+            fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
+            validation_state.divergence_count++;
+            return false;
+        }
+        // State synced by unified handler, validate
+        validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
+        return true;
+    }
+
+    // Normal instruction - Execute on Unicorn
     if (!unicorn_execute_one(validation_state.unicorn)) {
         // Unicorn execution failed - dump full CPU state for debugging
         fprintf(stderr, "\n❌ Unicorn execution failed at PC=0x%08X\n", uae_pc_before);
@@ -627,23 +684,12 @@ void unicorn_validation_get_stats(uint64_t *instructions, uint64_t *divergences)
     if (divergences) *divergences = validation_state.divergence_count;
 }
 
-/* Platform EmulOp/Trap Handlers - UAE is Primary */
+/* Platform EmulOp/Trap Handlers - Unified (checks master_cpu) */
 
-void unicorn_validation_uae_emulop_primary(uint16_t opcode, bool is_primary) {
-    uae_emulop_hook(opcode, is_primary);
+bool unicorn_validation_unified_emulop(uint16_t opcode, bool is_primary) {
+    return unified_emulop_handler(opcode, is_primary);
 }
 
-void unicorn_validation_uae_trap_primary(int vector, uint16_t opcode, bool is_primary) {
-    uae_trap_hook(vector, opcode, is_primary);
-}
-
-/* Platform EmulOp/Trap Handlers - Unicorn is Primary */
-
-void unicorn_validation_unicorn_emulop_primary(uint16_t opcode) {
-    unicorn_emulop_hook(opcode, NULL);
-}
-
-void unicorn_validation_unicorn_trap_primary(int vector, uint16_t opcode) {
-    (void)vector;  // Vector passed in opcode for Unicorn
-    unicorn_exception_hook(validation_state.unicorn, vector, opcode);
+bool unicorn_validation_unified_trap(int vector, uint16_t opcode, bool is_primary) {
+    return unified_trap_handler(vector, opcode, is_primary);
 }

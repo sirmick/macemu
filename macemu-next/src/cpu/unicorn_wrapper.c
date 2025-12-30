@@ -54,10 +54,12 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
     if ((opcode & 0xFF00) == 0x7100) {
         if (g_platform.emulop_handler) {
             /* Platform handler - pass is_primary=false for Unicorn */
-            g_platform.emulop_handler(opcode, false);
-            /* Advance past EmulOp */
-            pc += 2;
-            uc_reg_write(uc, UC_M68K_REG_PC, &pc);
+            bool pc_advanced = g_platform.emulop_handler(opcode, false);
+            /* Advance past EmulOp only if handler didn't */
+            if (!pc_advanced) {
+                pc += 2;
+                uc_reg_write(uc, UC_M68K_REG_PC, &pc);
+            }
             return true;
         }
         /* Fallback to per-CPU handler */
@@ -74,6 +76,7 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
         if (g_platform.trap_handler) {
             /* Platform handler - pass is_primary=false for Unicorn */
             g_platform.trap_handler(0xA, opcode, false);
+            /* Handler handles PC advancement for traps */
             return true;
         }
         /* Fallback to per-CPU handler */
@@ -86,7 +89,9 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
     /* Check for F-line trap (0xFxxx) */
     if ((opcode & 0xF000) == 0xF000) {
         if (g_platform.trap_handler) {
+            /* Platform handler - pass is_primary=false for Unicorn */
             g_platform.trap_handler(0xB, opcode, false);
+            /* Handler handles PC advancement for traps */
             return true;
         }
         /* Fallback to per-CPU handler */

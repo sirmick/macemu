@@ -65,12 +65,23 @@ void unicorn_validation_get_stats(uint64_t *instructions, uint64_t *divergences)
  * Platform EmulOp/Trap Handlers
  *
  * These are called by the CPU wrappers when EmulOps or traps are encountered.
- * In dual-CPU mode, one CPU acts as primary (executes operation) and one as secondary (skips operation).
+ * The handlers automatically check validation_state.master_cpu to determine
+ * which CPU should execute the operation and which should skip.
+ *
+ * is_primary indicates which CPU is calling:
+ * - UAE wrapper calls with is_primary=true
+ * - Unicorn wrapper calls with is_primary=false
+ *
+ * The handler then checks DUALCPU_MASTER env var to decide:
+ * - If master_cpu==UAE and is_primary==true: execute and sync to Unicorn
+ * - If master_cpu==UNICORN and is_primary==false: execute and sync to UAE
+ * - Otherwise: skip (secondary CPU)
  */
 
-/* Unified handlers - is_primary indicates which CPU is calling */
-void unicorn_validation_uae_emulop_primary(uint16_t opcode, bool is_primary);
-void unicorn_validation_uae_trap_primary(int vector, uint16_t opcode, bool is_primary);
+/* Unified handlers - automatically check master_cpu
+ * Returns true if PC was advanced, false if caller should advance */
+bool unicorn_validation_unified_emulop(uint16_t opcode, bool is_primary);
+bool unicorn_validation_unified_trap(int vector, uint16_t opcode, bool is_primary);
 
 #ifdef __cplusplus
 }

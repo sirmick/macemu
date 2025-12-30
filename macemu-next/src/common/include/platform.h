@@ -158,13 +158,19 @@ typedef struct {
      *
      *  is_primary=true:  This CPU should execute the operation and sync to the other CPU
      *  is_primary=false: This CPU should skip execution (state will be synced from primary)
+     *
+     *  Return value:
+     *    true  = Handler executed and advanced PC (caller should not advance PC)
+     *    false = Handler skipped execution (caller should advance PC)
      */
 
     // EmulOp handler (0x71xx illegal instructions used for emulator functions)
-    void (*emulop_handler)(uint16_t opcode, bool is_primary);
+    // Returns true if PC was advanced, false if caller should advance
+    bool (*emulop_handler)(uint16_t opcode, bool is_primary);
 
     // Trap handler (A-line and F-line exceptions)
-    void (*trap_handler)(int vector, uint16_t opcode, bool is_primary);
+    // Returns true if PC was advanced, false if caller should advance
+    bool (*trap_handler)(int vector, uint16_t opcode, bool is_primary);
 } Platform;
 
 /*
