@@ -142,12 +142,11 @@ bool unicorn_validation_init(void) {
     printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
 
     // NOTE: EmulOp/trap handlers are now registered by cpu_dualcpu_install() via platform API
-    // However, we still need to install the invalid instruction hook on Unicorn so it can
-    // check the platform handlers. Install a dummy handler to trigger hook registration
-    // (the hook checks g_platform first, so the dummy is never actually called)
-    printf("Installing Unicorn invalid instruction hook...\n");
+    // However, we still need to install the code hook on Unicorn so it can intercept
+    // EmulOps before they trigger exceptions. Install a dummy handler to trigger hook
+    // registration (the hook checks g_platform first, so the dummy is never actually called)
     unicorn_set_emulop_handler(validation_state.unicorn, dummy_emulop, NULL);
-    printf("✓ Unicorn invalid instruction hook installed\n");
+    printf("✓ Unicorn code hook installed (intercepts EmulOps/traps before execution)\n");
     printf("✓ Platform handlers configured by CPU backend\n");
 
     // Open log file
