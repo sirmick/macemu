@@ -11,6 +11,8 @@
 #include "uae_wrapper.h"
 #include "sysdeps.h"
 #include "cpu_emulation.h"
+#include "main.h"  // For M68kRegisters
+#include "emul_op.h"  // For EmulOp function
 
 // External memory pointers from BasiliskII
 extern uint32 RAMBaseMac;
@@ -257,25 +259,41 @@ bool unicorn_validation_step(void) {
 
             validation_state.last_good_pc = uae_get_pc();
         } else {
-            // Execute EMUL_OP on Unicorn, sync to UAE
-            if (!unicorn_execute_one(validation_state.unicorn)) {
-                fprintf(stderr, "\n❌ Unicorn EmulOp execution failed at PC=0x%08X\n", pc);
-                fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
-                return false;
+            // Execute EMUL_OP on Unicorn master: call EmulOp() manually
+            // Build M68kRegisters struct from Unicorn state
+            struct M68kRegisters regs;
+            for (int i = 0; i < 8; i++) {
+                regs.d[i] = unicorn_get_dreg(validation_state.unicorn, i);
+                regs.a[i] = unicorn_get_areg(validation_state.unicorn, i);
             }
+            regs.sr = unicorn_get_sr(validation_state.unicorn);
+
+            // Call EmulOp handler
+            extern void EmulOp(uint16 opcode, struct M68kRegisters *r);
+            EmulOp(opcode, &regs);
+
+            // Write registers back to Unicorn
+            for (int i = 0; i < 8; i++) {
+                unicorn_set_dreg(validation_state.unicorn, i, regs.d[i]);
+                unicorn_set_areg(validation_state.unicorn, i, regs.a[i]);
+            }
+            unicorn_set_sr(validation_state.unicorn, regs.sr);
+
+            // Advance PC past the EmulOp instruction (2 bytes)
+            unicorn_set_pc(validation_state.unicorn, pc + 2);
 
             // Sync entire state from Unicorn to UAE
             for (int i = 0; i < 8; i++) {
-                uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
-                uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
+                uae_set_dreg(i, regs.d[i]);
+                uae_set_areg(i, regs.a[i]);
             }
-            uae_set_pc(unicorn_get_pc(validation_state.unicorn));
-            uae_set_sr(unicorn_get_sr(validation_state.unicorn));
+            uae_set_pc(pc + 2);
+            uae_set_sr(regs.sr);
 
             // Sync all RAM (EMUL_OP can write anywhere)
             unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
 
-            validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
+            validation_state.last_good_pc = pc + 2;
         }
 
         return true;  // EMUL_OP handled, no divergence to report
