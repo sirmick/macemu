@@ -2772,6 +2772,7 @@ document.addEventListener('fullscreenchange', () => {
 // ============================================================================
 
 let currentConfig = {
+    emulator: 'basilisk',  // Default, will be overwritten by loadCurrentConfig()
     rom: '',
     disks: [],
     ram: 32,
@@ -3476,7 +3477,9 @@ setInterval(pollEmulatorStatus, 2000);
 
 // Initialize on page load
 window.addEventListener('DOMContentLoaded', async () => {
-    await fetchConfig();  // Load config from server
+    await fetchConfig();  // Load debug config from server
+    await loadCurrentConfig();  // Load emulator config from JSON
+    updateEmulatorPanelVisibility();  // Update header logo/title based on loaded config
     initClient();
     pollEmulatorStatus();
 });

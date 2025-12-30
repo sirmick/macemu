@@ -57,6 +57,7 @@ static uint32 current_palette[256 * 3];  // RGB triplets for indexed modes
 // Debug flags (read from environment once at startup)
 static bool g_debug_perf = false;
 static bool g_debug_mode_switch = false;
+static bool g_debug_frames = false;
 
 // Helper function for computing bytes per row
 static inline int TrivialBytesPerRow(int width, int depth_code) {
@@ -226,6 +227,8 @@ static void video_refresh_thread()
 {
     fprintf(stderr, "IPC: Video refresh thread started\n");
 
+    static uint64_t frame_count = 0;
+
     while (video_thread_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
@@ -234,6 +237,11 @@ static void video_refresh_thread()
 
         // Signal server
         macemu_frame_complete();
+
+        frame_count++;
+        if (g_debug_frames && (frame_count % 60 == 0)) {
+            fprintf(stderr, "[Emulator] Sent frame #%lu (60 fps)\n", frame_count);
+        }
 
         // 60 FPS = 16.67ms per frame
         auto frame_end = std::chrono::steady_clock::now();
@@ -260,6 +268,7 @@ bool VideoInit(void)
     // Read debug flags
     g_debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
     g_debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
+    g_debug_frames = (getenv("MACEMU_DEBUG_FRAMES") != nullptr);
 
     fprintf(stderr, "IPC: Initializing SheepShaver video driver (v3)\n");
 
