@@ -69,6 +69,9 @@ Response APIRouter::handle(const Request& req, bool* handled) {
     if (req.path == "/api/emulator/restart" && req.method == "POST") {
         return handle_emulator_restart(req);
     }
+    if (req.path == "/api/emulator/reset" && req.method == "POST") {
+        return handle_emulator_reset(req);
+    }
     if (req.path == "/api/log" && req.method == "POST") {
         return handle_log(req);
     }
@@ -311,6 +314,15 @@ Response APIRouter::handle_emulator_restart(const Request& req) {
         ctx_->request_restart_fn(true);
     }
     return Response::json("{\"success\": true, \"message\": \"Restart requested\"}");
+}
+
+Response APIRouter::handle_emulator_reset(const Request& req) {
+    // Send RESET command to running emulator (soft reset, no restart)
+    fprintf(stderr, "API: Reset requested via web UI\n");
+    if (ctx_->send_command_fn) {
+        ctx_->send_command_fn(MACEMU_CMD_RESET);
+    }
+    return Response::json("{\"success\": true, \"message\": \"Reset command sent\"}");
 }
 
 Response APIRouter::handle_log(const Request& req) {

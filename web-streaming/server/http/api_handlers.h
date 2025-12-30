@@ -80,6 +80,7 @@ private:
     Response handle_emulator_start(const Request& req);
     Response handle_emulator_stop(const Request& req);
     Response handle_emulator_restart(const Request& req);
+    Response handle_emulator_reset(const Request& req);
     Response handle_log(const Request& req);
     Response handle_error(const Request& req);
 

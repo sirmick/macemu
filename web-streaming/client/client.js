@@ -3361,8 +3361,7 @@ async function saveConfig() {
         if (data.success) {
             console.log('✅ CONFIG SAVED to macemu-config.json');
             closeConfig();
-            // Restart emulator with new config
-            restartEmulator();
+            // Don't auto-restart - user can restart manually if needed
         } else {
             logger.error('Failed to save config', { message: data.error });
         }
@@ -3415,6 +3414,12 @@ async function restartEmulator() {
     }
 }
 
+async function resetEmulator() {
+    // Reset = Restart (stop + start) since MACEMU_CMD_RESET crashes SheepShaver
+    logger.info('Resetting emulator...');
+    await restartEmulator();
+}
+
 // Codec management
 async function changeCodec() {
     const select = document.getElementById('codec-select');
@@ -3460,6 +3465,18 @@ async function pollEmulatorStatus() {
         }
         if (emuPid) {
             emuPid.textContent = 'PID: ' + (data.emulator_pid > 0 ? data.emulator_pid : '-');
+        }
+
+        // Update Start/Reset button based on emulator state
+        const startBtn = document.getElementById('start-btn');
+        if (startBtn) {
+            if (data.emulator_running) {
+                startBtn.textContent = 'Reset';
+                startBtn.onclick = resetEmulator;
+            } else {
+                startBtn.textContent = 'Start';
+                startBtn.onclick = startEmulator;
+            }
         }
 
         // Update emulator status in header status bar
