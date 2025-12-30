@@ -2159,6 +2159,16 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
         uint32_t width = g_ipc_shm->width;
         uint32_t height = g_ipc_shm->height;
 
+        // Track resolution changes
+        static uint32_t last_width = 0;
+        static uint32_t last_height = 0;
+        if (g_debug_mode_switch && (width != last_width || height != last_height)) {
+            fprintf(stderr, "[MODE] Server detected resolution change: %dx%d -> %dx%d\n",
+                    last_width, last_height, width, height);
+            last_width = width;
+            last_height = height;
+        }
+
         if (width == 0 || height == 0 || width > MACEMU_MAX_WIDTH || height > MACEMU_MAX_HEIGHT) {
             continue;
         }

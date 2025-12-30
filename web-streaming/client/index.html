@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MacEmu Web - WebRTC Streaming</title>
     <link rel="stylesheet" href="styles.css">
+
+    <!-- Server-injected configuration (eliminates race conditions) -->
+    <script id="server-config" type="application/json">
+{{CONFIG_JSON}}
+    </script>
 </head>
 <body>
     <header>
@@ -38,25 +43,25 @@
             </div>
             <div class="codec-selector">
                 <label for="codec-select">Codec:</label>
-                <select id="codec-select" onchange="changeCodec()" disabled>
-                    <option value="png">PNG</option>
-                    <option value="h264">H.264</option>
-                    <option value="av1">AV1</option>
-                    <option value="vp9">VP9</option>
+                <select id="codec-select" disabled>
+                    <option value="png" {{SELECTED_PNG}}>PNG</option>
+                    <option value="h264" {{SELECTED_H264}}>H.264</option>
+                    <option value="av1" {{SELECTED_AV1}}>AV1</option>
+                    <option value="vp9" {{SELECTED_VP9}}>VP9</option>
                 </select>
             </div>
             <div class="codec-selector">
                 <label for="mouse-mode-select">Mouse:</label>
-                <select id="mouse-mode-select" onchange="changeMouseMode()">
-                    <option value="relative" selected>Relative</option>
-                    <option value="absolute">Absolute</option>
+                <select id="mouse-mode-select">
+                    <option value="relative" {{SELECTED_RELATIVE}}>Relative</option>
+                    <option value="absolute" {{SELECTED_ABSOLUTE}}>Absolute</option>
                 </select>
             </div>
-            <button class="btn" id="config-btn" onclick="openConfig()">Settings</button>
-            <button class="btn success" id="start-btn" onclick="startEmulator()">Start</button>
-            <button class="btn danger" id="stop-btn" onclick="stopEmulator()">Stop</button>
-            <button class="btn" id="debug-toggle" onclick="toggleDebugPanel()">Debug</button>
-            <button class="btn" onclick="toggleFullscreen()">Fullscreen</button>
+            <button class="btn" id="config-btn">Settings</button>
+            <button class="btn success" id="start-btn">Start</button>
+            <button class="btn danger" id="stop-btn">Stop</button>
+            <button class="btn" id="debug-toggle">Debug</button>
+            <button class="btn" id="fullscreen-btn">Fullscreen</button>
         </div>
     </header>
 
@@ -102,12 +107,12 @@
         <div id="debug-panel">
             <div class="debug-header">
                 <h3>Debug Console</h3>
-                <button class="clear-btn" onclick="clearLog()">Clear</button>
+                <button class="clear-btn" id="clear-log-btn">Clear</button>
             </div>
             <div class="debug-tabs">
-                <div class="debug-tab active" onclick="showDebugTab('log')">Log</div>
-                <div class="debug-tab" onclick="showDebugTab('stats')">Stats</div>
-                <div class="debug-tab" onclick="showDebugTab('webrtc')">WebRTC</div>
+                <div class="debug-tab active" data-tab="log">Log</div>
+                <div class="debug-tab" data-tab="stats">Stats</div>
+                <div class="debug-tab" data-tab="webrtc">WebRTC</div>
             </div>
             <div class="debug-content">
                 <div class="debug-pane active" id="log-pane">
@@ -280,12 +285,12 @@
         <div class="modal">
             <div class="modal-header">
                 <h2>Emulator Settings</h2>
-                <button class="modal-close" onclick="closeConfig()">&times;</button>
+                <button class="modal-close" id="modal-close-btn">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-group">
                     <label>Emulator Type</label>
-                    <select id="cfg-emulator" onchange="onEmulatorChange()">
+                    <select id="cfg-emulator">
                         <option value="basilisk">68k (Mac OS 7.x)</option>
                         <option value="sheepshaver">PPC (Mac OS 8/9)</option>
                     </select>
@@ -294,7 +299,7 @@
 
                 <div class="form-group">
                     <label>ROM File</label>
-                    <select id="cfg-rom" onchange="onRomChange()">
+                    <select id="cfg-rom">
                         <option value="">Loading...</option>
                     </select>
                 </div>
@@ -333,17 +338,9 @@
                     </select>
                 </div>
 
-                <div class="form-group">
-                    <label>Video Codec</label>
-                    <select id="cfg-webcodec">
-                        <option value="png" selected>PNG (good for dithered, uses dirty rects)</option>
-                        <option value="av1">AV1 (best for dithered, modern browsers)</option>
-                        <option value="vp9">VP9 (great for UI, works via WebCodecs)</option>
-                        <option value="h264">H.264 (avoid for dithered content)</option>
-                    </select>
-                </div>
+                <!-- Video Codec and Mouse Mode are on the main page, not in config -->
 
-                <div class="advanced-toggle" onclick="toggleAdvanced()">
+                <div class="advanced-toggle" id="advanced-toggle">
                     <span class="arrow">&#9654;</span>
                     <span>Advanced Settings</span>
                 </div>
@@ -457,8 +454,8 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn" onclick="closeConfig()">Cancel</button>
-                <button class="btn success" onclick="saveConfig()">Save &amp; Restart</button>
+                <button class="btn" id="cancel-config-btn">Cancel</button>
+                <button class="btn success" id="save-config-btn">Save &amp; Restart</button>
             </div>
         </div>
     </div>

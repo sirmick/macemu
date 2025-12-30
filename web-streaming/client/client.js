@@ -4,6 +4,53 @@
  * Full-featured client with debugging, stats tracking, and connection monitoring.
  */
 
+// ============================================================================
+// Constants
+// ============================================================================
+const CONSTANTS = {
+    // Debug & Logging
+    MAX_LOG_ENTRIES: 500,
+
+    // Timing & Intervals (milliseconds)
+    MS_PER_SECOND: 1000,
+    PING_INTERVAL_MS: 1000,
+    STATS_UPDATE_INTERVAL_MS: 1000,
+    LATENCY_LOG_INTERVAL_MS: 3000,
+    DETAILED_STATS_INTERVAL_MS: 3000,
+    STATUS_POLL_INTERVAL_MS: 2000,
+    TRACK_READY_CHECK_INTERVAL_MS: 2000,
+    FRAME_DETECTION_INTERVAL_MS: 1000,
+
+    // Reconnection
+    MAX_RECONNECT_ATTEMPTS: 10,
+    BASE_RECONNECT_DELAY_MS: 1000,
+    MAX_RECONNECT_DELAY_MS: 30000,
+    MAX_RTT_THRESHOLD_MS: 30000,
+    MAX_DECODE_LATENCY_MS: 1000,
+
+    // Ping & RTT
+    PING_SAMPLES_BEFORE_RESET: 10,
+
+    // Frame Protocol Sizes (bytes)
+    PNG_HEADER_SIZE: 113,
+    MIN_PNG_SIZE_WITH_HEADER: 121,
+    H264_METADATA_SIZE: 65,
+
+    // Audio Capture
+    AUDIO_CAPTURE_DURATION_SEC: 10,
+    AUDIO_BUFFER_SIZE: 4096,
+    AUDIO_CHANNELS: 2,
+
+    // Canvas & Drawing
+    FRAME_DETECTION_CANVAS_SIZE: 10,
+    CURSOR_ARROW_HEIGHT: 20,
+
+    // Conversion factors
+    MICROSECONDS_TO_MS: 1000.0,
+    BITS_PER_BYTE: 8,
+    BITS_TO_KILOBITS: 1000,
+};
+
 // Global debug configuration (fetched from server)
 const debugConfig = {
     debug_connection: false,   // WebRTC/ICE/signaling logs
@@ -18,19 +65,71 @@ let serverUIConfig = {
     resolution: '800x600'
 };
 
+/**
+ * Load configuration embedded in HTML by server (eliminates race conditions)
+ * Server injects config as JSON in <script id="server-config"> tag
+ */
+function loadEmbeddedConfig() {
+    const configScript = document.getElementById('server-config');
+    if (!configScript) {
+        return null;
+    }
+
+    try {
+        const configText = configScript.textContent.trim();
+
+        // Check if server has replaced placeholders (if not, we'll see {{PLACEHOLDER}})
+        if (configText.includes('{{')) {
+            logger.info('Embedded config contains unreplaced placeholders, will use fetch fallback');
+            return null;
+        }
+
+        const config = JSON.parse(configText);
+        logger.info('Loaded embedded config from HTML', config);
+        return config;
+    } catch (e) {
+        logger.error('Failed to parse embedded config', { error: e.message });
+        return null;
+    }
+}
+
+/**
+ * Fetch configuration from server
+ * Uses embedded config (injected by C++ server) if available, falls back to API fetch
+ */
 async function fetchConfig() {
+    // STRATEGY 1: Try embedded config first (synchronous, no race condition)
+    const embeddedConfig = loadEmbeddedConfig();
+    if (embeddedConfig) {
+        // Apply to debug config
+        Object.assign(debugConfig, embeddedConfig);
+
+        // Apply to UI config
+        if (embeddedConfig.webcodec) serverUIConfig.webcodec = embeddedConfig.webcodec;
+        if (embeddedConfig.mousemode) serverUIConfig.mousemode = embeddedConfig.mousemode;
+        if (embeddedConfig.resolution) serverUIConfig.resolution = embeddedConfig.resolution;
+
+        logger.info('[Browser] Using embedded config (no fetch needed)', serverUIConfig);
+
+        // Note: UI elements (select dropdowns, resolution) are already correct
+        // because server pre-rendered them with selected attributes
+        return;
+    }
+
+    // STRATEGY 2: Fallback to fetch if embedded config not available
+    // (backwards compatibility, development with static HTML)
     try {
         const response = await fetch('/api/config');
         const config = await response.json();
         Object.assign(debugConfig, config);
-        console.log('[Browser] Debug config:', debugConfig);
+        logger.info('[Browser] Fetched config from API (fallback)', config);
 
         // Store UI config from server
         if (config.webcodec) serverUIConfig.webcodec = config.webcodec;
         if (config.mousemode) serverUIConfig.mousemode = config.mousemode;
         if (config.resolution) serverUIConfig.resolution = config.resolution;
 
-        // Set UI dropdowns to match server config
+        // Set UI dropdowns to match server config (only needed when using fetch)
         const codecSelect = document.getElementById('codec-select');
         if (codecSelect && config.webcodec) {
             codecSelect.value = config.webcodec;
@@ -41,15 +140,15 @@ async function fetchConfig() {
             mouseSelect.value = config.mousemode;
         }
 
-        // Set initial resolution display
+        // Set initial resolution display (only needed when using fetch)
         const headerResEl = document.getElementById('header-resolution');
         if (headerResEl && config.resolution) {
             headerResEl.textContent = config.resolution;
         }
 
-        console.log('[Browser] UI config loaded:', serverUIConfig);
+        logger.info('[Browser] UI config loaded from fetch', serverUIConfig);
     } catch (e) {
-        console.warn('[Browser] Failed to fetch debug config, using defaults');
+        logger.warn('[Browser] Failed to fetch config, using defaults', { error: e.message });
     }
 }
 
@@ -57,7 +156,7 @@ async function fetchConfig() {
 class DebugLogger {
     constructor() {
         this.logElement = null;
-        this.maxEntries = 500;
+        this.maxEntries = CONSTANTS.MAX_LOG_ENTRIES;
         this.sendToServer = true;  // Send important logs to server
     }
 
@@ -290,22 +389,34 @@ class VideoDecoder {
             return 0;
         }
         const elapsed = now - this.lastFrameTime;
-        return elapsed > 0 ? Math.round(1000 / elapsed) : 0;
+        return elapsed > 0 ? Math.round(CONSTANTS.MS_PER_SECOND / elapsed) : 0;
     }
 }
 
-// H.264 decoder using native WebRTC video track
-class H264Decoder extends VideoDecoder {
-    constructor(videoElement) {
+// Unified WebRTC video decoder for H.264, AV1, and VP9
+// All three codecs use the same mechanism - native browser WebRTC decoding
+class WebRTCVideoDecoder extends VideoDecoder {
+    constructor(videoElement, codecType) {
         super(videoElement);
         this.videoElement = videoElement;
+        this.codecType = codecType;
     }
 
-    get type() { return CodecType.H264; }
-    get name() { return 'H.264 (WebRTC)'; }
+    get type() {
+        return this.codecType;
+    }
+
+    get name() {
+        const names = {
+            [CodecType.H264]: 'H.264 (WebRTC)',
+            [CodecType.AV1]: 'AV1 (WebRTC)',
+            [CodecType.VP9]: 'VP9 (WebRTC)'
+        };
+        return names[this.codecType] || 'Unknown';
+    }
 
     init() {
-        logger.info('H264Decoder initialized');
+        logger.info(`${this.name} initialized`);
         return true;
     }
 
@@ -315,85 +426,40 @@ class H264Decoder extends VideoDecoder {
         }
     }
 
-    // H.264 frames come through the WebRTC video track, not this method
+    // Frames come through the WebRTC video track, not handleData()
     // The track is set up by the WebRTC connection directly
-    attachTrack(stream) {
+    async attachTrack(stream) {
         this.videoElement.srcObject = stream;
-        this.videoElement.play().catch(e => {
+        try {
+            await this.videoElement.play();
+        } catch (e) {
             logger.warn('Video play() failed', { error: e.message });
-        });
-    }
-
-    handleData(data) {
-        // H.264 data is handled by the browser's native WebRTC stack
-        // This method is not used for H.264
-        logger.warn('H264Decoder.handleData called - this should not happen');
-    }
-}
-
-// AV1 decoder using native WebRTC video track (same as H.264, browser handles it)
-class AV1Decoder extends VideoDecoder {
-    constructor(videoElement) {
-        super(videoElement);
-        this.videoElement = videoElement;
-    }
-
-    get type() { return CodecType.AV1; }
-    get name() { return 'AV1 (WebRTC)'; }
-
-    init() {
-        logger.info('AV1Decoder initialized');
-        return true;
-    }
-
-    cleanup() {
-        if (this.videoElement) {
-            this.videoElement.srcObject = null;
         }
     }
 
-    attachTrack(stream) {
-        this.videoElement.srcObject = stream;
-        this.videoElement.play().catch(e => {
-            logger.warn('Video play() failed', { error: e.message });
-        });
-    }
-
     handleData(data) {
-        logger.warn('AV1Decoder.handleData called - this should not happen');
+        // Video data is handled by the browser's native WebRTC stack
+        // This method is not used for WebRTC video codecs
+        logger.warn(`${this.name}.handleData called - this should not happen`);
     }
 }
 
-// VP9 decoder using native WebRTC video track (same as H.264/AV1, browser handles it)
-class VP9Decoder extends VideoDecoder {
+// Backwards compatibility aliases
+class H264Decoder extends WebRTCVideoDecoder {
     constructor(videoElement) {
-        super(videoElement);
-        this.videoElement = videoElement;
+        super(videoElement, CodecType.H264);
     }
+}
 
-    get type() { return CodecType.VP9; }
-    get name() { return 'VP9 (WebRTC)'; }
-
-    init() {
-        logger.info('VP9Decoder initialized');
-        return true;
+class AV1Decoder extends WebRTCVideoDecoder {
+    constructor(videoElement) {
+        super(videoElement, CodecType.AV1);
     }
+}
 
-    cleanup() {
-        if (this.videoElement) {
-            this.videoElement.srcObject = null;
-        }
-    }
-
-    attachTrack(stream) {
-        this.videoElement.srcObject = stream;
-        this.videoElement.play().catch(e => {
-            logger.warn('Video play() failed', { error: e.message });
-        });
-    }
-
-    handleData(data) {
-        logger.warn('VP9Decoder.handleData called - this should not happen');
+class VP9Decoder extends WebRTCVideoDecoder {
+    constructor(videoElement) {
+        super(videoElement, CodecType.VP9);
     }
 }
 
@@ -425,7 +491,7 @@ class PNGDecoder extends VideoDecoder {
         this.lastRttLog = 0;
         this.lastAverageRtt = 0;  // Last calculated average for stats panel
 
-        // Ping timer (runs every 1 second)
+        // Ping timer
         this.pingTimer = null;
     }
 
@@ -456,10 +522,10 @@ class PNGDecoder extends VideoDecoder {
         this.stopPingTimer();
         this.dataChannel = dataChannel;
 
-        // Send ping every 1 second for RTT measurement
+        // Send ping for RTT measurement
         this.pingTimer = setInterval(() => {
             this.sendPing(this.dataChannel);
-        }, 1000);
+        }, CONSTANTS.PING_INTERVAL_MS);
     }
 
     stopPingTimer() {
@@ -488,7 +554,7 @@ class PNGDecoder extends VideoDecoder {
     // Frame format: [8-byte t1_frame_ready] [4-byte x] [4-byte y] [4-byte width] [4-byte height]
     //               [4-byte frame_width] [4-byte frame_height] [8-byte t4_send_time]
     //               [44-byte ping data] [8-byte cursor data] [PNG data]
-    handleData(data) {
+    async handleData(data) {
         if (!this.ctx) return;
 
         const t5_receive = Date.now();  // T5: Browser receive time
@@ -498,8 +564,8 @@ class PNGDecoder extends VideoDecoder {
         let frameWidth = 0, frameHeight = 0;
         let cursorX = 0, cursorY = 0, cursorVisible = 0;  // Declare at function scope
 
-        // Parse metadata header if present (ArrayBuffer with at least 113 bytes + PNG signature)
-        if (data instanceof ArrayBuffer && data.byteLength > 121) {
+        // Parse metadata header if present (ArrayBuffer with at least header + PNG signature)
+        if (data instanceof ArrayBuffer && data.byteLength > CONSTANTS.MIN_PNG_SIZE_WITH_HEADER) {
             const view = new DataView(data);
 
             // Read T1: 8-byte emulator frame ready time (ms since Unix epoch)
@@ -599,14 +665,15 @@ class PNGDecoder extends VideoDecoder {
             }
             // Note: Pings are sent every 1 second and echoed in 5 consecutive frames
 
-            // PNG data starts after 113-byte header (40 base + 5 cursor + 68 ping with 7 timestamps)
-            pngData = data.slice(113);
+            // PNG data starts after header (40 base + 5 cursor + 68 ping with 7 timestamps)
+            pngData = data.slice(CONSTANTS.PNG_HEADER_SIZE);
         }
 
         // Create blob from PNG data
         const blob = pngData instanceof Blob ? pngData : new Blob([pngData], { type: 'image/png' });
 
-        createImageBitmap(blob).then(bitmap => {
+        try {
+            const bitmap = await createImageBitmap(blob);
             const t6_draw = performance.now();  // Draw complete time (use performance.now for accuracy)
 
             // Calculate decode latency (receive to draw)
@@ -615,7 +682,7 @@ class PNGDecoder extends VideoDecoder {
             const decodeLatency = t6_draw - t5_receive_perf;
 
             // Track decode latency
-            if (decodeLatency >= 0 && decodeLatency < 1000) {
+            if (decodeLatency >= 0 && decodeLatency < CONSTANTS.MAX_DECODE_LATENCY_MS) {
                 this.decodeLatencyTotal += decodeLatency;
                 this.latencySamples++;
             }
@@ -647,9 +714,9 @@ class PNGDecoder extends VideoDecoder {
                 this.onFrame(this.frameCount, { cursorX, cursorY, cursorVisible, frameWidth, frameHeight });
             }
 
-            // Log latency stats periodically (every 3 seconds)
+            // Log latency stats periodically
             const now = performance.now();
-            if (now - this.lastLatencyLog > 3000 && this.latencySamples > 0) {
+            if (now - this.lastLatencyLog > CONSTANTS.LATENCY_LOG_INTERVAL_MS && this.latencySamples > 0) {
                 const avgDecode = this.decodeLatencyTotal / this.latencySamples;
                 this.lastAverageLatency = avgDecode;  // Save for stats panel
 
@@ -663,9 +730,9 @@ class PNGDecoder extends VideoDecoder {
                 this.latencySamples = 0;
                 this.lastLatencyLog = now;
             }
-        }).catch(e => {
+        } catch (e) {
             logger.error('Failed to decode PNG', { error: e.message });
-        });
+        }
     }
 
     handlePingEcho(sequence, browser_send_ms, server_recv_us, emulator_recv_us,
@@ -685,11 +752,11 @@ class PNGDecoder extends VideoDecoder {
         const send_prep_us = server_send_us - encode_done_us;         // t6→t7: Packetizing/send prep
 
         // Convert microseconds to milliseconds
-        const ipc_latency_ms = ipc_latency_us / 1000.0;
-        const emulator_proc_ms = emulator_proc_us / 1000.0;
-        const wake_latency_ms = wake_latency_us / 1000.0;
-        const encode_ms = encode_us / 1000.0;
-        const send_prep_ms = send_prep_us / 1000.0;
+        const ipc_latency_ms = ipc_latency_us / CONSTANTS.MICROSECONDS_TO_MS;
+        const emulator_proc_ms = emulator_proc_us / CONSTANTS.MICROSECONDS_TO_MS;
+        const wake_latency_ms = wake_latency_us / CONSTANTS.MICROSECONDS_TO_MS;
+        const encode_ms = encode_us / CONSTANTS.MICROSECONDS_TO_MS;
+        const send_prep_ms = send_prep_us / CONSTANTS.MICROSECONDS_TO_MS;
 
         // Network latency (estimated as remainder after subtracting known server-side latencies)
         const server_side_total_ms = ipc_latency_ms + emulator_proc_ms + wake_latency_ms + encode_ms + send_prep_ms;
@@ -699,11 +766,11 @@ class PNGDecoder extends VideoDecoder {
         const now = performance.now();
 
         // Track total RTT for averaging (only if reasonable values)
-        // Permissive: accept RTT up to 30 seconds (handles slow connections, breakpoints, etc.)
-        if (total_rtt_ms > 0 && total_rtt_ms < 30000) {
+        // Permissive: accept RTT up to threshold (handles slow connections, breakpoints, etc.)
+        if (total_rtt_ms > 0 && total_rtt_ms < CONSTANTS.MAX_RTT_THRESHOLD_MS) {
             this.rttTotal += total_rtt_ms;
             this.rttSamples++;
-        } else if (total_rtt_ms >= 30000) {
+        } else if (total_rtt_ms >= CONSTANTS.MAX_RTT_THRESHOLD_MS) {
             // Log unusually high RTT but don't include in average
             logger.warn(`[Ping] Unusually high RTT: ${total_rtt_ms.toFixed(1)}ms (not included in average)`);
         }
@@ -733,8 +800,8 @@ class PNGDecoder extends VideoDecoder {
             logger.info(rttLog);
         }
 
-        // Reset averaging every 10 pings to keep running average current
-        if (this.rttSamples >= 10) {
+        // Reset averaging periodically to keep running average current
+        if (this.rttSamples >= CONSTANTS.PING_SAMPLES_BEFORE_RESET) {
             this.lastAverageRtt = this.rttTotal / this.rttSamples;  // Save for stats panel
             this.rttTotal = 0;
             this.rttSamples = 0;
@@ -864,7 +931,7 @@ class BasiliskWebRTC {
 
         // Reconnection
         this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 10;
+        this.maxReconnectAttempts = CONSTANTS.MAX_RECONNECT_ATTEMPTS;
         this.reconnectTimer = null;
 
         // Frame detection for black screen debugging
@@ -1325,10 +1392,21 @@ class BasiliskWebRTC {
                 });
 
                 this.video.onloadedmetadata = () => {
-                    logger.info('Video metadata loaded', {
-                        width: this.video.videoWidth,
-                        height: this.video.videoHeight
-                    });
+                    // Track resolution changes
+                    if (currentConfig.debug_mode_switch) {
+                        const oldRes = `${this.currentScreenWidth}x${this.currentScreenHeight}`;
+                        const newRes = `${this.video.videoWidth}x${this.video.videoHeight}`;
+                        logger.info(`[MODE] Browser detected resolution: ${oldRes} -> ${newRes}`, {
+                            width: this.video.videoWidth,
+                            height: this.video.videoHeight
+                        });
+                    } else {
+                        logger.info('Video metadata loaded', {
+                            width: this.video.videoWidth,
+                            height: this.video.videoHeight
+                        });
+                    }
+
                     this.updateWebRTCState('video-size', `${this.video.videoWidth} x ${this.video.videoHeight}`);
 
                     // Update screen dimensions for absolute mouse mode
@@ -1596,9 +1674,9 @@ class BasiliskWebRTC {
         // Handle incoming messages (frames for PNG, or other messages)
         this.dataChannel.onmessage = (event) => {
             if (event.data instanceof ArrayBuffer) {
-                // Check if this is a frame metadata message for H.264/AV1 (65 bytes)
+                // Check if this is a frame metadata message for H.264/AV1
                 // Format: [cursor_x:2][cursor_y:2][cursor_visible:1][ping_seq:4][t1:8][t2:8][t3:8][t4:8][t5:8][t6:8][t7:8]
-                if (event.data.byteLength === 65) {
+                if (event.data.byteLength === CONSTANTS.H264_METADATA_SIZE) {
                     const view = new DataView(event.data);
                     this.handleFrameMetadata(view);
                     return;
@@ -1679,32 +1757,15 @@ class BasiliskWebRTC {
                 }
             } else {
                 // Absolute mode: calculate Mac screen coordinates from canvas position
-                if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
-                    console.warn('[Browser] Absolute mouse: screen dimensions not set yet');
-                    return;
+                const pos = this.calculateAbsoluteMousePosition(e, displayElement);
+                if (pos) {
+                    // Debug logging (avoid object creation unless needed)
+                    if (debugConfig.debug_connection) {
+                        logger.info('Absolute mouse', { x: pos.x, y: pos.y, screenW: this.currentScreenWidth, screenH: this.currentScreenHeight });
+                    }
+
+                    this.sendMouseAbsolute(pos.x, pos.y, performance.now());
                 }
-
-                // Cache rect and scale to avoid expensive getBoundingClientRect() on every move
-                if (!this.cachedMouseRect) {
-                    this.cachedMouseRect = displayElement.getBoundingClientRect();
-                    this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
-                    this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
-                }
-
-                const rect = this.cachedMouseRect;
-                const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
-                const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
-
-                // Clamp to screen bounds
-                const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
-                const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
-
-                // Debug logging (avoid object creation unless needed)
-                if (debugConfig.debug_connection) {
-                    console.log('[Browser] Absolute mouse:', macX, clampedX, 'macY', clampedY, 'screenW', this.currentScreenWidth, 'screenH', this.currentScreenHeight);
-                }
-
-                this.sendMouseAbsolute(clampedX, clampedY, performance.now());
             }
         };
         displayElement.addEventListener('mousemove', handleMouseMove);
@@ -1727,32 +1788,18 @@ class BasiliskWebRTC {
 
                 // In absolute mode, update position before sending click
                 if (this.mouseMode === 'absolute') {
-                    if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
-                        console.warn('[Browser] Absolute mouse: screen dimensions not set yet');
-                        return;
+                    const pos = this.calculateAbsoluteMousePosition(e, displayElement);
+                    if (pos) {
+                        this.sendMouseAbsolute(pos.x, pos.y, performance.now());
+                    } else {
+                        return; // Dimensions not set yet
                     }
-
-                    // Calculate position using same logic as mousemove
-                    if (!this.cachedMouseRect) {
-                        this.cachedMouseRect = displayElement.getBoundingClientRect();
-                        this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
-                        this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
-                    }
-
-                    const rect = this.cachedMouseRect;
-                    const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
-                    const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
-
-                    const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
-                    const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
-
-                    // Send position update first, then button press
-                    this.sendMouseAbsolute(clampedX, clampedY, performance.now());
                 }
 
                 this.sendMouseButton(e.button, true, performance.now());
             }
         };
+
         const handleMouseUp = (e) => {
             if (!this.connected) return;
 
@@ -1761,26 +1808,12 @@ class BasiliskWebRTC {
 
                 // In absolute mode, update position before sending click release
                 if (this.mouseMode === 'absolute') {
-                    if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
-                        console.warn('[Browser] Absolute mouse: screen dimensions not set yet');
-                        return;
+                    const pos = this.calculateAbsoluteMousePosition(e, displayElement);
+                    if (pos) {
+                        this.sendMouseAbsolute(pos.x, pos.y, performance.now());
+                    } else {
+                        return; // Dimensions not set yet
                     }
-
-                    if (!this.cachedMouseRect) {
-                        this.cachedMouseRect = displayElement.getBoundingClientRect();
-                        this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
-                        this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
-                    }
-
-                    const rect = this.cachedMouseRect;
-                    const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
-                    const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
-
-                    const clampedX = Math.max(0, Math.min(this.currentScreenWidth - 1, macX));
-                    const clampedY = Math.max(0, Math.min(this.currentScreenHeight - 1, macY));
-
-                    // Send position update first, then button release
-                    this.sendMouseAbsolute(clampedX, clampedY, performance.now());
                 }
 
                 this.sendMouseButton(e.button, false, performance.now());
@@ -1888,6 +1921,32 @@ class BasiliskWebRTC {
         if (debugConfig.debug_connection) {
             logger.info('Mouse mode change sent to server', { mode });
         }
+    }
+
+    // Calculate absolute mouse position from mouse event
+    // Returns {x, y} or null if dimensions not set
+    calculateAbsoluteMousePosition(e, displayElement) {
+        if (this.currentScreenWidth === 0 || this.currentScreenHeight === 0) {
+            logger.warn('Absolute mouse: screen dimensions not set yet');
+            return null;
+        }
+
+        // Use cached rect if available, otherwise calculate it
+        if (!this.cachedMouseRect) {
+            this.cachedMouseRect = displayElement.getBoundingClientRect();
+            this.cachedMouseScaleX = this.currentScreenWidth / this.cachedMouseRect.width;
+            this.cachedMouseScaleY = this.currentScreenHeight / this.cachedMouseRect.height;
+        }
+
+        const rect = this.cachedMouseRect;
+        const macX = Math.floor((e.clientX - rect.left) * this.cachedMouseScaleX);
+        const macY = Math.floor((e.clientY - rect.top) * this.cachedMouseScaleY);
+
+        // Clamp to screen bounds
+        return {
+            x: Math.max(0, Math.min(this.currentScreenWidth - 1, macX)),
+            y: Math.max(0, Math.min(this.currentScreenHeight - 1, macY))
+        };
     }
 
     // Handle frame metadata for H.264/AV1 (sent via data channel)
@@ -2045,9 +2104,9 @@ class BasiliskWebRTC {
         }
 
         this.reconnectAttempts++;
-        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
-        logger.info(`Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-        this.updateOverlayStatus(`Reconnecting in ${Math.round(delay / 1000)}s...`);
+        const delay = Math.min(CONSTANTS.BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1), CONSTANTS.MAX_RECONNECT_DELAY_MS);
+        logger.info(`Reconnecting in ${delay / CONSTANTS.MS_PER_SECOND}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+        this.updateOverlayStatus(`Reconnecting in ${Math.round(delay / CONSTANTS.MS_PER_SECOND)}s...`);
 
         this.reconnectTimer = setTimeout(() => {
             if (!this.connected) {
@@ -2112,7 +2171,7 @@ class BasiliskWebRTC {
         if (!this.connected) return;
 
         const now = performance.now();
-        const elapsed = (now - this.lastStatsTime) / 1000;
+        const elapsed = (now - this.lastStatsTime) / CONSTANTS.MS_PER_SECOND;
 
         // For PNG codec, calculate stats from our own tracking
         const usesVideoTrack = (this.codecType === CodecType.H264 || this.codecType === CodecType.AV1);
@@ -2122,7 +2181,7 @@ class BasiliskWebRTC {
                 const bytesDelta = this.pngStats.bytesReceived - this.lastPngBytesReceived;
 
                 this.stats.fps = Math.round(framesDelta / elapsed);
-                this.stats.bitrate = Math.round((bytesDelta * 8 / elapsed) / 1000);
+                this.stats.bitrate = Math.round((bytesDelta * CONSTANTS.BITS_PER_BYTE / elapsed) / CONSTANTS.BITS_TO_KILOBITS);
                 this.stats.framesDecoded = this.pngStats.framesReceived;
                 this.stats.packetsLost = 0;  // DataChannel is reliable
                 this.stats.jitter = 0;
@@ -2398,8 +2457,7 @@ class BasiliskWebRTC {
     // Synchronized audio capture (triggered by server when user presses 'C')
     startAudioCapture() {
         const SAMPLE_RATE = 48000;
-        const CAPTURE_DURATION = 10;  // 10 seconds
-        const CAPTURE_SAMPLES = SAMPLE_RATE * CAPTURE_DURATION * 2;  // Stereo
+        const CAPTURE_SAMPLES = SAMPLE_RATE * CONSTANTS.AUDIO_CAPTURE_DURATION_SEC * CONSTANTS.AUDIO_CHANNELS;
 
         if (this.audioCapturing) {
             logger.warn('[AudioCapture] Already capturing!');
@@ -2415,7 +2473,7 @@ class BasiliskWebRTC {
         logger.info('[AudioCapture] ========================================');
         logger.info('[AudioCapture] STARTING SYNCHRONIZED CAPTURE');
         logger.info('[AudioCapture] ========================================');
-        logger.info('[AudioCapture] Capturing 10 seconds of audio...');
+        logger.info(`[AudioCapture] Capturing ${CONSTANTS.AUDIO_CAPTURE_DURATION_SEC} seconds of audio...`);
         logger.info('[AudioCapture] ========================================');
 
         this.audioCapturing = true;
@@ -2423,17 +2481,17 @@ class BasiliskWebRTC {
         try {
             const captureContext = new AudioContext({ sampleRate: SAMPLE_RATE });
             const source = captureContext.createMediaStreamSource(audioElement.srcObject);
-            const captureProcessor = captureContext.createScriptProcessor(4096, 2, 2);
+            const captureProcessor = captureContext.createScriptProcessor(CONSTANTS.AUDIO_BUFFER_SIZE, CONSTANTS.AUDIO_CHANNELS, CONSTANTS.AUDIO_CHANNELS);
 
             let capturedSamples = new Int16Array(CAPTURE_SAMPLES);
             let sampleOffset = 0;
             const startTime = performance.now();
 
             captureProcessor.onaudioprocess = (e) => {
-                const elapsed = (performance.now() - startTime) / 1000;
+                const elapsed = (performance.now() - startTime) / CONSTANTS.MS_PER_SECOND;
 
-                // Stop after 10 seconds
-                if (elapsed >= CAPTURE_DURATION) {
+                // Stop after capture duration
+                if (elapsed >= CONSTANTS.AUDIO_CAPTURE_DURATION_SEC) {
                     captureProcessor.disconnect();
                     source.disconnect();
                     this.audioCapturing = false;
@@ -2537,9 +2595,52 @@ class BasiliskWebRTC {
     }
 }
 
-// Global client instance
-let client = null;
-let statsInterval = null;
+// ============================================================================
+// Application State - Encapsulated Global Object
+// ============================================================================
+const App = {
+    client: null,
+    statsInterval: null,
+    currentConfig: {
+        emulator: 'basilisk',  // Default, will be overwritten by loadCurrentConfig()
+        rom: '',
+        disks: [],
+        ram: 32,
+        screen: '800x600',
+        cpu: 4,
+        model: 14,
+        fpu: true,
+        jit: true,
+        sound: true
+    },
+    serverPaths: {
+        romsPath: 'storage/roms',
+        imagesPath: 'storage/images'
+    },
+    storageCache: null
+};
+
+// Legacy global references for backwards compatibility
+Object.defineProperty(window, 'client', {
+    get() { return App.client; },
+    set(value) { App.client = value; }
+});
+Object.defineProperty(window, 'statsInterval', {
+    get() { return App.statsInterval; },
+    set(value) { App.statsInterval = value; }
+});
+Object.defineProperty(window, 'currentConfig', {
+    get() { return App.currentConfig; },
+    set(value) { App.currentConfig = value; }
+});
+Object.defineProperty(window, 'serverPaths', {
+    get() { return App.serverPaths; },
+    set(value) { App.serverPaths = value; }
+});
+Object.defineProperty(window, 'storageCache', {
+    get() { return App.storageCache; },
+    set(value) { App.storageCache = value; }
+});
 
 // Get base path from current page location (for reverse proxy support)
 // e.g., /macemu/ from /macemu/index.html, or empty string for root
@@ -2595,7 +2696,7 @@ function initClient() {
     // Start stats collection
     statsInterval = setInterval(() => {
         if (client) client.updateStats();
-    }, 1000);
+    }, CONSTANTS.STATS_UPDATE_INTERVAL_MS);
 
     // Set initial disconnected visual state
     const displayContainer = document.getElementById('display-container');
@@ -2770,28 +2871,6 @@ document.addEventListener('fullscreenchange', () => {
 // ============================================================================
 // Configuration Modal
 // ============================================================================
-
-let currentConfig = {
-    emulator: 'basilisk',  // Default, will be overwritten by loadCurrentConfig()
-    rom: '',
-    disks: [],
-    ram: 32,
-    screen: '800x600',
-    cpu: 4,
-    model: 14,
-    fpu: true,
-    jit: true,
-    sound: true
-};
-
-// Paths from server (for generating absolute paths in prefs)
-let serverPaths = {
-    romsPath: 'storage/roms',
-    imagesPath: 'storage/images'
-};
-
-// Cache for storage data (roms + disks from single API call)
-let storageCache = null;
 
 async function loadStorage() {
     if (storageCache) return storageCache;
@@ -3188,7 +3267,14 @@ function updateConfigUI() {
 async function saveConfig() {
     // Gather common values
     currentConfig.emulator = document.getElementById('cfg-emulator')?.value || 'basilisk';
-    currentConfig.rom = document.getElementById('cfg-rom')?.value || '';
+
+    // Only update ROM if dropdown has a value (preserve existing if dropdown not populated)
+    const romDropdown = document.getElementById('cfg-rom');
+    if (romDropdown && romDropdown.value) {
+        currentConfig.rom = romDropdown.value;
+    }
+    // If dropdown is empty/null, keep currentConfig.rom as-is (from loadCurrentConfig)
+
     currentConfig.ram = parseInt(document.getElementById('cfg-ram')?.value || 32);
     currentConfig.screen = document.getElementById('cfg-screen')?.value || '800x600';
     currentConfig.sound = document.getElementById('cfg-sound')?.checked ?? true;
@@ -3473,13 +3559,70 @@ async function pollEmulatorStatus() {
 }
 
 // Start status polling
-setInterval(pollEmulatorStatus, 2000);
+setInterval(pollEmulatorStatus, CONSTANTS.STATUS_POLL_INTERVAL_MS);
+
+// Setup event listeners for UI elements
+function setupEventListeners() {
+    // Header controls
+    const codecSelect = document.getElementById('codec-select');
+    if (codecSelect) codecSelect.addEventListener('change', changeCodec);
+
+    const mouseModeSelect = document.getElementById('mouse-mode-select');
+    if (mouseModeSelect) mouseModeSelect.addEventListener('change', changeMouseMode);
+
+    const configBtn = document.getElementById('config-btn');
+    if (configBtn) configBtn.addEventListener('click', openConfig);
+
+    const startBtn = document.getElementById('start-btn');
+    if (startBtn) startBtn.addEventListener('click', startEmulator);
+
+    const stopBtn = document.getElementById('stop-btn');
+    if (stopBtn) stopBtn.addEventListener('click', stopEmulator);
+
+    const debugToggle = document.getElementById('debug-toggle');
+    if (debugToggle) debugToggle.addEventListener('click', toggleDebugPanel);
+
+    const fullscreenBtn = document.getElementById('fullscreen-btn');
+    if (fullscreenBtn) fullscreenBtn.addEventListener('click', toggleFullscreen);
+
+    // Debug panel
+    const clearLogBtn = document.getElementById('clear-log-btn');
+    if (clearLogBtn) clearLogBtn.addEventListener('click', clearLog);
+
+    const debugTabs = document.querySelectorAll('.debug-tab');
+    debugTabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+            const tabName = tab.getAttribute('data-tab');
+            if (tabName) showDebugTab(tabName);
+        });
+    });
+
+    // Config modal
+    const modalCloseBtn = document.getElementById('modal-close-btn');
+    if (modalCloseBtn) modalCloseBtn.addEventListener('click', closeConfig);
+
+    const cancelConfigBtn = document.getElementById('cancel-config-btn');
+    if (cancelConfigBtn) cancelConfigBtn.addEventListener('click', closeConfig);
+
+    const saveConfigBtn = document.getElementById('save-config-btn');
+    if (saveConfigBtn) saveConfigBtn.addEventListener('click', saveConfig);
+
+    const cfgEmulator = document.getElementById('cfg-emulator');
+    if (cfgEmulator) cfgEmulator.addEventListener('change', onEmulatorChange);
+
+    const cfgRom = document.getElementById('cfg-rom');
+    if (cfgRom) cfgRom.addEventListener('change', onRomChange);
+
+    const advancedToggle = document.getElementById('advanced-toggle');
+    if (advancedToggle) advancedToggle.addEventListener('click', toggleAdvanced);
+}
 
 // Initialize on page load
 window.addEventListener('DOMContentLoaded', async () => {
     await fetchConfig();  // Load debug config from server
     await loadCurrentConfig();  // Load emulator config from JSON
     updateEmulatorPanelVisibility();  // Update header logo/title based on loaded config
+    setupEventListeners();  // Setup all event listeners
     initClient();
     pollEmulatorStatus();
 });

@@ -564,9 +564,32 @@ Response APIRouter::handle_config_save(const Request& req) {
     if (!config::save_config("macemu-config.json", cfg)) {
         return Response::json("{\"success\": false, \"error\": \"Failed to save config file\"}");
     }
-    
+
     fprintf(stderr, "✅ Config saved to macemu-config.json (emulator=%s, codec=%s)\n",
             cfg.web.emulator.c_str(), cfg.web.codec.c_str());
+
+    // Regenerate prefs file so changes take effect immediately on restart
+    std::string prefs_content;
+    std::string prefs_file;
+
+    if (cfg.web.emulator == "ppc") {
+        prefs_content = config::generate_sheepshaver_prefs(cfg, ctx_->roms_path, ctx_->images_path);
+        // SheepShaver reads from ~/.config/SheepShaver/prefs by default
+        const char* home = getenv("HOME");
+        std::string config_dir = std::string(home ? home : ".") + "/.config/SheepShaver";
+        prefs_file = config_dir + "/prefs";
+    } else {
+        // m68k -> BasiliskII
+        prefs_content = config::generate_basilisk_prefs(cfg, ctx_->roms_path, ctx_->images_path);
+        prefs_file = "basilisk_ii.prefs";
+    }
+
+    if (!storage::write_prefs_file(prefs_file, prefs_content)) {
+        fprintf(stderr, "⚠️  Warning: Failed to regenerate prefs file: %s\n", prefs_file.c_str());
+        return Response::json("{\"success\": true, \"warning\": \"Config saved but prefs file not updated\"}");
+    }
+
+    fprintf(stderr, "✅ Regenerated prefs file: %s\n", prefs_file.c_str());
 
     return Response::json("{\"success\": true}");
 }

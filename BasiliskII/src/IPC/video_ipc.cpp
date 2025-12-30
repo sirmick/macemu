@@ -729,27 +729,55 @@ static bool IPC_VideoInit(bool classic)
 
     frame_skip = PrefsFindInt32("frameskip");
 
+    // Read debug flags FIRST so we can use them during initialization
+    g_debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
+    g_debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
+    g_debug_mouse = (getenv("MACEMU_DEBUG_MOUSE") != nullptr);
+
     // Get screen mode from preferences
     int default_width = 640;
     int default_height = 480;
     const char *mode_str = PrefsFindString("screen");
 
+    if (g_debug_mode_switch) {
+        fprintf(stderr, "[MODE] Parsing screen preference: '%s'\n", mode_str ? mode_str : "(null)");
+    }
+
     if (mode_str) {
-        // Try different format strings
-        if (sscanf(mode_str, "ipc/%d/%d", &default_width, &default_height) != 2) {
-            if (sscanf(mode_str, "win/%d/%d", &default_width, &default_height) != 2) {
-                if (sscanf(mode_str, "dga/%d/%d", &default_width, &default_height) != 2) {
-                    sscanf(mode_str, "%d/%d", &default_width, &default_height);
+        // Try different format strings (both / and x as separator)
+        if (sscanf(mode_str, "ipc/%dx%d", &default_width, &default_height) != 2) {
+            if (sscanf(mode_str, "ipc/%d/%d", &default_width, &default_height) != 2) {
+                if (sscanf(mode_str, "win/%dx%d", &default_width, &default_height) != 2) {
+                    if (sscanf(mode_str, "win/%d/%d", &default_width, &default_height) != 2) {
+                        if (sscanf(mode_str, "dga/%dx%d", &default_width, &default_height) != 2) {
+                            if (sscanf(mode_str, "dga/%d/%d", &default_width, &default_height) != 2) {
+                                if (sscanf(mode_str, "%dx%d", &default_width, &default_height) != 2) {
+                                    sscanf(mode_str, "%d/%d", &default_width, &default_height);
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
+        if (g_debug_mode_switch) {
+            fprintf(stderr, "[MODE] Parsed resolution from prefs: %dx%d\n", default_width, default_height);
         }
     }
 
     // Clamp to supported range
+    int requested_width = default_width;
+    int requested_height = default_height;
     if (default_width < 512) default_width = 512;
     if (default_width > MACEMU_MAX_WIDTH) default_width = MACEMU_MAX_WIDTH;
     if (default_height < 384) default_height = 384;
     if (default_height > MACEMU_MAX_HEIGHT) default_height = MACEMU_MAX_HEIGHT;
+
+    if (g_debug_mode_switch && (requested_width != default_width || requested_height != default_height)) {
+        fprintf(stderr, "[MODE] Resolution clamped from %dx%d to %dx%d (limits: %d-%d x %d-%d)\n",
+                requested_width, requested_height, default_width, default_height,
+                512, MACEMU_MAX_WIDTH, 384, MACEMU_MAX_HEIGHT);
+    }
 
     if (classic) {
         default_width = 512;
@@ -760,11 +788,6 @@ static bool IPC_VideoInit(bool classic)
     frame_height = default_height;
     frame_depth = 32;
     frame_bytes_per_row = TrivialBytesPerRow(frame_width, VDEPTH_32BIT);
-
-    // Read debug flags once at startup
-    g_debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
-    g_debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
-    g_debug_mouse = (getenv("MACEMU_DEBUG_MOUSE") != nullptr);
 
     fprintf(stderr, "IPC: Initializing video driver (v3, emulator-owned resources)\n");
 

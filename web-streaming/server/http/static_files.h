@@ -31,6 +31,7 @@ public:
 private:
     std::string map_path_to_file(const std::string& path) const;
     std::string get_content_type(const std::string& path) const;
+    std::string inject_config_template(const std::string& html) const;
 
     std::string root_dir_;
 };
