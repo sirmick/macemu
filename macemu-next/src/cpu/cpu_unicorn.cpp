@@ -11,8 +11,48 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdint.h>
+
+// M68kRegisters structure (from main.h, duplicated to avoid type conflicts)
+struct M68kRegisters {
+	uint32_t d[8];
+	uint32_t a[8];
+	uint16_t sr;
+};
+
+// Forward declarations (from macemu globals)
+extern uint32_t RAMBaseMac;  // RAM base in Mac address space
+extern uint8_t *RAMBaseHost; // RAM base in host address space
+extern uint32_t RAMSize;     // RAM size
+extern uint32_t ROMBaseMac;  // ROM base in Mac address space
+extern uint8_t *ROMBaseHost; // ROM base in host address space
+extern uint32_t ROMSize;     // ROM size
+extern void EmulOp(uint16_t opcode, struct M68kRegisters *r);
 
 static UnicornCPU *unicorn_cpu = NULL;
+
+// EmulOp handler for Unicorn-only mode
+static void unicorn_emulop_handler(uint16_t opcode, void *user_data) {
+	(void)user_data;
+
+	// Build M68kRegisters structure from Unicorn state
+	struct M68kRegisters regs;
+	for (int i = 0; i < 8; i++) {
+		regs.d[i] = unicorn_get_dreg(unicorn_cpu, i);
+		regs.a[i] = unicorn_get_areg(unicorn_cpu, i);
+	}
+	regs.sr = unicorn_get_sr(unicorn_cpu);
+
+	// Call EmulOp handler
+	EmulOp(opcode, &regs);
+
+	// Write registers back to Unicorn
+	for (int i = 0; i < 8; i++) {
+		unicorn_set_dreg(unicorn_cpu, i, regs.d[i]);
+		unicorn_set_areg(unicorn_cpu, i, regs.a[i]);
+	}
+	unicorn_set_sr(unicorn_cpu, regs.sr);
+}
 
 // CPU Lifecycle
 static bool unicorn_backend_init(void) {
@@ -28,6 +68,25 @@ static bool unicorn_backend_init(void) {
 		return false;
 	}
 
+	// Map RAM to Unicorn
+	if (!unicorn_map_ram(unicorn_cpu, RAMBaseMac, RAMBaseHost, RAMSize)) {
+		fprintf(stderr, "Failed to map RAM to Unicorn\n");
+		unicorn_destroy(unicorn_cpu);
+		unicorn_cpu = NULL;
+		return false;
+	}
+
+	// Map ROM as writable (BasiliskII patches ROM during boot)
+	if (!unicorn_map_rom_writable(unicorn_cpu, ROMBaseMac, ROMBaseHost, ROMSize)) {
+		fprintf(stderr, "Failed to map ROM to Unicorn\n");
+		unicorn_destroy(unicorn_cpu);
+		unicorn_cpu = NULL;
+		return false;
+	}
+
+	// Register EmulOp handler for 0x71xx illegal instructions
+	unicorn_set_emulop_handler(unicorn_cpu, unicorn_emulop_handler, NULL);
+
 	// Register exception handler for A-line/F-line traps
 	unicorn_set_exception_handler(unicorn_cpu, unicorn_simulate_exception);
 
@@ -36,13 +95,21 @@ static bool unicorn_backend_init(void) {
 
 static void unicorn_backend_reset(void) {
 	if (!unicorn_cpu) return;
-	// Unicorn doesn't have explicit reset, just reinitialize registers
+
+	// M68K reset: Initialize registers to power-on state
 	for (int i = 0; i < 8; i++) {
 		unicorn_set_dreg(unicorn_cpu, i, 0);
 		unicorn_set_areg(unicorn_cpu, i, 0);
 	}
-	unicorn_set_pc(unicorn_cpu, 0);
-	unicorn_set_sr(unicorn_cpu, 0);
+
+	// Set A7 (SSP) to initial stack pointer value
+	unicorn_set_areg(unicorn_cpu, 7, 0x2000);
+
+	// Set PC to ROM entry point (matching UAE's m68k_reset)
+	unicorn_set_pc(unicorn_cpu, ROMBaseMac + 0x2a);
+
+	// Set SR: Supervisor mode, interrupt mask 7
+	unicorn_set_sr(unicorn_cpu, 0x2700);  // S=1, I=111
 }
 
 static void unicorn_backend_destroy(void) {

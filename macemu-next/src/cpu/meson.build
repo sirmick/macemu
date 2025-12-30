@@ -1,7 +1,7 @@
 # Always compile ALL CPU backends (runtime selection via platform API)
 cpu_sources = [
   'cpu_uae.c',                # UAE backend for platform API
-  'cpu_unicorn.c',            # Unicorn backend for platform API
+  'cpu_unicorn.cpp',          # Unicorn backend for platform API (C++ for EmulOp linkage)
   'cpu_dualcpu.c',            # DualCPU backend for platform API
   'uae_wrapper.cpp',          # UAE CPU wrapper
   'unicorn_wrapper.c',        # Unicorn wrapper
