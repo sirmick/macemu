@@ -82,6 +82,18 @@ struct comptbl {
 extern void REGPARAM2 op_illg (uae_u32) REGPARAM;
 extern void m68k_dumpstate(uaecptr *nextpc);
 
+/* Hook accessor functions (for dual-CPU validation) */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void* uae_get_emulop_handler(void);
+void* uae_get_emulop_user_data(void);
+void* uae_get_trap_handler(void);
+void* uae_get_trap_user_data(void);
+#ifdef __cplusplus
+}
+#endif
+
 typedef char flagtype;
 
 struct regstruct {

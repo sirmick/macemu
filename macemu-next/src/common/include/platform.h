@@ -149,6 +149,22 @@ typedef struct {
 
     // Interrupts
     void (*cpu_trigger_interrupt)(int level);
+
+    /*
+     *  CPU Special Instruction Handlers
+     *
+     *  EmulOps (0x71xx) and Traps (A-line/F-line) need special handling in dual-CPU mode.
+     *  The handler is called by both CPUs, with is_primary indicating which CPU is calling.
+     *
+     *  is_primary=true:  This CPU should execute the operation and sync to the other CPU
+     *  is_primary=false: This CPU should skip execution (state will be synced from primary)
+     */
+
+    // EmulOp handler (0x71xx illegal instructions used for emulator functions)
+    void (*emulop_handler)(uint16_t opcode, bool is_primary);
+
+    // Trap handler (A-line and F-line exceptions)
+    void (*trap_handler)(int vector, uint16_t opcode, bool is_primary);
 } Platform;
 
 /*

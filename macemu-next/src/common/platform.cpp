@@ -9,7 +9,9 @@
 /*
  *  Global platform instance
  */
+extern "C" {
 Platform g_platform;
+}
 
 /*
  *  Initialize platform with null drivers (safe defaults)
@@ -58,4 +60,8 @@ void platform_init(void)
 	g_platform.rom = nullptr;
 	g_platform.ram_size = 0;
 	g_platform.rom_size = 0;
+
+	// EmulOp/Trap handlers (NULL by default - set by CPU backend or main)
+	g_platform.emulop_handler = nullptr;
+	g_platform.trap_handler = nullptr;
 }

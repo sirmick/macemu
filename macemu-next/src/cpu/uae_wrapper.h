@@ -53,6 +53,14 @@ void uae_set_areg(int reg, uint32_t value);
 void uae_set_pc(uint32_t value);
 void uae_set_sr(uint16_t value);
 
+/* Hook callbacks - called during execution */
+typedef void (*UaeEmulOpHandler)(uint16_t opcode, void *user_data);
+typedef void (*UaeTrapHandler)(int vector, uint16_t opcode, void *user_data);
+
+/* Hook registration */
+void uae_set_emulop_handler(UaeEmulOpHandler handler, void *user_data);
+void uae_set_trap_handler(UaeTrapHandler handler, void *user_data);
+
 /* Execution */
 void uae_cpu_execute_one(void);  /* Execute one instruction */
 

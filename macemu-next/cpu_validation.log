@@ -1,0 +1,7 @@
+=== BasiliskII Dual-CPU Validation Log ===
+UAE vs Unicorn instruction-by-instruction comparison
+
+
+[2] PC DIVERGENCE at 0x0200008C (opcode 0x7103)
+UAE PC: 0x0200008C → 0x0200008E
+UC  PC: 0x0200008C → 0x020000BA

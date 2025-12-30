@@ -29,6 +29,7 @@
 #include "cpu_emulation.h"
 #include "main.h"
 #include "emul_op.h"
+#include "platform.h"
 
 extern int intlev(void);	// From baisilisk_glue.cpp
 
@@ -1274,6 +1275,14 @@ void m68k_emulop_return(void)
 
 void m68k_emulop(uae_u32 opcode)
 {
+	/* Check if platform handler is registered (g_platform declared in platform.h) */
+	if (g_platform.emulop_handler) {
+		/* Platform handler takes over - pass is_primary=true for UAE */
+		g_platform.emulop_handler((uint16_t)opcode, true);
+		return;
+	}
+
+	/* Normal EmulOp handling (standalone mode) */
 	struct M68kRegisters r;
 	int i;
 
@@ -1296,12 +1305,23 @@ void REGPARAM2 op_illg (uae_u32 opcode)
 {
 	uaecptr pc = m68k_getpc ();
 
+	/* Check if platform trap handler is registered (g_platform declared in platform.h) */
+
 	if ((opcode & 0xF000) == 0xA000) {
+		if (g_platform.trap_handler) {
+			/* Platform handler - pass is_primary=true for UAE */
+			g_platform.trap_handler(0xA, (uint16_t)opcode, true);
+			return;
+		}
 		Exception(0xA,0);
 		return;
 	}
 
 	if ((opcode & 0xF000) == 0xF000) {
+		if (g_platform.trap_handler) {
+			g_platform.trap_handler(0xB, (uint16_t)opcode, true);
+			return;
+		}
 		Exception(0xB,0);
 		return;
 	}

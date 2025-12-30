@@ -3,6 +3,7 @@
  */
 
 #include "unicorn_wrapper.h"
+#include "platform.h"
 #include <unicorn/unicorn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,30 +48,51 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
     opcode = __builtin_bswap16(opcode);
     #endif
 
+    /* Check platform handlers first (g_platform declared in platform.h) */
+
     /* Check if EmulOp (0x71xx for M68K) */
     if ((opcode & 0xFF00) == 0x7100) {
-        if (cpu->emulop_handler) {
-            cpu->emulop_handler(opcode, cpu->emulop_user_data);
+        if (g_platform.emulop_handler) {
+            /* Platform handler - pass is_primary=false for Unicorn */
+            g_platform.emulop_handler(opcode, false);
             /* Advance past EmulOp */
             pc += 2;
             uc_reg_write(uc, UC_M68K_REG_PC, &pc);
-            return true;  /* Handled */
+            return true;
+        }
+        /* Fallback to per-CPU handler */
+        if (cpu->emulop_handler) {
+            cpu->emulop_handler(opcode, cpu->emulop_user_data);
+            pc += 2;
+            uc_reg_write(uc, UC_M68K_REG_PC, &pc);
+            return true;
         }
     }
 
     /* Check for A-line trap (0xAxxx) */
     if ((opcode & 0xF000) == 0xA000) {
+        if (g_platform.trap_handler) {
+            /* Platform handler - pass is_primary=false for Unicorn */
+            g_platform.trap_handler(0xA, opcode, false);
+            return true;
+        }
+        /* Fallback to per-CPU handler */
         if (cpu->exception_handler) {
             cpu->exception_handler(cpu, 10, opcode);
-            return true;  /* Handled */
+            return true;
         }
     }
 
     /* Check for F-line trap (0xFxxx) */
     if ((opcode & 0xF000) == 0xF000) {
+        if (g_platform.trap_handler) {
+            g_platform.trap_handler(0xB, opcode, false);
+            return true;
+        }
+        /* Fallback to per-CPU handler */
         if (cpu->exception_handler) {
             cpu->exception_handler(cpu, 11, opcode);
-            return true;  /* Handled */
+            return true;
         }
     }
 

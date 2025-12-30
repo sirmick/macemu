@@ -44,6 +44,12 @@ static struct {
     uint32_t last_good_pc;
 } validation_state = {0};
 
+/* Forward declarations for hook handlers */
+static void uae_emulop_hook(uint16_t opcode, void *user_data);
+static void uae_trap_hook(int vector, uint16_t opcode, void *user_data);
+static void unicorn_emulop_hook(uint16_t opcode, void *user_data);
+static void unicorn_exception_hook(UnicornCPU *cpu, int vector_nr, uint16_t opcode);
+
 /* Initialize validation */
 bool unicorn_validation_init(void) {
     if (validation_state.initialized) {
@@ -135,9 +141,9 @@ bool unicorn_validation_init(void) {
     // State will be synced on first instruction execution in unicorn_validation_step()
     printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
 
-    // Register exception handler for A-line/F-line traps
-    unicorn_set_exception_handler(validation_state.unicorn, unicorn_simulate_exception);
-    printf("✓ Exception handler registered (A-line/F-line)\n");
+    // NOTE: EmulOp/trap handlers are now registered by cpu_dualcpu_install() via platform API
+    // No need to register hooks here - the CPU wrappers will call platform handlers automatically
+    printf("✓ Platform handlers configured by CPU backend\n");
 
     // Open log file
     validation_state.log_file = fopen("cpu_validation.log", "w");
@@ -209,6 +215,132 @@ static uint16_t read_word_be(uint32_t addr) {
     return 0;
 }
 
+/* Hook Handlers - UAE is Master */
+
+static void uae_emulop_hook(uint16_t opcode, bool is_primary) {
+    validation_state.emulop_count++;
+
+    if (is_primary) {
+        // UAE is primary: Execute EmulOp and sync to Unicorn
+        struct M68kRegisters regs;
+        for (int i = 0; i < 8; i++) {
+            regs.d[i] = uae_get_dreg(i);
+            regs.a[i] = uae_get_areg(i);
+        }
+        regs.sr = uae_get_sr();
+
+        // Call EmulOp
+        extern void EmulOp(uint16 opcode, struct M68kRegisters *r);
+        EmulOp(opcode, &regs);
+
+        // Write registers back to UAE
+        for (int i = 0; i < 8; i++) {
+            uae_set_dreg(i, regs.d[i]);
+            uae_set_areg(i, regs.a[i]);
+        }
+        uae_set_sr(regs.sr);
+
+        // NOTE: PC will be advanced by the opcode handler (m68k_incpc(2))
+        // Sync entire state from UAE to Unicorn (EmulOp can modify anything)
+        for (int i = 0; i < 8; i++) {
+            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
+            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+        }
+        // PC will be synced after opcode handler increments it
+        uint32_t current_pc = uae_get_pc();
+        unicorn_set_pc(validation_state.unicorn, current_pc + 2);  // Sync with post-increment PC
+        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
+
+        // Sync all RAM (EmulOp can write anywhere)
+        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+    } else {
+        // Unicorn is secondary: Just skip the instruction, state will be synced from UAE
+        // (PC is advanced by Unicorn wrapper, no further action needed)
+    }
+}
+
+static void uae_trap_hook(int vector, uint16_t opcode, bool is_primary) {
+    (void)opcode;
+
+    if (is_primary) {
+        // UAE is primary: Execute trap and sync to Unicorn
+        extern void Exception(int nr, uaecptr oldpc);
+        Exception(vector, 0);
+
+        // Sync entire state from UAE to Unicorn
+        for (int i = 0; i < 8; i++) {
+            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
+            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+        }
+        unicorn_set_pc(validation_state.unicorn, uae_get_pc());
+        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
+
+        // Sync all RAM
+        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+    } else {
+        // Unicorn is secondary: Skip, state will be synced from UAE
+    }
+}
+
+/* Hook Handlers - Unicorn is Master */
+
+static void unicorn_emulop_hook(uint16_t opcode, void *user_data) {
+    (void)user_data;
+    validation_state.emulop_count++;
+
+    // Build M68kRegisters struct from Unicorn state
+    struct M68kRegisters regs;
+    for (int i = 0; i < 8; i++) {
+        regs.d[i] = unicorn_get_dreg(validation_state.unicorn, i);
+        regs.a[i] = unicorn_get_areg(validation_state.unicorn, i);
+    }
+    regs.sr = unicorn_get_sr(validation_state.unicorn);
+
+    // Call EmulOp handler
+    extern void EmulOp(uint16 opcode, struct M68kRegisters *r);
+    EmulOp(opcode, &regs);
+
+    // Write registers back to Unicorn
+    for (int i = 0; i < 8; i++) {
+        unicorn_set_dreg(validation_state.unicorn, i, regs.d[i]);
+        unicorn_set_areg(validation_state.unicorn, i, regs.a[i]);
+    }
+    unicorn_set_sr(validation_state.unicorn, regs.sr);
+
+    // Note: Unicorn wrapper already advances PC by 2
+
+    // Sync entire state from Unicorn to UAE
+    for (int i = 0; i < 8; i++) {
+        uae_set_dreg(i, regs.d[i]);
+        uae_set_areg(i, regs.a[i]);
+    }
+    uint32_t new_pc = unicorn_get_pc(validation_state.unicorn);
+    uae_set_pc(new_pc);
+    uae_set_sr(regs.sr);
+
+    // Sync all RAM (EmulOp can write anywhere)
+    unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+}
+
+static void unicorn_exception_hook(UnicornCPU *cpu, int vector_nr, uint16_t opcode) {
+    (void)cpu;
+    (void)opcode;
+
+    // Unicorn handles the exception via unicorn_exception.c
+    // We just need to sync state to UAE after exception handling
+
+    // Sync entire state from Unicorn to UAE
+    for (int i = 0; i < 8; i++) {
+        uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
+        uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
+    }
+    uae_set_pc(unicorn_get_pc(validation_state.unicorn));
+    uae_set_sr(unicorn_get_sr(validation_state.unicorn));
+
+    // Sync all RAM
+    unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+}
+
 /* Validate one instruction */
 bool unicorn_validation_step(void) {
     if (!validation_state.initialized || !validation_state.enabled) {
@@ -234,116 +366,9 @@ bool unicorn_validation_step(void) {
 
     validation_state.instruction_count++;
 
-    // Get current PC
+    // Get current PC and opcode (hooks will handle EmulOps and traps automatically)
     uint32_t pc = uae_get_pc();
-
-    // Check if this is an EMUL_OP instruction (0x71xx)
     uint16_t opcode = read_word_be(pc);
-    if ((opcode & 0xFF00) == 0x7100) {
-        validation_state.emulop_count++;
-
-        if (validation_state.master_cpu == MASTER_CPU_UAE) {
-            // Execute EMUL_OP on UAE, sync to Unicorn
-            uae_cpu_execute_one();
-
-            // Sync entire state from UAE to Unicorn (EMUL_OP can modify anything)
-            for (int i = 0; i < 8; i++) {
-                unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
-                unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
-            }
-            unicorn_set_pc(validation_state.unicorn, uae_get_pc());
-            unicorn_set_sr(validation_state.unicorn, uae_get_sr());
-
-            // Sync all RAM (EMUL_OP can write anywhere)
-            unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-
-            validation_state.last_good_pc = uae_get_pc();
-        } else {
-            // Execute EMUL_OP on Unicorn master: call EmulOp() manually
-            // Build M68kRegisters struct from Unicorn state
-            struct M68kRegisters regs;
-            for (int i = 0; i < 8; i++) {
-                regs.d[i] = unicorn_get_dreg(validation_state.unicorn, i);
-                regs.a[i] = unicorn_get_areg(validation_state.unicorn, i);
-            }
-            regs.sr = unicorn_get_sr(validation_state.unicorn);
-
-            // Call EmulOp handler
-            extern void EmulOp(uint16 opcode, struct M68kRegisters *r);
-            EmulOp(opcode, &regs);
-
-            // Write registers back to Unicorn
-            for (int i = 0; i < 8; i++) {
-                unicorn_set_dreg(validation_state.unicorn, i, regs.d[i]);
-                unicorn_set_areg(validation_state.unicorn, i, regs.a[i]);
-            }
-            unicorn_set_sr(validation_state.unicorn, regs.sr);
-
-            // Advance PC past the EmulOp instruction (2 bytes)
-            unicorn_set_pc(validation_state.unicorn, pc + 2);
-
-            // Sync entire state from Unicorn to UAE
-            for (int i = 0; i < 8; i++) {
-                uae_set_dreg(i, regs.d[i]);
-                uae_set_areg(i, regs.a[i]);
-            }
-            uae_set_pc(pc + 2);
-            uae_set_sr(regs.sr);
-
-            // Sync all RAM (EMUL_OP can write anywhere)
-            unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-
-            validation_state.last_good_pc = pc + 2;
-        }
-
-        return true;  // EMUL_OP handled, no divergence to report
-    }
-
-    // Check if this is an A-line or F-line trap
-    bool is_aline = (opcode & 0xF000) == 0xA000;
-    bool is_fline = (opcode & 0xF000) == 0xF000;
-
-    if (is_aline || is_fline) {
-        if (validation_state.master_cpu == MASTER_CPU_UAE) {
-            // Execute on UAE (it will handle the exception), sync to Unicorn
-            uae_cpu_execute_one();
-
-            // Sync state from UAE to Unicorn
-            for (int i = 0; i < 8; i++) {
-                unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
-                unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
-            }
-            unicorn_set_pc(validation_state.unicorn, uae_get_pc());
-            unicorn_set_sr(validation_state.unicorn, uae_get_sr());
-
-            // Sync all RAM (exception handlers write to stack, etc.)
-            unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-
-            validation_state.last_good_pc = uae_get_pc();
-        } else {
-            // Execute on Unicorn (it has exception handlers), sync to UAE
-            if (!unicorn_execute_one(validation_state.unicorn)) {
-                fprintf(stderr, "\n❌ Unicorn A-line/F-line execution failed at PC=0x%08X\n", pc);
-                fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
-                return false;
-            }
-
-            // Sync state from Unicorn to UAE
-            for (int i = 0; i < 8; i++) {
-                uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
-                uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
-            }
-            uae_set_pc(unicorn_get_pc(validation_state.unicorn));
-            uae_set_sr(unicorn_get_sr(validation_state.unicorn));
-
-            // Sync all RAM
-            unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-
-            validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
-        }
-
-        return true;  // Exception handled, no divergence to report
-    }
 
     // Normal instruction - capture state before
     uint32_t uae_pc_before = pc;
@@ -600,4 +625,25 @@ void unicorn_validation_set_enabled(bool enabled) {
 void unicorn_validation_get_stats(uint64_t *instructions, uint64_t *divergences) {
     if (instructions) *instructions = validation_state.instruction_count;
     if (divergences) *divergences = validation_state.divergence_count;
+}
+
+/* Platform EmulOp/Trap Handlers - UAE is Primary */
+
+void unicorn_validation_uae_emulop_primary(uint16_t opcode, bool is_primary) {
+    uae_emulop_hook(opcode, is_primary);
+}
+
+void unicorn_validation_uae_trap_primary(int vector, uint16_t opcode, bool is_primary) {
+    uae_trap_hook(vector, opcode, is_primary);
+}
+
+/* Platform EmulOp/Trap Handlers - Unicorn is Primary */
+
+void unicorn_validation_unicorn_emulop_primary(uint16_t opcode) {
+    unicorn_emulop_hook(opcode, NULL);
+}
+
+void unicorn_validation_unicorn_trap_primary(int vector, uint16_t opcode) {
+    (void)vector;  // Vector passed in opcode for Unicorn
+    unicorn_exception_hook(validation_state.unicorn, vector, opcode);
 }

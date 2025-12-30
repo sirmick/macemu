@@ -206,6 +206,30 @@ void uae_set_sr(uint16_t value) {
     MakeFromSR();  /* Extract flags from SR into separate variables (OPTIMIZED_FLAGS) */
 }
 
+/* Hook handlers */
+static UaeEmulOpHandler g_emulop_handler = NULL;
+static void *g_emulop_user_data = NULL;
+static UaeTrapHandler g_trap_handler = NULL;
+static void *g_trap_user_data = NULL;
+
+void uae_set_emulop_handler(UaeEmulOpHandler handler, void *user_data) {
+    g_emulop_handler = handler;
+    g_emulop_user_data = user_data;
+}
+
+void uae_set_trap_handler(UaeTrapHandler handler, void *user_data) {
+    g_trap_handler = handler;
+    g_trap_user_data = user_data;
+}
+
+/* Internal accessor functions for UAE CPU core */
+extern "C" {
+    void* uae_get_emulop_handler(void) { return (void*)g_emulop_handler; }
+    void* uae_get_emulop_user_data(void) { return g_emulop_user_data; }
+    void* uae_get_trap_handler(void) { return (void*)g_trap_handler; }
+    void* uae_get_trap_user_data(void) { return g_trap_user_data; }
+}
+
 /* Execution */
 
 // Debug trace control (set CPU_TRACE=1 environment variable to enable)
