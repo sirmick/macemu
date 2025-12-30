@@ -25,6 +25,7 @@ FPNG_CFLAGS = -msse4.1 -mpclmul
 # Source files
 SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/config/server_config.cpp \
+              $(SERVER_DIR)/config/config_manager.cpp \
               $(SERVER_DIR)/utils/keyboard_map.cpp \
               $(SERVER_DIR)/utils/json_utils.cpp \
               $(SERVER_DIR)/ipc/ipc_connection.cpp \
@@ -42,6 +43,7 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
 # Object files
 SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/server_config.o \
+              $(BUILD_DIR)/config_manager.o \
               $(BUILD_DIR)/keyboard_map.o \
               $(BUILD_DIR)/json_utils.o \
               $(BUILD_DIR)/ipc_connection.o \
@@ -206,3 +208,9 @@ help:
 	@echo "  6. Open http://localhost:8000 in browser"
 
 .PHONY: all dirs run clean distclean help libdatachannel install
+
+# Config manager
+$(BUILD_DIR)/config_manager.o: $(SERVER_DIR)/config/config_manager.cpp \
+                                $(SERVER_DIR)/config/config_manager.h \
+                                $(SERVER_DIR)/utils/json_utils.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@

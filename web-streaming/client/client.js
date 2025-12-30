@@ -1042,11 +1042,6 @@ class BasiliskWebRTC {
                         codecSelect.disabled = false;
                     }
 
-                    // Update codec badge immediately
-                    const codecBadge = document.getElementById('codec-badge');
-                    if (codecBadge) {
-                        codecBadge.textContent = getCodecLabel(this.codecType);
-                    }
                 }
                 if (debugConfig.debug_connection) {
                     logger.info('Server acknowledged connection', { codec: msg.codec, peer_id: msg.peer_id });
@@ -2233,11 +2228,6 @@ class BasiliskWebRTC {
             this.cachedWidth = width;
             this.cachedHeight = height;
 
-            // Codec badge
-            const codecBadge = document.getElementById('codec-badge');
-            if (codecBadge) {
-                codecBadge.textContent = getCodecLabel(this.codecType);
-            }
 
             // Footer resolution
             const resEl = document.getElementById('resolution');
@@ -2709,38 +2699,63 @@ async function changeMouseMode() {
 
 // Known ROM database with checksums and recommendations
 const ROM_DATABASE = {
-    // Mac II family
-    '97851db6': { name: 'Mac II', model: 5, recommended: false },
-    'b2e362a8': { name: 'Mac IIx', model: 6, recommended: false },
-    '4147dd77': { name: 'Mac IIcx', model: 7, recommended: false },
-    '368cadfe': { name: 'Mac IIci', model: 11, recommended: true },
-    '36b7fb6c': { name: 'Mac IIfx', model: 13, recommended: false },
+    // ========================================
+    // 68k ROMs (BasiliskII)
+    // ========================================
 
-    // Quadra family
-    '420dbff3': { name: 'Quadra 700', model: 22, recommended: true },
-    '3dc27823': { name: 'Quadra 900', model: 14, recommended: true },
-    '49579803': { name: 'Quadra 950', model: 26, recommended: false },
+    // ⭐ RECOMMENDED 68k ROMs
+    '420dbff3': { name: 'Quadra 700', model: 22, recommended: true, arch: 'm68k' },
+    '3dc27823': { name: 'Quadra 900', model: 14, recommended: true, arch: 'm68k' },
+    '368cadfe': { name: 'Mac IIci', model: 11, recommended: true, arch: 'm68k' },
 
-    // LC/Performa family
-    '350eacf0': { name: 'LC', model: 19, recommended: false },
-    '35c28f5f': { name: 'LC II', model: 37, recommended: false },
-    'ecbbc41c': { name: 'LC III', model: 27, recommended: false },
-    'ecd99dc0': { name: 'LC 475/Performa 475', model: 44, recommended: false },
-    'ff7439ee': { name: 'LC 575/Performa 575', model: 60, recommended: false },
+    // ========================================
+    // PPC ROMs (SheepShaver)
+    // ========================================
 
-    // Classic family
-    'a49f9914': { name: 'Classic', model: 17, recommended: false },
-    '3193670e': { name: 'Classic II', model: 23, recommended: false },
+    // ⭐ RECOMMENDED PPC ROMs
+    '960e4be9': { name: 'Power Mac 9600', model: 14, recommended: true, arch: 'ppc' },
+    'be65e1c4f04a3f2881d6e8de47d66454': { name: 'Mac OS ROM 1.6', model: 14, recommended: true, arch: 'ppc' },
+    'bf9f186ba2dcaaa0bc2b9762a4bf0c4a': { name: 'Mac OS 9.0.4 installed on iMac (2000)', model: 14, recommended: true, arch: 'ppc' },
 
-    // Common alternate checksums
-    '9779d2c4': { name: 'Mac IIci (alternate)', model: 11, recommended: false },
-    'e33b2724': { name: 'Quadra 610', model: 52, recommended: false },
-    'f1a6f343': { name: 'Quadra 650', model: 36, recommended: false },
-    'f1acad13': { name: 'Quadra 800', model: 35, recommended: false },
+    // Other PPC ROMs
+    '4c4f5744': { name: 'PowerBook G3', model: 14, recommended: false, arch: 'ppc' },
 };
 
-function getRomInfo(checksum) {
-    return ROM_DATABASE[checksum] || null;
+function getRomInfo(checksum, md5) {
+    // Try MD5 first (newer, more accurate)
+    if (md5 && ROM_DATABASE[md5]) {
+        return ROM_DATABASE[md5];
+    }
+    // Fall back to checksum (older ROMs)
+    if (checksum && ROM_DATABASE[checksum]) {
+        return ROM_DATABASE[checksum];
+    }
+    return null;
+}
+
+// Update header title with current model name
+function updateHeaderTitle() {
+    const titleEl = document.getElementById('emulator-title');
+    if (!titleEl) return;
+
+    // Get current ROM and look up its info
+    if (!currentConfig.rom || !storageCache?.roms) {
+        titleEl.textContent = 'Macintosh';
+        return;
+    }
+
+    const rom = storageCache.roms.find(r => r.name === currentConfig.rom);
+    if (!rom) {
+        titleEl.textContent = 'Macintosh';
+        return;
+    }
+
+    const info = getRomInfo(rom.checksum, rom.md5);
+    if (info?.name) {
+        titleEl.textContent = info.name;
+    } else {
+        titleEl.textContent = 'Macintosh';
+    }
 }
 
 // Handle fullscreen changes
@@ -2751,201 +2766,6 @@ document.addEventListener('fullscreenchange', () => {
 // ============================================================================
 // Prefs File Handling
 // ============================================================================
-
-// Default prefs template - JS handles all config complexity
-const PREFS_TEMPLATE = `# Basilisk II preferences - generated by web UI
-
-# ROM file (required)
-rom {{ROM_PATH}}
-
-# Disk images
-{{DISK_LINES}}
-
-# CD-ROM images
-{{CDROM_LINES}}
-
-# Hardware settings
-ramsize {{RAM_BYTES}}
-screen ipc/{{SCREEN_W}}/{{SCREEN_H}}
-cpu {{CPU}}
-modelid {{MODEL}}
-fpu {{FPU}}
-jit {{JIT}}
-nosound {{NOSOUND}}
-
-# JIT settings
-jitfpu true
-jitcachesize 8192
-jitlazyflush true
-jitinline true
-jitdebug false
-
-# Display settings
-displaycolordepth 0
-frameskip 0
-scale_nearest false
-scale_integer false
-
-# WebRTC streaming settings
-webcodec {{WEBCODEC}}
-mousemode {{MOUSEMODE}}
-
-# Input settings
-keyboardtype 5
-keycodes false
-mousewheelmode 1
-mousewheellines 3
-swap_opt_cmd true
-hotkey 0
-
-# Serial/Network
-seriala /dev/null
-serialb /dev/null
-udptunnel false
-udpport 6066
-etherpermanentaddress true
-ethermulticastmode 0
-routerenabled false
-ftp_port_list 21
-
-# Boot settings
-bootdrive 0
-bootdriver 0
-nocdrom false
-
-# System settings
-ignoresegv true
-idlewait true
-noclipconversion false
-nogui true
-sound_buffer 0
-name_encoding 0
-delay 0
-init_grab false
-yearofs 0
-dayofs 0
-reservewindowskey false
-
-# ExtFS settings
-enableextfs false
-debugextfs false
-extfs ./storage
-extdrives CDEFGHIJKLMNOPQRSTUVWXYZ
-pollmedia true
-`;
-
-// Parse prefs file content into config object
-function parsePrefsFile(content) {
-    const config = {
-        rom: '',
-        disks: [],
-        cdroms: [],
-        ram: 32,
-        screen: '800x600',
-        cpu: 4,
-        model: 14,
-        fpu: true,
-        jit: true,
-        sound: true,
-        webcodec: 'h264',
-        mousemode: 'relative'
-    };
-
-    if (!content) return config;
-
-    const lines = content.split('\n');
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-
-        const spaceIdx = trimmed.indexOf(' ');
-        if (spaceIdx === -1) continue;
-
-        const key = trimmed.substring(0, spaceIdx);
-        const value = trimmed.substring(spaceIdx + 1).trim();
-
-        switch (key) {
-            case 'rom':
-                // Store path relative to romsPath (strip the base path prefix if present)
-                // e.g., "storage/roms/1MB ROMs/foo.ROM" -> "1MB ROMs/foo.ROM"
-                // or just "1MB ROMs/foo.ROM" if already relative
-                config.rom = value.replace(/^storage\/roms\//, '');
-                break;
-            case 'disk':
-                // Store path relative to imagesPath
-                config.disks.push(value.replace(/^storage\/images\//, ''));
-                break;
-            case 'cdrom':
-                // Store path relative to imagesPath
-                config.cdroms.push(value.replace(/^storage\/images\//, ''));
-                break;
-            case 'ramsize':
-                config.ram = Math.round(parseInt(value) / (1024 * 1024));
-                break;
-            case 'screen':
-                // Parse "ipc/800/600" format
-                const parts = value.split('/');
-                if (parts.length >= 3) {
-                    config.screen = `${parts[1]}x${parts[2]}`;
-                }
-                break;
-            case 'cpu':
-                config.cpu = parseInt(value);
-                break;
-            case 'modelid':
-                config.model = parseInt(value);
-                break;
-            case 'fpu':
-                config.fpu = value === 'true';
-                break;
-            case 'jit':
-                config.jit = value === 'true';
-                break;
-            case 'nosound':
-                config.sound = value !== 'true';
-                break;
-            case 'webcodec':
-                config.webcodec = value;
-                break;
-            case 'mousemode':
-                config.mousemode = value;
-                break;
-        }
-    }
-
-    return config;
-}
-
-// Generate prefs file content from config object
-function generatePrefsFile(config, romsPath, imagesPath) {
-    // Get absolute paths (server provides base paths)
-    const romPath = config.rom ? `${romsPath}/${config.rom}` : '';
-    const diskLines = config.disks.map(d => `disk ${imagesPath}/${d}`).join('\n');
-    const cdromLines = config.cdroms.map(d => `cdrom ${imagesPath}/${d}`).join('\n');
-
-    // Parse screen resolution
-    const screenMatch = config.screen.match(/(\d+)x(\d+)/);
-    const screenW = screenMatch ? screenMatch[1] : '800';
-    const screenH = screenMatch ? screenMatch[2] : '600';
-
-    // Apply template
-    let prefs = PREFS_TEMPLATE
-        .replace('{{ROM_PATH}}', romPath)
-        .replace('{{DISK_LINES}}', diskLines || '# No disk images configured')
-        .replace('{{CDROM_LINES}}', cdromLines || '# No CD-ROM images configured')
-        .replace('{{RAM_BYTES}}', (config.ram * 1024 * 1024).toString())
-        .replace('{{SCREEN_W}}', screenW)
-        .replace('{{SCREEN_H}}', screenH)
-        .replace('{{CPU}}', config.cpu.toString())
-        .replace('{{MODEL}}', config.model.toString())
-        .replace('{{FPU}}', config.fpu ? 'true' : 'false')
-        .replace('{{JIT}}', config.jit ? 'true' : 'false')
-        .replace('{{NOSOUND}}', config.sound ? 'false' : 'true')
-        .replace('{{WEBCODEC}}', config.webcodec || 'h264')
-        .replace('{{MOUSEMODE}}', config.mousemode || 'relative');
-
-    return prefs;
-}
 
 // ============================================================================
 // Configuration Modal
@@ -3026,34 +2846,80 @@ async function loadRomList() {
         }
 
         if (data.roms && data.roms.length > 0) {
-            // Sort: recommended first, then by name
-            const sortedRoms = data.roms.slice().sort((a, b) => {
-                const infoA = getRomInfo(a.checksum);
-                const infoB = getRomInfo(b.checksum);
-                if (infoA?.recommended && !infoB?.recommended) return -1;
-                if (!infoA?.recommended && infoB?.recommended) return 1;
-                return a.name.localeCompare(b.name);
+            // Determine current emulator architecture
+            const currentArch = (currentConfig.emulator === 'sheepshaver') ? 'ppc' : 'm68k';
+
+            // Filter and categorize ROMs
+            const recommendedRoms = [];
+            const otherRoms = [];
+            const seenKnownMD5 = new Set();
+
+            data.roms.forEach(rom => {
+                const info = getRomInfo(rom.checksum, rom.md5);
+
+                // Filter: only show ROMs matching current architecture (or unknown)
+                if (info && info.arch && info.arch !== currentArch) {
+                    return; // Skip incompatible ROMs
+                }
+
+                // Deduplicate known ROMs only (skip if we've seen this MD5 or checksum)
+                const hash = rom.md5 || rom.checksum;
+                if (info && seenKnownMD5.has(hash)) {
+                    return; // Skip duplicate known ROM
+                }
+                if (info) {
+                    seenKnownMD5.add(hash);
+                }
+
+                if (info?.recommended && info.arch === currentArch) {
+                    recommendedRoms.push(rom);
+                } else {
+                    otherRoms.push(rom);
+                }
             });
 
-            select.innerHTML = sortedRoms.map(rom => {
-                const info = getRomInfo(rom.checksum);
-                const displayName = info ? info.name : `${rom.name} [${rom.checksum}]`;
-                const sizeStr = rom.size ? ` - ${(rom.size / 1024 / 1024).toFixed(1)} MB` : '';
-                const recStr = info?.recommended ? ' ★' : '';
-                const selected = currentConfig.rom === rom.name ? 'selected' : '';
-                return `<option value="${rom.name}" ${selected}>${displayName}${sizeStr}${recStr}</option>`;
-            }).join('');
+            // Sort each category by name
+            recommendedRoms.sort((a, b) => a.name.localeCompare(b.name));
+            otherRoms.sort((a, b) => a.name.localeCompare(b.name));
+
+            // Build HTML with recommended ROMs first
+            let html = '';
+
+            if (recommendedRoms.length > 0) {
+                html += recommendedRoms.map(rom => {
+                    const info = getRomInfo(rom.checksum, rom.md5);
+                    const displayName = info ? info.name : rom.name;
+                    const sizeStr = rom.size ? ` (${(rom.size / 1024 / 1024).toFixed(1)} MB)` : '';
+                    const selected = currentConfig.rom === rom.name ? 'selected' : '';
+                    return `<option value="${rom.name}" ${selected}>${displayName}${sizeStr}</option>`;
+                }).join('');
+            }
+
+            if (otherRoms.length > 0) {
+                // Add separator if we have both categories
+                if (recommendedRoms.length > 0) {
+                    html += '<option disabled>──────────────────</option>';
+                }
+
+                html += otherRoms.map(rom => {
+                    const info = getRomInfo(rom.checksum, rom.md5);
+                    const displayName = info ? info.name : rom.name;
+                    const checksumStr = info ? '' : ` [${rom.checksum.substring(0, 8)}]`;
+                    const sizeStr = rom.size ? ` (${(rom.size / 1024 / 1024).toFixed(1)} MB)` : '';
+                    const selected = currentConfig.rom === rom.name ? 'selected' : '';
+                    return `<option value="${rom.name}" ${selected}>${displayName}${checksumStr}${sizeStr}</option>`;
+                }).join('');
+            }
+
+            select.innerHTML = html;
 
             // Auto-select first recommended ROM if none selected
-            if (!currentConfig.rom) {
-                const recommended = sortedRoms.find(r => getRomInfo(r.checksum)?.recommended);
-                if (recommended) {
-                    currentConfig.rom = recommended.name;
-                    select.value = recommended.name;
-                } else if (sortedRoms.length > 0) {
-                    currentConfig.rom = sortedRoms[0].name;
-                    select.value = sortedRoms[0].name;
-                }
+            if (!currentConfig.rom && recommendedRoms.length > 0) {
+                currentConfig.rom = recommendedRoms[0].name;
+                select.value = recommendedRoms[0].name;
+            } else if (!currentConfig.rom && otherRoms.length > 0) {
+                currentConfig.rom = otherRoms[0].name;
+                select.value = otherRoms[0].name;
             }
         } else {
             select.innerHTML = '<option value="">No ROM files found</option>';
@@ -3134,6 +3000,54 @@ function updateCdromSelection() {
     currentConfig.cdroms = Array.from(checkboxes).map(cb => cb.value);
 }
 
+// Helper to show/hide emulator-specific settings panels (no side effects)
+function updateEmulatorPanelVisibility() {
+    const emulatorType = document.getElementById('cfg-emulator')?.value;
+    if (!emulatorType) return;
+
+    const basiliskSettings = document.getElementById('basilisk-settings');
+    const sheepshaverSettings = document.getElementById('sheepshaver-settings');
+
+    if (emulatorType === 'sheepshaver') {
+        if (basiliskSettings) basiliskSettings.style.display = 'none';
+        if (sheepshaverSettings) sheepshaverSettings.style.display = 'block';
+    } else {
+        if (basiliskSettings) basiliskSettings.style.display = 'block';
+        if (sheepshaverSettings) sheepshaverSettings.style.display = 'none';
+    }
+
+    // Update processor logo based on emulator type
+    const processorLogo = document.getElementById('processor-logo');
+    if (processorLogo) {
+        processorLogo.src = emulatorType === 'sheepshaver' ? 'PowerPC.svg' : 'Motorola.svg';
+        processorLogo.alt = emulatorType === 'sheepshaver' ? 'PowerPC' : 'Motorola';
+    }
+
+    // Update title with current model name
+    updateHeaderTitle();
+}
+
+// Called when user changes emulator dropdown
+async function onEmulatorChange() {
+    const emulatorType = document.getElementById('cfg-emulator')?.value;
+    if (!emulatorType) return;
+
+    // Show/hide appropriate settings
+    updateEmulatorPanelVisibility();
+
+    // Update current config emulator type
+    currentConfig.emulator = emulatorType;
+
+    // Reload ROM list to show only compatible ROMs
+    await loadRomList();
+
+    console.log('🔄 SWITCHED EMULATOR:', {
+        emulator: emulatorType,
+        cpu: currentConfig.cpu,
+        jit: currentConfig.jit
+    });
+}
+
 function onRomChange() {
     const romName = document.getElementById('cfg-rom')?.value;
     if (!romName || !storageCache?.roms) return;
@@ -3143,30 +3057,66 @@ function onRomChange() {
     if (!rom) return;
 
     // Look up ROM info and auto-set model if known
-    const info = getRomInfo(rom.checksum);
-    if (info?.model) {
+    const info = getRomInfo(rom.checksum, rom.md5);
+
+    // ONLY set modelid for 68k ROMs (BasiliskII)
+    // PPC/SheepShaver always uses model 14 (hardcoded, no user selection)
+    if (info?.model && info.arch === 'm68k') {
         const modelSelect = document.getElementById('cfg-model');
         if (modelSelect) {
             modelSelect.value = info.model;
             currentConfig.model = info.model;
+            console.log(`Auto-set model ID to ${info.model} for ${info.name}`);
         }
     }
+
+    // Update header title to show model name
+    updateHeaderTitle();
 }
 
 async function loadCurrentConfig() {
     try {
-        const res = await fetch(getApiUrl('prefs'));
-        const data = await res.json();
+        const res = await fetch(getApiUrl('config'));
+        const cfg = await res.json();
 
-        // Store server paths for later use
-        if (data.romsPath) serverPaths.romsPath = data.romsPath;
-        if (data.imagesPath) serverPaths.imagesPath = data.imagesPath;
-
-        // Parse prefs file content
-        if (data.content) {
-            currentConfig = parsePrefsFile(data.content);
-            logger.info('Loaded config from prefs file', currentConfig);
+        // Store server paths
+        if (cfg._paths) {
+            serverPaths.romsPath = cfg._paths.roms;
+            serverPaths.imagesPath = cfg._paths.images;
         }
+
+        // Convert JSON config to currentConfig format
+        const emuType = cfg.web?.emulator || 'm68k';
+        const isM68k = (emuType === 'm68k');
+        const emuCfg = isM68k ? cfg.m68k : cfg.ppc;
+
+        currentConfig = {
+            emulator: isM68k ? 'basilisk' : 'sheepshaver',
+            rom: emuCfg?.rom || '',
+            ram: cfg.common?.ram || 64,
+            screen: cfg.common?.screen || '1024x768',
+            sound: cfg.common?.sound ?? true,
+            cpu: emuCfg?.cpu || 4,
+            model: emuCfg?.modelid || 14,
+            fpu: emuCfg?.fpu ?? true,
+            jit: emuCfg?.jit ?? true,
+            jit68k: emuCfg?.jit68k ?? false,
+            disks: emuCfg?.disks || [],
+            cdroms: emuCfg?.cdroms || [],
+            idlewait: emuCfg?.idlewait ?? true,
+            ignoresegv: emuCfg?.ignoresegv ?? true,
+            ignoreillegal: emuCfg?.ignoreillegal ?? false,
+            swap_opt_cmd: emuCfg?.swap_opt_cmd ?? true,
+            keyboardtype: emuCfg?.keyboardtype || 5
+        };
+
+        console.log('📂 LOADED CONFIG from JSON:', {
+            emulator: currentConfig.emulator,
+            cpu: currentConfig.cpu,
+            jit: currentConfig.jit,
+            ram: currentConfig.ram
+        });
+
         updateConfigUI();
     } catch (e) {
         logger.warn('Failed to load current config', { error: e.message });
@@ -3174,23 +3124,51 @@ async function loadCurrentConfig() {
 }
 
 function updateConfigUI() {
+    // Common elements
+    const emulatorEl = document.getElementById('cfg-emulator');
     const romEl = document.getElementById('cfg-rom');
     const ramEl = document.getElementById('cfg-ram');
     const screenEl = document.getElementById('cfg-screen');
+    const soundEl = document.getElementById('cfg-sound');
+
+    if (emulatorEl) emulatorEl.value = currentConfig.emulator || 'basilisk';
+    if (romEl) romEl.value = currentConfig.rom;
+    if (ramEl) ramEl.value = currentConfig.ram;
+    if (screenEl) screenEl.value = currentConfig.screen;
+    if (soundEl) soundEl.checked = currentConfig.sound;
+
+    // Basilisk II specific
     const cpuEl = document.getElementById('cfg-cpu');
     const modelEl = document.getElementById('cfg-model');
     const fpuEl = document.getElementById('cfg-fpu');
     const jitEl = document.getElementById('cfg-jit');
-    const soundEl = document.getElementById('cfg-sound');
+    const idlewaitB2El = document.getElementById('cfg-idlewait-b2');
+    const ignoresegvEl = document.getElementById('cfg-ignoresegv');
 
-    if (romEl) romEl.value = currentConfig.rom;
-    if (ramEl) ramEl.value = currentConfig.ram;
-    if (screenEl) screenEl.value = currentConfig.screen;
     if (cpuEl) cpuEl.value = currentConfig.cpu;
     if (modelEl) modelEl.value = currentConfig.model;
     if (fpuEl) fpuEl.checked = currentConfig.fpu;
     if (jitEl) jitEl.checked = currentConfig.jit;
-    if (soundEl) soundEl.checked = currentConfig.sound;
+    if (idlewaitB2El) idlewaitB2El.checked = currentConfig.idlewait ?? true;
+    if (ignoresegvEl) ignoresegvEl.checked = currentConfig.ignoresegv ?? true;
+
+    // SheepShaver specific
+    const fpuSSEl = document.getElementById('cfg-fpu-ss');
+    const jitSSEl = document.getElementById('cfg-jit-ss');
+    const jit68kEl = document.getElementById('cfg-jit68k');
+    const idlewaitEl = document.getElementById('cfg-idlewait');
+    const ignoresegvSSEl = document.getElementById('cfg-ignoresegv-ss');
+    const ignoreillegalEl = document.getElementById('cfg-ignoreillegal');
+
+    if (fpuSSEl) fpuSSEl.checked = currentConfig.fpu ?? true;
+    if (jitSSEl) jitSSEl.checked = currentConfig.jit ?? true;
+    if (jit68kEl) jit68kEl.checked = currentConfig.jit68k ?? true;
+    if (idlewaitEl) idlewaitEl.checked = currentConfig.idlewait ?? true;
+    if (ignoresegvSSEl) ignoresegvSSEl.checked = currentConfig.ignoresegv ?? true;
+    if (ignoreillegalEl) ignoreillegalEl.checked = currentConfig.ignoreillegal ?? true;
+
+    // Show/hide appropriate settings (without triggering reload)
+    updateEmulatorPanelVisibility();
 
     // Update disk checkboxes
     document.querySelectorAll('#disk-list input[type="checkbox"]').forEach(cb => {
@@ -3201,34 +3179,100 @@ function updateConfigUI() {
     document.querySelectorAll('#cdrom-list input[type="checkbox"]').forEach(cb => {
         cb.checked = currentConfig.cdroms.includes(cb.value);
     });
+
+    // Update header title with model name
+    updateHeaderTitle();
 }
 
 async function saveConfig() {
-    // Gather values from form
+    // Gather common values
+    currentConfig.emulator = document.getElementById('cfg-emulator')?.value || 'basilisk';
     currentConfig.rom = document.getElementById('cfg-rom')?.value || '';
     currentConfig.ram = parseInt(document.getElementById('cfg-ram')?.value || 32);
     currentConfig.screen = document.getElementById('cfg-screen')?.value || '800x600';
-    currentConfig.cpu = parseInt(document.getElementById('cfg-cpu')?.value || 4);
-    currentConfig.model = parseInt(document.getElementById('cfg-model')?.value || 14);
-    currentConfig.fpu = document.getElementById('cfg-fpu')?.checked ?? true;
-    currentConfig.jit = document.getElementById('cfg-jit')?.checked ?? true;
     currentConfig.sound = document.getElementById('cfg-sound')?.checked ?? true;
-    // disks and cdroms already updated via updateDiskSelection() and updateCdromSelection()
 
-    // Generate prefs file content
-    const prefsContent = generatePrefsFile(currentConfig, serverPaths.romsPath, serverPaths.imagesPath);
-    logger.debug('Generated prefs file', { length: prefsContent.length });
+    // Gather emulator-specific values
+    if (currentConfig.emulator === 'basilisk') {
+        currentConfig.cpu = parseInt(document.getElementById('cfg-cpu')?.value || 4);
+        currentConfig.model = parseInt(document.getElementById('cfg-model')?.value || 14);
+        currentConfig.fpu = document.getElementById('cfg-fpu')?.checked ?? true;
+        currentConfig.jit = document.getElementById('cfg-jit')?.checked ?? true;
+        currentConfig.idlewait = document.getElementById('cfg-idlewait-b2')?.checked ?? true;
+        currentConfig.ignoresegv = document.getElementById('cfg-ignoresegv')?.checked ?? true;
+    } else {
+        // SheepShaver
+        currentConfig.cpu = 4;
+        currentConfig.model = 14;
+        currentConfig.fpu = document.getElementById('cfg-fpu-ss')?.checked ?? true;
+        currentConfig.jit = document.getElementById('cfg-jit-ss')?.checked ?? true;
+        currentConfig.jit68k = document.getElementById('cfg-jit68k')?.checked ?? true;
+        currentConfig.idlewait = document.getElementById('cfg-idlewait')?.checked ?? true;
+        currentConfig.ignoresegv = document.getElementById('cfg-ignoresegv-ss')?.checked ?? true;
+        currentConfig.ignoreillegal = document.getElementById('cfg-ignoreillegal')?.checked ?? true;
+    }
+
+    // Build unified JSON config
+    const isM68k = (currentConfig.emulator === 'basilisk');
+    const jsonConfig = {
+        version: 1,
+        web: {
+            emulator: isM68k ? 'm68k' : 'ppc',
+            codec: 'h264',  // TODO: read from UI
+            mousemode: 'relative'  // TODO: read from UI
+        },
+        common: {
+            ram: currentConfig.ram,
+            screen: currentConfig.screen,
+            sound: currentConfig.sound,
+            extfs: './storage'
+        },
+        m68k: {
+            rom: isM68k ? currentConfig.rom : '',
+            modelid: currentConfig.model,
+            cpu: currentConfig.cpu,
+            fpu: currentConfig.fpu,
+            jit: currentConfig.jit,
+            disks: isM68k ? currentConfig.disks : [],
+            cdroms: isM68k ? currentConfig.cdroms : [],
+            idlewait: currentConfig.idlewait,
+            ignoresegv: currentConfig.ignoresegv,
+            swap_opt_cmd: currentConfig.swap_opt_cmd ?? true,
+            keyboardtype: currentConfig.keyboardtype || 5
+        },
+        ppc: {
+            rom: isM68k ? '' : currentConfig.rom,
+            modelid: currentConfig.model,
+            cpu: currentConfig.cpu,
+            fpu: currentConfig.fpu,
+            jit: currentConfig.jit,
+            jit68k: currentConfig.jit68k ?? false,
+            disks: isM68k ? [] : currentConfig.disks,
+            cdroms: isM68k ? [] : currentConfig.cdroms,
+            idlewait: currentConfig.idlewait,
+            ignoresegv: currentConfig.ignoresegv,
+            ignoreillegal: currentConfig.ignoreillegal ?? false,
+            keyboardtype: currentConfig.keyboardtype || 5
+        }
+    };
+
+    console.log('💾 SAVING JSON CONFIG:', {
+        emulator: jsonConfig.web.emulator,
+        cpu: currentConfig.cpu,
+        jit: currentConfig.jit,
+        ram: currentConfig.ram
+    });
 
     try {
-        const res = await fetch(getApiUrl('prefs'), {
+        const res = await fetch(getApiUrl('config'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: prefsContent })
+            body: JSON.stringify(jsonConfig)
         });
         const data = await res.json();
 
         if (data.success) {
-            logger.info('Configuration saved');
+            console.log('✅ CONFIG SAVED to macemu-config.json');
             closeConfig();
             // Restart emulator with new config
             restartEmulator();
@@ -3310,6 +3354,7 @@ async function changeCodec() {
     }
 }
 
+// Emulator selection
 // Emulator status polling
 async function pollEmulatorStatus() {
     try {

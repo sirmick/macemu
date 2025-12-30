@@ -68,6 +68,22 @@ bool get_bool(const json& j, const std::string& key, bool default_val = false);
  */
 bool has_key(const json& j, const std::string& key);
 
+/**
+ * Get string array from JSON object
+ * @param j JSON object
+ * @param key Key to retrieve
+ * @return Vector of strings, or empty vector if key doesn't exist or is not an array
+ */
+std::vector<std::string> get_string_array(const json& j, const std::string& key);
+
+/**
+ * Parse JSON file
+ * @param path Path to JSON file
+ * @return Parsed JSON object
+ * @throws std::exception on file read or parse error
+ */
+json parse_file(const std::string& path);
+
 } // namespace json_utils
 
 #endif // JSON_UTILS_H

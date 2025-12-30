@@ -19,7 +19,10 @@ bool StaticFileHandler::handles(const std::string& path) const {
     return path == "/" ||
            path == "/index.html" ||
            path == "/client.js" ||
-           path == "/styles.css";
+           path == "/styles.css" ||
+           path == "/Apple.svg" ||
+           path == "/Motorola.svg" ||
+           path == "/PowerPC.svg";
 }
 
 Response StaticFileHandler::serve(const std::string& path) {
@@ -54,6 +57,12 @@ std::string StaticFileHandler::map_path_to_file(const std::string& path) const {
         return root_dir_ + "/client.js";
     } else if (path == "/styles.css") {
         return root_dir_ + "/styles.css";
+    } else if (path == "/Apple.svg") {
+        return root_dir_ + "/Apple.svg";
+    } else if (path == "/Motorola.svg") {
+        return root_dir_ + "/Motorola.svg";
+    } else if (path == "/PowerPC.svg") {
+        return root_dir_ + "/PowerPC.svg";
     }
     return "";  // Not found
 }
@@ -65,6 +74,8 @@ std::string StaticFileHandler::get_content_type(const std::string& path) const {
         return "application/javascript";
     } else if (path.find(".css") != std::string::npos) {
         return "text/css";
+    } else if (path.find(".svg") != std::string::npos) {
+        return "image/svg+xml";
     }
     return "text/plain";
 }

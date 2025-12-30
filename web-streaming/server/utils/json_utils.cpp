@@ -3,6 +3,7 @@
  */
 
 #include "json_utils.h"
+#include <fstream>
 
 namespace json_utils {
 
@@ -60,6 +61,38 @@ bool has_key(const json& j, const std::string& key) {
     }
 
     return j.find(key) != j.end();
+}
+
+std::vector<std::string> get_string_array(const json& j, const std::string& key) {
+    std::vector<std::string> result;
+
+    if (!j.is_object()) {
+        return result;
+    }
+
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_array()) {
+        return result;
+    }
+
+    for (const auto& elem : *it) {
+        if (elem.is_string()) {
+            result.push_back(elem.get<std::string>());
+        }
+    }
+
+    return result;
+}
+
+json parse_file(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error("Failed to open file: " + path);
+    }
+
+    json j;
+    file >> j;
+    return j;
 }
 
 } // namespace json_utils

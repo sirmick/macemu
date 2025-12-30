@@ -669,4 +669,18 @@ bool audio_set_channels(int index)
 
 // No dedicated audio thread needed - audio processing happens inline in audio_request_data()
 
+
+/*
+ *  Startup sound (SheepShaver only)
+ */
+
+#ifdef SHEEPSHAVER
+// SheepShaver-specific function (not used in BasiliskII)
+void PlayStartupSound() {
+	// Startup sound is handled by Mac OS ROM in SheepShaver
+	// No emulator-side implementation needed with IPC audio
+}
+#endif
+
+
 #endif // ENABLE_IPC_AUDIO

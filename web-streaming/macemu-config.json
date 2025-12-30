@@ -1,0 +1,43 @@
+{
+  "common": {
+    "extfs": "./storage",
+    "ram": 64,
+    "screen": "1024x768",
+    "sound": true
+  },
+  "m68k": {
+    "cdroms": [],
+    "cpu": 4,
+    "disks": [],
+    "fpu": true,
+    "idlewait": true,
+    "ignoresegv": true,
+    "jit": true,
+    "keyboardtype": 5,
+    "modelid": 14,
+    "rom": "",
+    "swap_opt_cmd": true
+  },
+  "ppc": {
+    "cdroms": [],
+    "cpu": 4,
+    "disks": [
+      "9.0.4.img"
+    ],
+    "fpu": true,
+    "idlewait": true,
+    "ignoreillegal": false,
+    "ignoresegv": true,
+    "jit": true,
+    "jit68k": false,
+    "keyboardtype": 5,
+    "modelid": 14,
+    "rom": "New World ROM/1999-05-14 - Mac OS ROM 1.6.rom"
+  },
+  "version": 1,
+  "web": {
+    "codec": "h264",
+    "emulator": "ppc",
+    "mousemode": "relative"
+  }
+}

@@ -10,6 +10,9 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <cstdio>
+#include <openssl/md5.h>
+#include <sstream>
+#include <iomanip>
 
 namespace storage {
 
@@ -37,6 +40,33 @@ static uint32_t read_rom_checksum(const std::string& path) {
     fclose(f);
     return ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
            ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+}
+
+// Helper: Calculate MD5 hash of entire file
+static std::string calculate_md5(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return "";
+
+    MD5_CTX md5_ctx;
+    MD5_Init(&md5_ctx);
+
+    unsigned char buffer[4096];
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+        MD5_Update(&md5_ctx, buffer, bytes_read);
+    }
+
+    unsigned char digest[MD5_DIGEST_LENGTH];
+    MD5_Final(digest, &md5_ctx);
+    fclose(f);
+
+    // Convert to hex string
+    std::ostringstream hex;
+    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+        hex << std::hex << std::setw(2) << std::setfill('0') << (int)digest[i];
+    }
+
+    return hex.str();
 }
 
 // Recursive directory scanning
@@ -68,10 +98,12 @@ static void scan_directory_recursive(const std::string& base_dir, const std::str
                 info.size = st.st_size;
                 info.checksum = 0;
                 info.has_checksum = false;
+                info.md5 = "";
 
                 if (read_checksums) {
                     info.checksum = read_rom_checksum(full_path);
                     info.has_checksum = true;
+                    info.md5 = calculate_md5(full_path);
                 }
 
                 files.push_back(info);
@@ -104,6 +136,7 @@ std::vector<FileInfo> scan_directory(const std::string& directory,
                 info.size = 0;
                 info.checksum = 0;
                 info.has_checksum = false;
+                info.md5 = "";
 
                 std::string full_path = directory + "/" + name;
                 struct stat st;
@@ -114,6 +147,7 @@ std::vector<FileInfo> scan_directory(const std::string& directory,
                 if (read_checksums) {
                     info.checksum = read_rom_checksum(full_path);
                     info.has_checksum = true;
+                    info.md5 = calculate_md5(full_path);
                 }
 
                 files.push_back(info);
@@ -134,9 +168,7 @@ std::string get_storage_json(const std::string& roms_path, const std::string& im
     auto disks = scan_directory(images_path, {".img", ".dsk", ".hfv", ".toast"});
     auto cdroms = scan_directory(images_path, {".iso"});
 
-    // Use nlohmann/json for proper JSON serialization
-    // Note: We'll use simple string building for now to avoid adding dependency here
-    // Could be refactored to use json_utils in a future phase
+    // Note: Client handles deduplication of known ROMs by MD5
     std::ostringstream json;
     json << "{\n";
     json << "  \"romsPath\": \"" << json_escape(roms_path) << "\",\n";
@@ -147,7 +179,8 @@ std::string get_storage_json(const std::string& roms_path, const std::string& im
         json << "{\"name\": \"" << json_escape(roms[i].name) << "\", \"size\": " << roms[i].size;
         char checksum_hex[16];
         snprintf(checksum_hex, sizeof(checksum_hex), "%08x", roms[i].checksum);
-        json << ", \"checksum\": \"" << checksum_hex << "\"}";
+        json << ", \"checksum\": \"" << checksum_hex << "\"";
+        json << ", \"md5\": \"" << roms[i].md5 << "\"}";
     }
     json << "],\n";
     json << "  \"disks\": [";

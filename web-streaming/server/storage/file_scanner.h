@@ -18,8 +18,9 @@ namespace storage {
 struct FileInfo {
     std::string name;
     int64_t size;
-    uint32_t checksum;  // First 4 bytes for ROM identification
+    uint32_t checksum;  // First 4 bytes for ROM identification (deprecated)
     bool has_checksum;
+    std::string md5;    // MD5 hash of entire file
 };
 
 /**

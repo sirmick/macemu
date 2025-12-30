@@ -22,6 +22,7 @@
 #include "utils/keyboard_map.h"
 #include "utils/json_utils.h"
 #include "config/server_config.h"
+#include "config/config_manager.h"
 #include "ipc/ipc_connection.h"
 #include "storage/file_scanner.h"
 #include "storage/prefs_manager.h"
@@ -400,15 +401,58 @@ static bool start_emulator() {
         g_started_emulator_pid = -1;
     }
 
-    // Note: Codec is now set via /api/codec endpoint, not prefs file
+    // Load unified JSON config
+    config::MacemuConfig cfg = config::load_config("macemu-config.json");
 
-    std::string emu_path = find_emulator();
-    if (emu_path.empty()) {
-        fprintf(stderr, "Emulator: No emulator found. Place BasiliskII or SheepShaver in current directory.\n");
+    // Determine which emulator to launch
+    bool is_ppc = (cfg.web.emulator == "ppc");
+    const char* emu_name = is_ppc ? "SheepShaver" : "BasiliskII";
+    std::string emu_binary = std::string("./bin/") + emu_name;
+
+    // Check if binary exists
+    if (access(emu_binary.c_str(), X_OK) != 0) {
+        fprintf(stderr, "Emulator: Binary not found or not executable: %s\n", emu_binary.c_str());
+        // Try fallback to other emulator
+        emu_name = is_ppc ? "BasiliskII" : "SheepShaver";
+        emu_binary = std::string("./bin/") + emu_name;
+        if (access(emu_binary.c_str(), X_OK) != 0) {
+            fprintf(stderr, "Emulator: No emulator found in ./bin/\n");
+            return false;
+        }
+        is_ppc = !is_ppc;  // Update flag to match fallback
+    }
+
+    // Generate appropriate prefs file
+    std::string prefs_content;
+    std::string prefs_file;
+    if (is_ppc) {
+        prefs_content = config::generate_sheepshaver_prefs(cfg, g_roms_path, g_images_path);
+        // SheepShaver reads from ~/.config/SheepShaver/prefs by default
+        const char* home = getenv("HOME");
+        std::string config_dir = std::string(home ? home : ".") + "/.config/SheepShaver";
+        // Create directory if it doesn't exist
+        mkdir((std::string(home ? home : ".") + "/.config").c_str(), 0755);
+        mkdir(config_dir.c_str(), 0755);
+        prefs_file = config_dir + "/prefs";
+    } else {
+        prefs_content = config::generate_basilisk_prefs(cfg, g_roms_path, g_images_path);
+        prefs_file = "basilisk_ii.prefs";
+    }
+
+    // Write prefs file
+    if (!storage::write_prefs_file(prefs_file, prefs_content)) {
+        fprintf(stderr, "Emulator: Failed to write prefs file: %s\n", prefs_file.c_str());
         return false;
     }
 
-    fprintf(stderr, "Emulator: Starting %s --config %s\n", emu_path.c_str(), g_prefs_path.c_str());
+    fprintf(stderr, "\n");
+    fprintf(stderr, "🚀 LAUNCHING EMULATOR:\n");
+    fprintf(stderr, "   Type:   %s\n", emu_name);
+    fprintf(stderr, "   Binary: %s\n", emu_binary.c_str());
+    fprintf(stderr, "   Prefs:  %s (generated from macemu-config.json)\n", prefs_file.c_str());
+    fprintf(stderr, "   Codec:  %s\n", cfg.web.codec.c_str());
+    fprintf(stderr, "   Mouse:  %s\n", cfg.web.mousemode.c_str());
+    fprintf(stderr, "\n");
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -429,14 +473,15 @@ static bool start_emulator() {
         if (g_debug_perf) setenv("MACEMU_DEBUG_PERF", "1", 1);
         if (g_debug_frames) setenv("MACEMU_DEBUG_FRAMES", "1", 1);
 
-        // Execute emulator with prefs file
-        // BasiliskII uses --config, SheepShaver uses --prefs
-        if (emu_path.find("SheepShaver") != std::string::npos) {
-            execl(emu_path.c_str(), emu_path.c_str(),
-                  "--prefs", g_prefs_path.c_str(), nullptr);
+        // Execute emulator with generated prefs file
+        // BasiliskII uses --config flag, SheepShaver reads from ~/.config/SheepShaver/prefs
+        if (is_ppc) {
+            // SheepShaver: no args needed, reads prefs from default location
+            execl(emu_binary.c_str(), emu_binary.c_str(), nullptr);
         } else {
-            execl(emu_path.c_str(), emu_path.c_str(),
-                  "--config", g_prefs_path.c_str(), nullptr);
+            // BasiliskII: use --config flag
+            execl(emu_binary.c_str(), emu_binary.c_str(),
+                  "--config", prefs_file.c_str(), nullptr);
         }
 
         // If exec fails
@@ -1954,9 +1999,8 @@ static void connection_manager_loop(WebRTCServer& webrtc,
                 }
                 disconnect_from_emulator(&webrtc, false);  // Don't disconnect peers
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                if (g_auto_start_emulator) {
-                    start_emulator();
-                }
+                // Always restart when explicitly requested via web UI
+                start_emulator();
             }
         }
 

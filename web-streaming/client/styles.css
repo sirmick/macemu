@@ -17,7 +17,7 @@ body {
 /* Header */
 header {
     background: #2d2d2d;
-    padding: 10px 20px;
+    padding: 6px 12px;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -28,11 +28,11 @@ header {
 .logo {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
 }
 
 .logo h1 {
-    font-size: 1.2em;
+    font-size: 1.1em;
     font-weight: 500;
 }
 
@@ -47,14 +47,28 @@ header {
 /* Status Bar */
 .status-bar {
     display: flex;
-    gap: 20px;
-    font-size: 0.9em;
+    gap: 12px;
+    font-size: 0.85em;
 }
 
 .status-item {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
+}
+
+.status-item span {
+    font-size: 1.1em;
+    transition: filter 0.3s, opacity 0.3s;
+}
+
+.status-item span.inactive {
+    filter: grayscale(100%);
+    opacity: 0.4;
+}
+
+.status-item span.connecting {
+    animation: pulse 1s infinite;
 }
 
 .status-dot {
@@ -86,15 +100,15 @@ header {
 /* Controls */
 .controls {
     display: flex;
-    gap: 10px;
+    gap: 8px;
     align-items: center;
 }
 
 .codec-selector {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 4px 12px;
+    gap: 6px;
+    padding: 3px 8px;
     background: #3d3d3d;
     border-radius: 4px;
 }
@@ -123,10 +137,10 @@ header {
     background: #3d3d3d;
     border: none;
     color: #fff;
-    padding: 8px 16px;
+    padding: 6px 12px;
     border-radius: 4px;
     cursor: pointer;
-    font-size: 0.9em;
+    font-size: 0.85em;
     transition: background 0.2s;
 }
 

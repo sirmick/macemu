@@ -62,14 +62,21 @@ public:
     Response handle(const Request& req, bool* handled);
 
 private:
-    Response handle_config(const Request& req);
-    Response handle_config_post(const Request& req);
+    // New unified config endpoints
+    Response handle_config_get(const Request& req);     // GET /api/config - return macemu-config.json
+    Response handle_config_save(const Request& req);    // POST /api/config - save macemu-config.json
+
+    // Legacy endpoints (deprecated, kept for compatibility)
+    Response handle_config(const Request& req);         // Old config endpoint
+    Response handle_config_post(const Request& req);    // Old config POST
     Response handle_storage(const Request& req);
-    Response handle_prefs_get(const Request& req);
-    Response handle_prefs_post(const Request& req);
+    Response handle_prefs_get(const Request& req);      // Deprecated
+    Response handle_prefs_post(const Request& req);     // Deprecated
+
     Response handle_restart(const Request& req);
     Response handle_status(const Request& req);
     Response handle_codec_post(const Request& req);
+    Response handle_emulator_change(const Request& req);
     Response handle_emulator_start(const Request& req);
     Response handle_emulator_stop(const Request& req);
     Response handle_emulator_restart(const Request& req);

@@ -30,7 +30,7 @@ struct ServerConfig {
     std::string emulator_path;  // Path to BasiliskII/SheepShaver executable
 
     // Behavior
-    bool auto_start_emulator = true;
+    bool auto_start_emulator = false;  // Start with emulator off, user starts from Web UI
     pid_t target_emulator_pid = 0;  // If specified, connect to this PID only
     CodecType server_codec;          // Server-side codec preference (set in constructor)
 
