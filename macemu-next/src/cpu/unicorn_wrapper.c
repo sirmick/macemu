@@ -9,6 +9,18 @@
 #include <string.h>
 #include <stdio.h>
 
+/* MMIO Trap Region for JIT-compatible EmulOp handling */
+#define TRAP_REGION_BASE  0xFF000000UL
+#define TRAP_REGION_SIZE  0x00001000UL  /* 4KB = 2048 EmulOp slots */
+
+/* Trap context for MMIO approach */
+typedef struct {
+    uint32_t saved_pc;     /* Original PC where 0x71xx was */
+    bool in_emulop;        /* Currently handling EmulOp? */
+    bool in_trap;          /* Currently handling A-line/F-line trap? */
+    uint16_t trap_opcode;  /* Original trap opcode */
+} TrapContext;
+
 struct UnicornCPU {
     uc_engine *uc;
     UnicornArch arch;
@@ -24,7 +36,11 @@ struct UnicornCPU {
     void *memory_user_data;
     uc_hook mem_hook_handle;
 
-    uc_hook invalid_insn_hook;  // UC_HOOK_INSN_INVALID (now works with m68k_stop_interrupt)
+    uc_hook code_hook;  // UC_HOOK_CODE for EmulOps/traps (allows register modification)
+    uc_hook trap_hook;  // UC_HOOK_MEM_FETCH_UNMAPPED for MMIO trap region
+
+    /* MMIO trap context */
+    TrapContext trap_ctx;
 };
 
 /* Helper: Convert uc_err to string and store in cpu->error */
@@ -34,15 +50,77 @@ static void set_error(UnicornCPU *cpu, uc_err err) {
     }
 }
 
+/* MMIO Trap Handler - called when CPU fetches from unmapped trap region
+ * This fires even in JIT mode, making it reliable for EmulOp handling
+ */
+static void trap_mem_fetch_handler(uc_engine *uc, uc_mem_type type,
+                                   uint64_t address, int size,
+                                   int64_t value, void *user_data) {
+    UnicornCPU *cpu = (UnicornCPU *)user_data;
+
+    /* Verify address is in trap region */
+    if (address < TRAP_REGION_BASE ||
+        address >= TRAP_REGION_BASE + TRAP_REGION_SIZE) {
+        fprintf(stderr, "ERROR: Unexpected unmapped fetch at 0x%08lx\n", address);
+        return;
+    }
+
+    if (!cpu->trap_ctx.in_emulop && !cpu->trap_ctx.in_trap) {
+        fprintf(stderr, "WARNING: Trap region access without INSN_INVALID at 0x%08lx\n", address);
+        return;
+    }
+
+    /* Handle EmulOp */
+    if (cpu->trap_ctx.in_emulop) {
+        /* Calculate EmulOp number from trap address */
+        uint32_t emulop_num = (address - TRAP_REGION_BASE) / 2;
+        uint16_t opcode = 0x7100 + emulop_num;
+
+        /* Call platform EmulOp handler (same as UAE uses) */
+        if (g_platform.emulop_handler) {
+            bool pc_advanced = g_platform.emulop_handler(opcode, false);
+
+            /* Restore PC to instruction AFTER the 0x71xx */
+            uint32_t next_pc = cpu->trap_ctx.saved_pc + (pc_advanced ? 0 : 2);
+            uc_reg_write(uc, UC_M68K_REG_PC, &next_pc);
+
+            cpu->trap_ctx.in_emulop = false;
+            return;
+        }
+    }
+
+    /* Handle A-line/F-line trap */
+    if (cpu->trap_ctx.in_trap) {
+        uint16_t opcode = cpu->trap_ctx.trap_opcode;
+        int vector = ((opcode & 0xF000) == 0xA000) ? 0xA : 0xB;
+
+        if (g_platform.trap_handler) {
+            g_platform.trap_handler(vector, opcode, false);
+            /* Handler manages PC, just clear trap flag */
+            cpu->trap_ctx.in_trap = false;
+            return;
+        }
+    }
+
+    fprintf(stderr, "ERROR: Trap handler not available for address 0x%08lx\n", address);
+}
+
 /* Invalid instruction hook for EmulOp/trap handling
  * NOTE: Requires m68k_stop_interrupt() patch in Unicorn (see external/unicorn/qemu/target/m68k/unicorn.c)
  */
-static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
+/* CODE hook - called BEFORE each instruction executes
+ * This allows register modifications to persist (unlike INSN_INVALID hook)
+ * Fast-path: Only checks opcodes that look like EmulOps/traps (0x7xxx, 0xAxxx, 0xFxxx)
+ *
+ * NOTE: This function is non-static so it can be registered from cpu_unicorn.cpp
+ * for Unicorn-only mode (which uses platform handlers instead of per-CPU handlers)
+ */
+void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
     UnicornCPU *cpu = (UnicornCPU *)user_data;
-    uint32_t pc;
+    uint32_t pc = (uint32_t)address;
     uint16_t opcode;
 
-    uc_reg_read(uc, UC_M68K_REG_PC, &pc);
+    /* Read opcode at PC */
     uc_mem_read(uc, pc, &opcode, sizeof(opcode));
 
     /* M68K is big-endian, swap if needed */
@@ -50,7 +128,11 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
     opcode = __builtin_bswap16(opcode);
     #endif
 
-    fprintf(stderr, "[Hook] Invalid instruction hook called: PC=0x%08X, opcode=0x%04X\n", pc, opcode);
+    /* Fast path: Skip normal instructions */
+    uint8_t opcode_high = (opcode >> 12) & 0xF;
+    if (opcode_high != 0x7 && opcode_high != 0xA && opcode_high != 0xF) {
+        return;  // Not an EmulOp or trap, continue normally
+    }
 
     /* Check platform handlers first (g_platform declared in platform.h) */
 
@@ -59,19 +141,46 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
         if (g_platform.emulop_handler) {
             /* Platform handler - pass is_primary=false for Unicorn */
             bool pc_advanced = g_platform.emulop_handler(opcode, false);
+
+            /* Sync ALL registers back from platform to Unicorn after EmulOp */
+            /* This is necessary for Unicorn-only mode where platform == Unicorn */
+            if (g_platform.cpu_get_dreg && g_platform.cpu_get_areg) {
+                for (int i = 0; i < 8; i++) {
+                    uint32_t d = g_platform.cpu_get_dreg(i);
+                    uint32_t a = g_platform.cpu_get_areg(i);
+                    uc_reg_write(uc, UC_M68K_REG_D0 + i, &d);
+                    uc_reg_write(uc, UC_M68K_REG_A0 + i, &a);
+                }
+                if (g_platform.cpu_get_sr) {
+                    uint16_t sr = g_platform.cpu_get_sr();
+                    uc_reg_write(uc, UC_M68K_REG_SR, &sr);
+                }
+            }
+
             /* Advance past EmulOp only if handler didn't */
             if (!pc_advanced) {
                 pc += 2;
                 uc_reg_write(uc, UC_M68K_REG_PC, &pc);
             }
-            return true;
+
+            /* IMPORTANT: Stop emulation to let register writes take effect
+             * UC_HOOK_CODE is called BEFORE instruction execution, so:
+             * 1. Handler modifies registers (A7, etc.)
+             * 2. We write them to Unicorn here
+             * 3. uc_emu_stop() exits cleanly
+             * 4. Next uc_emu_start() generates new TB with updated registers
+             * This is the ONLY way to make register modifications persist in Unicorn.
+             */
+            uc_emu_stop(uc);
+            return;
         }
         /* Fallback to per-CPU handler */
         if (cpu->emulop_handler) {
             cpu->emulop_handler(opcode, cpu->emulop_user_data);
             pc += 2;
             uc_reg_write(uc, UC_M68K_REG_PC, &pc);
-            return true;
+            uc_emu_stop(uc);
+            return;
         }
     }
 
@@ -81,12 +190,14 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
             /* Platform handler - pass is_primary=false for Unicorn */
             g_platform.trap_handler(0xA, opcode, false);
             /* Handler handles PC advancement for traps */
-            return true;
+            uc_emu_stop(uc);
+            return;
         }
         /* Fallback to per-CPU handler */
         if (cpu->exception_handler) {
             cpu->exception_handler(cpu, 10, opcode);
-            return true;
+            uc_emu_stop(uc);
+            return;
         }
     }
 
@@ -96,16 +207,18 @@ static bool hook_invalid_insn(uc_engine *uc, void *user_data) {
             /* Platform handler - pass is_primary=false for Unicorn */
             g_platform.trap_handler(0xB, opcode, false);
             /* Handler handles PC advancement for traps */
-            return true;
+            uc_emu_stop(uc);
+            return;
         }
         /* Fallback to per-CPU handler */
         if (cpu->exception_handler) {
             cpu->exception_handler(cpu, 11, opcode);
-            return true;
+            uc_emu_stop(uc);
+            return;
         }
     }
 
-    return false;  /* Not handled, raise exception */
+    /* Not an EmulOp/trap we handle - let it execute normally */
 }
 
 /* Memory access hook */
@@ -172,6 +285,27 @@ UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model) {
             return NULL;
         }
     }
+
+    /* Register MMIO trap hook for JIT-compatible EmulOp/trap handling */
+    /* IMPORTANT: Don't map the trap region - leave it unmapped! */
+    err = uc_hook_add(cpu->uc, &cpu->trap_hook,
+                     UC_HOOK_MEM_FETCH_UNMAPPED,
+                     trap_mem_fetch_handler,
+                     cpu,  /* user_data */
+                     TRAP_REGION_BASE,
+                     TRAP_REGION_BASE + TRAP_REGION_SIZE - 1);
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "Failed to register MMIO trap hook: %s\n", uc_strerror(err));
+        uc_close(cpu->uc);
+        free(cpu);
+        return NULL;
+    }
+
+    /* Initialize trap context */
+    cpu->trap_ctx.saved_pc = 0;
+    cpu->trap_ctx.in_emulop = false;
+    cpu->trap_ctx.in_trap = false;
+    cpu->trap_ctx.trap_opcode = 0;
 
     return cpu;
 }
@@ -294,6 +428,78 @@ bool unicorn_execute_one(UnicornCPU *cpu) {
 
     uc_err err = uc_emu_start(cpu->uc, pc, 0xFFFFFFFFFFFFFFFFULL, 0, 1);
     if (err != UC_ERR_OK) {
+        /* Check for illegal instruction (EmulOps and traps) */
+        if (err == UC_ERR_INSN_INVALID && cpu->arch == UCPU_ARCH_M68K) {
+            /* Read opcode at PC */
+            uint16_t opcode;
+            if (uc_mem_read(cpu->uc, (uint32_t)pc, &opcode, sizeof(opcode)) == UC_ERR_OK) {
+                /* M68K is big-endian, swap if needed */
+                #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+                opcode = __builtin_bswap16(opcode);
+                #endif
+
+                static int illegal_count = 0;
+                if (illegal_count < 10 || illegal_count > 3685) {
+                    fprintf(stderr, "[ILLEGAL #%d] PC=0x%08X opcode=0x%04X\n",
+                           illegal_count, (uint32_t)pc, opcode);
+                }
+                illegal_count++;
+
+                /* MMIO Trap Approach: Redirect PC to unmapped region */
+
+                /* Handle EmulOp (0x71xx) via MMIO trap */
+                if ((opcode & 0xFF00) == 0x7100) {
+                    /* Save original PC */
+                    cpu->trap_ctx.saved_pc = (uint32_t)pc;
+                    cpu->trap_ctx.in_emulop = true;
+
+                    /* Calculate trap address in unmapped region */
+                    uint32_t emulop_num = opcode & 0xFF;
+                    uint32_t trap_addr = TRAP_REGION_BASE + (emulop_num * 2);
+
+                    /* Redirect PC to trap region */
+                    uint64_t trap_addr_64 = trap_addr;
+                    uc_reg_write(cpu->uc, UC_M68K_REG_PC, &trap_addr_64);
+
+                    /* Resume execution - will trigger UC_HOOK_MEM_FETCH_UNMAPPED */
+                    err = uc_emu_start(cpu->uc, trap_addr, 0xFFFFFFFFFFFFFFFFULL, 0, 1);
+
+                    /* Trap handler executed, check if successful */
+                    return (err == UC_ERR_OK || !cpu->trap_ctx.in_emulop);
+                }
+
+                /* Handle A-line trap (0xAxxx) via MMIO trap */
+                if ((opcode & 0xF000) == 0xA000) {
+                    cpu->trap_ctx.saved_pc = (uint32_t)pc;
+                    cpu->trap_ctx.in_trap = true;
+                    cpu->trap_ctx.trap_opcode = opcode;
+
+                    /* Use offset 0x800 in trap region for A-line traps */
+                    uint32_t trap_addr = TRAP_REGION_BASE + 0x800;
+                    uint64_t trap_addr_64 = trap_addr;
+                    uc_reg_write(cpu->uc, UC_M68K_REG_PC, &trap_addr_64);
+
+                    err = uc_emu_start(cpu->uc, trap_addr, 0xFFFFFFFFFFFFFFFFULL, 0, 1);
+                    return (err == UC_ERR_OK || !cpu->trap_ctx.in_trap);
+                }
+
+                /* Handle F-line trap (0xFxxx) via MMIO trap */
+                if ((opcode & 0xF000) == 0xF000) {
+                    cpu->trap_ctx.saved_pc = (uint32_t)pc;
+                    cpu->trap_ctx.in_trap = true;
+                    cpu->trap_ctx.trap_opcode = opcode;
+
+                    /* Use offset 0x900 in trap region for F-line traps */
+                    uint32_t trap_addr = TRAP_REGION_BASE + 0x900;
+                    uint64_t trap_addr_64 = trap_addr;
+                    uc_reg_write(cpu->uc, UC_M68K_REG_PC, &trap_addr_64);
+
+                    err = uc_emu_start(cpu->uc, trap_addr, 0xFFFFFFFFFFFFFFFFULL, 0, 1);
+                    return (err == UC_ERR_OK || !cpu->trap_ctx.in_trap);
+                }
+            }
+        }
+
         set_error(cpu, err);
         return false;
     }
@@ -454,13 +660,17 @@ void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *us
     cpu->emulop_handler = handler;
     cpu->emulop_user_data = user_data;
 
-    if (handler && !cpu->invalid_insn_hook) {
-        /* Use UC_HOOK_INSN_INVALID - now works with m68k_stop_interrupt() */
-        uc_hook_add(cpu->uc, &cpu->invalid_insn_hook, UC_HOOK_INSN_INVALID,
-                   (void *)hook_invalid_insn, cpu, 1, 0);
-    } else if (!handler && !cpu->exception_handler && cpu->invalid_insn_hook) {
-        uc_hook_del(cpu->uc, cpu->invalid_insn_hook);
-        cpu->invalid_insn_hook = 0;
+    if (handler && !cpu->code_hook) {
+        /* Use UC_HOOK_CODE - called BEFORE instruction execution
+         * This allows register modifications to persist (unlike INSN_INVALID)
+         * Fast-path filtering in hook_code() keeps overhead minimal */
+        fprintf(stderr, "[UNICORN] Registering UC_HOOK_CODE for EmulOp handling\n");
+        uc_hook_add(cpu->uc, &cpu->code_hook, UC_HOOK_CODE,
+                   (void *)hook_code, cpu, 1, 0);
+    } else if (!handler && !cpu->exception_handler && cpu->code_hook) {
+        fprintf(stderr, "[UNICORN] Unregistering UC_HOOK_CODE\n");
+        uc_hook_del(cpu->uc, cpu->code_hook);
+        cpu->code_hook = 0;
     }
 }
 
@@ -469,12 +679,13 @@ void unicorn_set_exception_handler(UnicornCPU *cpu, ExceptionHandler handler) {
 
     cpu->exception_handler = handler;
 
-    if (handler && !cpu->invalid_insn_hook) {
-        uc_hook_add(cpu->uc, &cpu->invalid_insn_hook, UC_HOOK_INSN_INVALID,
-                   (void *)hook_invalid_insn, cpu, 1, 0);
-    } else if (!handler && !cpu->emulop_handler && cpu->invalid_insn_hook) {
-        uc_hook_del(cpu->uc, cpu->invalid_insn_hook);
-        cpu->invalid_insn_hook = 0;
+    if (handler && !cpu->code_hook) {
+        /* Use UC_HOOK_CODE for trap handling */
+        uc_hook_add(cpu->uc, &cpu->code_hook, UC_HOOK_CODE,
+                   (void *)hook_code, cpu, 1, 0);
+    } else if (!handler && !cpu->emulop_handler && cpu->code_hook) {
+        uc_hook_del(cpu->uc, cpu->code_hook);
+        cpu->code_hook = 0;
     }
 }
 

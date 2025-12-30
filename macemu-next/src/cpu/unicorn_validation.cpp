@@ -37,12 +37,14 @@ typedef struct {
     // UAE state (after execution)
     uint32_t uae_pc;
     uint16_t uae_sr;
+    uint32_t uae_cacr;
     uint32_t uae_d[8];
     uint32_t uae_a[8];
 
     // Unicorn state (after execution)
     uint32_t uc_pc;
     uint16_t uc_sr;
+    uint32_t uc_cacr;
     uint32_t uc_d[8];
     uint32_t uc_a[8];
 
@@ -456,8 +458,8 @@ static bool unified_trap_handler(int vector, uint16_t opcode, bool is_uae_callin
 
 /* Helper: Add instruction to trace ringbuffer */
 static void trace_add_instruction(uint64_t instruction_num, uint32_t pc, uint16_t opcode,
-                                   uint32_t uae_pc, uint16_t uae_sr, uint32_t *uae_d, uint32_t *uae_a,
-                                   uint32_t uc_pc, uint16_t uc_sr, uint32_t *uc_d, uint32_t *uc_a,
+                                   uint32_t uae_pc, uint16_t uae_sr, uint32_t uae_cacr, uint32_t *uae_d, uint32_t *uae_a,
+                                   uint32_t uc_pc, uint16_t uc_sr, uint32_t uc_cacr, uint32_t *uc_d, uint32_t *uc_a,
                                    bool was_emulop) {
     if (!validation_state.trace_buffer) return;
 
@@ -467,10 +469,12 @@ static void trace_add_instruction(uint64_t instruction_num, uint32_t pc, uint16_
     trace->opcode = opcode;
     trace->uae_pc = uae_pc;
     trace->uae_sr = uae_sr;
+    trace->uae_cacr = uae_cacr;
     memcpy(trace->uae_d, uae_d, sizeof(trace->uae_d));
     memcpy(trace->uae_a, uae_a, sizeof(trace->uae_a));
     trace->uc_pc = uc_pc;
     trace->uc_sr = uc_sr;
+    trace->uc_cacr = uc_cacr;
     memcpy(trace->uc_d, uc_d, sizeof(trace->uc_d));
     memcpy(trace->uc_a, uc_a, sizeof(trace->uc_a));
     trace->was_emulop = was_emulop;
@@ -513,15 +517,17 @@ static void trace_dump_on_divergence(uint32_t divergence_pc, uint16_t divergence
         // Check if states match
         bool pc_match = (t->uae_pc == t->uc_pc);
         bool sr_match = (t->uae_sr == t->uc_sr);
-        bool all_match = pc_match && sr_match;
+        bool cacr_match = (t->uae_cacr == t->uc_cacr);
+        bool all_match = pc_match && sr_match && cacr_match;
         for (int j = 0; j < 8 && all_match; j++) {
             if (t->uae_d[j] != t->uc_d[j] || t->uae_a[j] != t->uc_a[j]) all_match = false;
         }
 
-        fprintf(stderr, "[%lu] PC=%08X OP=%04X%s | SR: UAE=%04X UC=%04X %s\n",
+        fprintf(stderr, "[%lu] PC=%08X OP=%04X%s | SR: UAE=%04X UC=%04X | CACR: UAE=%08X UC=%08X %s\n",
                 t->instruction_num, t->pc, t->opcode,
                 t->was_emulop ? " (EmulOp)" : "        ",
                 t->uae_sr, t->uc_sr,
+                t->uae_cacr, t->uc_cacr,
                 all_match ? "✓" : "❌");
     }
 
@@ -573,7 +579,27 @@ bool unicorn_validation_step(void) {
         uae_aregs_before[i] = uae_get_areg(i);
     }
 
-    // Execute on UAE (platform handler will be called for EmulOps/traps)
+    // For EmulOps/traps when Unicorn is primary: Execute ONLY on Unicorn, skip UAE
+    // Unicorn will execute and sync back to UAE
+    if (is_special && validation_state.master_cpu == MASTER_CPU_UNICORN) {
+        // Execute on Unicorn (platform handler will execute and sync to UAE)
+        if (!unicorn_execute_one(validation_state.unicorn)) {
+            fprintf(stderr, "\n❌ Unicorn execution failed at PC=0x%08X\n", uae_pc_before);
+            fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
+            validation_state.divergence_count++;
+            return false;
+        }
+
+        // Sync entire state from Unicorn to UAE (CPU state already synced by platform handler)
+        // Now sync RAM to ensure UAE sees memory changes from EmulOp
+        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, validation_state.unicorn_ram, RAMSize);
+        memcpy(RAMBaseHost, validation_state.unicorn_ram, RAMSize);
+
+        validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
+        return true;
+    }
+
+    // Execute on UAE (platform handler will be called for EmulOps/traps if UAE is master)
     uae_cpu_execute_one();
 
     // Capture state after
@@ -596,21 +622,6 @@ bool unicorn_validation_step(void) {
     if (is_special && validation_state.master_cpu == MASTER_CPU_UAE) {
         // State already synced by unified handler, just validate
         validation_state.last_good_pc = uae_pc_after;
-        return true;
-    }
-
-    // For EmulOps/traps when Unicorn is primary: Skip UAE execution result, run on Unicorn
-    // The UAE execution was just to keep it in sync, Unicorn will execute and sync back
-    if (is_special && validation_state.master_cpu == MASTER_CPU_UNICORN) {
-        // Execute on Unicorn (platform handler will execute and sync to UAE)
-        if (!unicorn_execute_one(validation_state.unicorn)) {
-            fprintf(stderr, "\n❌ Unicorn execution failed at PC=0x%08X\n", uae_pc_before);
-            fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
-            validation_state.divergence_count++;
-            return false;
-        }
-        // State synced by unified handler, validate
-        validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
         return true;
     }
 
@@ -713,29 +724,45 @@ bool unicorn_validation_step(void) {
         }
     }
 
-    // Skip validation for MOVEC CACR reads (UAE and Unicorn use different masking)
-    // Also sync the destination register to keep CPUs in sync
-    bool skip_validation = false;
-    if (opcode == 0x4E7A) {  // MOVEC Rc,Rn (read from control register)
-        uint16_t extension = read_word_be(uae_pc_before + 2);
-        uint16_t control_reg = extension & 0xFFF;
-        if (control_reg == 0x002) {  // CACR
-            skip_validation = true;
-            // Sync the destination register from UAE to Unicorn
-            uint16_t data_reg = (extension >> 12) & 0xF;
-            bool is_d_reg = !(data_reg & 8);
-            int reg_num = data_reg & 7;
-            if (is_d_reg) {
-                unicorn_set_dreg(validation_state.unicorn, reg_num, uae_dregs_after[reg_num]);
-            } else {
-                unicorn_set_areg(validation_state.unicorn, reg_num, uae_aregs_after[reg_num]);
-            }
-            if (validation_state.log_file) {
-                fprintf(validation_state.log_file, "[%lu] Skipping validation for MOVEC CACR,%c%d (synced %c%d=0x%08X from UAE)\n",
-                        validation_state.instruction_count,
-                        is_d_reg ? 'D' : 'A', reg_num,
-                        is_d_reg ? 'D' : 'A', reg_num,
-                        is_d_reg ? uae_dregs_after[reg_num] : uae_aregs_after[reg_num]);
+    // Get CACR values for comparison (read early to use in trace later)
+    uint32_t uae_cacr = uae_get_cacr();
+    uint32_t uc_cacr = unicorn_get_cacr(validation_state.unicorn);
+
+    // Check CACR (log but don't abort - Unicorn doesn't implement CACR properly)
+    // Also sync destination register for MOVEC CACR,Rn to prevent cascading divergences
+    if (uc_cacr != uae_cacr) {
+        // Don't set divergence = true (allowlisted)
+        if (validation_state.log_file) {
+            fprintf(validation_state.log_file, "\n[%lu] CACR MISMATCH (allowlisted) at 0x%08X (opcode 0x%04X)\n",
+                    validation_state.instruction_count, uae_pc_before, opcode);
+            fprintf(validation_state.log_file, "UAE CACR: 0x%08X\n", uae_cacr);
+            fprintf(validation_state.log_file, "UC  CACR: 0x%08X\n", uc_cacr);
+        }
+
+        // Sync CACR from UAE to Unicorn (though Unicorn may ignore it)
+        unicorn_set_cacr(validation_state.unicorn, uae_cacr);
+
+        // If this is a MOVEC CACR,Rn instruction, sync the destination register
+        if (opcode == 0x4E7A) {  // MOVEC Rc,Rn
+            uint16_t extension = read_word_be(uae_pc_before + 2);
+            uint16_t control_reg = extension & 0xFFF;
+            if (control_reg == 0x002) {  // CACR
+                uint16_t data_reg = (extension >> 12) & 0xF;
+                bool is_d_reg = !(data_reg & 8);
+                int reg_num = data_reg & 7;
+
+                if (is_d_reg) {
+                    unicorn_set_dreg(validation_state.unicorn, reg_num, uae_dregs_after[reg_num]);
+                } else {
+                    unicorn_set_areg(validation_state.unicorn, reg_num, uae_aregs_after[reg_num]);
+                }
+
+                if (validation_state.log_file) {
+                    fprintf(validation_state.log_file, "  Synced %c%d=0x%08X from UAE (MOVEC CACR,%c%d)\n",
+                            is_d_reg ? 'D' : 'A', reg_num,
+                            is_d_reg ? uae_dregs_after[reg_num] : uae_aregs_after[reg_num],
+                            is_d_reg ? 'D' : 'A', reg_num);
+                }
             }
         }
     }
@@ -744,9 +771,6 @@ bool unicorn_validation_step(void) {
     for (int i = 0; i < 8; i++) {
         uint32_t uc_dreg = unicorn_get_dreg(validation_state.unicorn, i);
         if (uc_dreg != uae_dregs_after[i]) {
-            // Skip if this is a CACR read divergence
-            if (skip_validation) continue;
-
             divergence = true;
             if (validation_state.log_file) {
                 fprintf(validation_state.log_file, "\n[%lu] D%d DIVERGENCE at 0x%08X (opcode 0x%04X)\n",
@@ -808,10 +832,10 @@ bool unicorn_validation_step(void) {
         uc_aregs[i] = unicorn_get_areg(validation_state.unicorn, i);
     }
 
-    // Add to trace ringbuffer BEFORE checking divergence
+    // Add to trace ringbuffer BEFORE checking divergence (CACR already read above)
     trace_add_instruction(validation_state.instruction_count, uae_pc_before, opcode,
-                          uae_pc_after, uae_sr_after, uae_dregs_after, uae_aregs_after,
-                          uc_pc, uc_sr, uc_dregs, uc_aregs,
+                          uae_pc_after, uae_sr_after, uae_cacr, uae_dregs_after, uae_aregs_after,
+                          uc_pc, uc_sr, uc_cacr, uc_dregs, uc_aregs,
                           is_emulop);
 
     if (divergence) {
@@ -832,6 +856,7 @@ bool unicorn_validation_step(void) {
         fprintf(stderr, "\nUAE state (after execution):\n");
         fprintf(stderr, "  PC: 0x%08X → 0x%08X\n", uae_pc_before, uae_pc_after);
         fprintf(stderr, "  SR: 0x%04X → 0x%04X  [%s]\n", uae_sr_before, uae_sr_after, format_sr_flags(uae_sr_after));
+        fprintf(stderr, "  CACR: 0x%08X\n", uae_cacr);
         fprintf(stderr, "  D0-D3: %08X %08X %08X %08X\n",
                 uae_dregs_after[0], uae_dregs_after[1], uae_dregs_after[2], uae_dregs_after[3]);
         fprintf(stderr, "  D4-D7: %08X %08X %08X %08X\n",
@@ -840,6 +865,7 @@ bool unicorn_validation_step(void) {
         fprintf(stderr, "\nUnicorn state (after execution):\n");
         fprintf(stderr, "  PC: 0x%08X → 0x%08X\n", uae_pc_before, uc_pc);
         fprintf(stderr, "  SR: 0x%04X → 0x%04X  [%s]\n", uae_sr_before, uc_sr, format_sr_flags(uc_sr));
+        fprintf(stderr, "  CACR: 0x%08X\n", uc_cacr);
         fprintf(stderr, "  D0-D3: %08X %08X %08X %08X\n",
                 uc_dregs[0], uc_dregs[1], uc_dregs[2], uc_dregs[3]);
         fprintf(stderr, "  D4-D7: %08X %08X %08X %08X\n",
@@ -852,6 +878,8 @@ bool unicorn_validation_step(void) {
             fprintf(stderr, "  ❌ SR: UAE=0x%04X [%s] vs UC=0x%04X [%s]\n",
                     uae_sr_after, format_sr_flags(uae_sr_after),
                     uc_sr, format_sr_flags(uc_sr));
+        if (uc_cacr != uae_cacr)
+            fprintf(stderr, "  ❌ CACR: UAE=0x%08X vs UC=0x%08X\n", uae_cacr, uc_cacr);
         for (int i = 0; i < 8; i++) {
             if (uc_dregs[i] != uae_dregs_after[i])
                 fprintf(stderr, "  ❌ D%d: UAE=0x%08X vs UC=0x%08X\n", i, uae_dregs_after[i], uc_dregs[i]);

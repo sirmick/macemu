@@ -95,8 +95,15 @@ void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *us
 void unicorn_set_exception_handler(UnicornCPU *cpu, ExceptionHandler handler);
 void unicorn_set_memory_hook(UnicornCPU *cpu, MemoryHookCallback callback, void *user_data);
 
-/* Internal access (for exception handler) */
+/* Internal access (for exception handler and cpu_unicorn.cpp) */
 void* unicorn_get_uc(UnicornCPU *cpu);  /* Returns uc_engine* - for exception.c only */
+
+/* Forward declare uc_engine for hook callback */
+struct uc_struct;
+typedef struct uc_struct uc_engine;
+
+/* Hook callback (for cpu_unicorn.cpp to register directly) */
+void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
 
 /* Error handling */
 const char* unicorn_get_error(UnicornCPU *cpu);
