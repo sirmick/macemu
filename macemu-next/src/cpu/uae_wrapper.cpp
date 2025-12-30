@@ -174,6 +174,16 @@ uint16_t uae_get_sr(void) {
     return regs.sr;
 }
 
+uint32_t uae_get_cacr(void) {
+    extern uae_u32 m68k_get_cacr(void);
+    return m68k_get_cacr();
+}
+
+uint32_t uae_get_vbr(void) {
+    extern uae_u32 m68k_get_vbr(void);
+    return m68k_get_vbr();
+}
+
 void uae_set_dreg(int reg, uint32_t value) {
     if (reg < 0 || reg > 7) return;
     m68k_dreg(regs, reg) = value;

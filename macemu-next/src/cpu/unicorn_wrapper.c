@@ -336,6 +336,31 @@ void unicorn_set_sr(UnicornCPU *cpu, uint16_t value) {
     uc_reg_write(cpu->uc, UC_M68K_REG_SR, &v);
 }
 
+/* Registers - M68K control registers */
+uint32_t unicorn_get_cacr(UnicornCPU *cpu) {
+    if (!cpu || !cpu->uc) return 0;
+    uint32_t value;
+    uc_reg_read(cpu->uc, UC_M68K_REG_CR_CACR, &value);
+    return value;
+}
+
+void unicorn_set_cacr(UnicornCPU *cpu, uint32_t value) {
+    if (!cpu || !cpu->uc) return;
+    uc_reg_write(cpu->uc, UC_M68K_REG_CR_CACR, &value);
+}
+
+uint32_t unicorn_get_vbr(UnicornCPU *cpu) {
+    if (!cpu || !cpu->uc) return 0;
+    uint32_t value;
+    uc_reg_read(cpu->uc, UC_M68K_REG_CR_VBR, &value);
+    return value;
+}
+
+void unicorn_set_vbr(UnicornCPU *cpu, uint32_t value) {
+    if (!cpu || !cpu->uc) return;
+    uc_reg_write(cpu->uc, UC_M68K_REG_CR_VBR, &value);
+}
+
 /* Registers - PPC */
 uint32_t unicorn_get_gpr(UnicornCPU *cpu, int reg) {
     if (!cpu || !cpu->uc || reg < 0 || reg > 31) return 0;

@@ -20,9 +20,9 @@ static bool unicorn_backend_init(void) {
 		return true;  // Already initialized
 	}
 
-	// Create Unicorn CPU with 68040 model
-	#define UC_CPU_M68K_M68040 3
-	unicorn_cpu = unicorn_create_with_model(UCPU_ARCH_M68K, UC_CPU_M68K_M68040);
+	// Create Unicorn CPU with 68030 model (matches UAE CPUType=3)
+	#define UC_CPU_M68K_M68030 3
+	unicorn_cpu = unicorn_create_with_model(UCPU_ARCH_M68K, UC_CPU_M68K_M68030);
 	if (!unicorn_cpu) {
 		fprintf(stderr, "Failed to create Unicorn CPU\n");
 		return false;

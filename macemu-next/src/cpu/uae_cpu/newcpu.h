@@ -296,6 +296,8 @@ extern void Exception (int, uaecptr);
 extern void dump_counts (void);
 extern int m68k_move2c (int, uae_u32 *);
 extern int m68k_movec2 (int, uae_u32 *);
+extern uae_u32 m68k_get_cacr(void);  /* Get Cache Control Register */
+extern uae_u32 m68k_get_vbr(void);   /* Get Vector Base Register */
 extern void m68k_divl (uae_u32, uae_u32, uae_u16, uaecptr);
 extern void m68k_mull (uae_u32, uae_u32, uae_u16);
 extern void m68k_emulop (uae_u32);

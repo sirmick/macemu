@@ -73,6 +73,12 @@ void unicorn_set_pc(UnicornCPU *cpu, uint32_t value);
 uint16_t unicorn_get_sr(UnicornCPU *cpu);
 void unicorn_set_sr(UnicornCPU *cpu, uint16_t value);
 
+/* Registers - M68K control registers */
+uint32_t unicorn_get_cacr(UnicornCPU *cpu);
+void unicorn_set_cacr(UnicornCPU *cpu, uint32_t value);
+uint32_t unicorn_get_vbr(UnicornCPU *cpu);
+void unicorn_set_vbr(UnicornCPU *cpu, uint32_t value);
+
 /* Registers - PPC specific */
 uint32_t unicorn_get_gpr(UnicornCPU *cpu, int reg);   /* GPR0-GPR31 */
 void unicorn_set_gpr(UnicornCPU *cpu, int reg, uint32_t value);

@@ -955,6 +955,15 @@ int m68k_movec2 (int regno, uae_u32 *regp)
 	return 1;
 }
 
+/* Accessor functions for control registers (for dual-CPU validation) */
+uae_u32 m68k_get_cacr(void) {
+	return cacr;
+}
+
+uae_u32 m68k_get_vbr(void) {
+	return regs.vbr;
+}
+
 #if !defined(uae_s64)
 static __inline__ int
 div_unsigned(uae_u32 src_hi, uae_u32 src_lo, uae_u32 div, uae_u32 *quot, uae_u32 *rem)

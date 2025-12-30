@@ -45,6 +45,8 @@ uint32_t uae_get_dreg(int reg);  /* D0-D7 */
 uint32_t uae_get_areg(int reg);  /* A0-A7 */
 uint32_t uae_get_pc(void);
 uint16_t uae_get_sr(void);
+uint32_t uae_get_cacr(void);  /* Cache Control Register */
+uint32_t uae_get_vbr(void);   /* Vector Base Register */
 
 void uae_set_dreg(int reg, uint32_t value);
 void uae_set_areg(int reg, uint32_t value);
