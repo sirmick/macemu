@@ -86,8 +86,8 @@ bool unicorn_validation_init(void) {
     }
     printf("✓ RAM mapped (0x%08X, %u MB)\n", RAMBaseMac, RAMSize / (1024*1024));
 
-    // Map ROM (use the patched ROM from UAE)
-    if (!unicorn_map_rom(validation_state.unicorn, ROMBaseMac, ROMBaseHost, ROMSize)) {
+    // Map ROM as writable (BasiliskII patches ROM during boot)
+    if (!unicorn_map_rom_writable(validation_state.unicorn, ROMBaseMac, ROMBaseHost, ROMSize)) {
         fprintf(stderr, "Failed to map ROM to Unicorn\n");
         unicorn_destroy(validation_state.unicorn);
         return false;

@@ -197,6 +197,27 @@ bool unicorn_map_rom(UnicornCPU *cpu, uint64_t addr, const void *host_ptr, uint6
     return true;
 }
 
+bool unicorn_map_rom_writable(UnicornCPU *cpu, uint64_t addr, const void *host_ptr, uint64_t size) {
+    if (!cpu || !cpu->uc) return false;
+
+    /* ROM mapped as writable for validation/debugging (BasiliskII patches ROM during boot) */
+    uc_err err = uc_mem_map(cpu->uc, addr, size, UC_PROT_ALL);
+    if (err != UC_ERR_OK) {
+        set_error(cpu, err);
+        return false;
+    }
+
+    /* Write ROM data */
+    if (host_ptr) {
+        err = uc_mem_write(cpu->uc, addr, host_ptr, size);
+        if (err != UC_ERR_OK) {
+            set_error(cpu, err);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool unicorn_unmap(UnicornCPU *cpu, uint64_t addr, uint64_t size) {
     if (!cpu || !cpu->uc) return false;
 

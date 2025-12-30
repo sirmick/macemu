@@ -49,6 +49,7 @@ void unicorn_destroy(UnicornCPU *cpu);
 /* Memory mapping */
 bool unicorn_map_ram(UnicornCPU *cpu, uint64_t addr, void *host_ptr, uint64_t size);
 bool unicorn_map_rom(UnicornCPU *cpu, uint64_t addr, const void *host_ptr, uint64_t size);
+bool unicorn_map_rom_writable(UnicornCPU *cpu, uint64_t addr, const void *host_ptr, uint64_t size); /* For validation/debugging */
 bool unicorn_unmap(UnicornCPU *cpu, uint64_t addr, uint64_t size);
 
 /* Memory access */
