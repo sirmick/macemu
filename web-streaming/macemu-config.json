@@ -21,23 +21,21 @@
   "ppc": {
     "cdroms": [],
     "cpu": 4,
-    "disks": [
-      "9.0.4.img"
-    ],
+    "disks": [],
     "fpu": true,
     "idlewait": true,
-    "ignoreillegal": false,
+    "ignoreillegal": true,
     "ignoresegv": true,
     "jit": true,
-    "jit68k": false,
+    "jit68k": true,
     "keyboardtype": 5,
     "modelid": 14,
-    "rom": "New World ROM/1999-05-14 - Mac OS ROM 1.6.rom"
+    "rom": ""
   },
   "version": 1,
   "web": {
     "codec": "h264",
-    "emulator": "ppc",
+    "emulator": "m68k",
     "mousemode": "relative"
   }
 }

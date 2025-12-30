@@ -1205,7 +1205,22 @@ public:
     bool has_codec_peer(CodecType codec) {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         for (auto& [id, peer] : peers_) {
-            if (peer->codec == codec && peer->ready) return true;
+            if (peer->codec == codec && peer->ready) {
+                if (g_debug_frames && codec == CodecType::H264) {
+                    static bool logged_once = false;
+                    if (!logged_once) {
+                        fprintf(stderr, "[Server] H.264 peer %s is ready\n", id.c_str());
+                        logged_once = true;
+                    }
+                }
+                return true;
+            }
+        }
+        if (g_debug_frames && codec == CodecType::H264) {
+            static int no_peer_count = 0;
+            if (no_peer_count++ < 5) {
+                fprintf(stderr, "[Server] No ready H.264 peer (total peers: %zu)\n", peers_.size());
+            }
         }
         return false;
     }

@@ -330,8 +330,12 @@ bool VideoInit(void)
     video_thread_running = true;
     video_thread = std::thread(video_refresh_thread);
 
+    // Start control socket thread (input handling)
+    ControlIPCStart();
+
     fprintf(stderr, "IPC: Video initialized (%dx%d @ %d bpp)\n",
             frame_width, frame_height, frame_depth);
+    fprintf(stderr, "IPC: Waiting for server to connect (PID %d)...\n", getpid());
 
     return true;
 }
