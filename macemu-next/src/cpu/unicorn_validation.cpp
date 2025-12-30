@@ -94,6 +94,28 @@ bool unicorn_validation_init(void) {
     }
     printf("✓ ROM mapped (0x%08X, %u KB)\n", ROMBaseMac, ROMSize / 1024);
 
+    // IMPORTANT: UAE has a bug where rom_lget/wget/bget read from (ROMBaseDiff + addr)
+    // without bounds checking. This means UAE can read PAST the end of ROM into
+    // unmapped memory. For example, address 0x0248831C (ROM + 4.5MB) gets read even
+    // though ROM is only 1MB. To match this buggy behavior and avoid UC_ERR_READ_UNMAPPED,
+    // we map additional dummy memory after ROM. Map 16MB to be safe.
+    uint32_t dummy_region_base = ROMBaseMac + ROMSize;
+    uint32_t dummy_region_size = 16 * 1024 * 1024;  // 16 MB
+    uint8_t *dummy_buffer = (uint8_t *)calloc(1, dummy_region_size);  // Zero-filled
+    if (!dummy_buffer) {
+        fprintf(stderr, "Failed to allocate dummy memory buffer\n");
+        unicorn_destroy(validation_state.unicorn);
+        return false;
+    }
+    if (!unicorn_map_ram(validation_state.unicorn, dummy_region_base, dummy_buffer, dummy_region_size)) {
+        fprintf(stderr, "Failed to map dummy region to Unicorn\n");
+        free(dummy_buffer);
+        unicorn_destroy(validation_state.unicorn);
+        return false;
+    }
+    printf("✓ Dummy region mapped (0x%08X - 0x%08X, %u MB) to match UAE out-of-bounds reads\n",
+           dummy_region_base, dummy_region_base + dummy_region_size, dummy_region_size / (1024*1024));
+
     // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
     // State will be synced on first instruction execution in unicorn_validation_step()
     printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
@@ -322,14 +344,37 @@ bool unicorn_validation_step(void) {
 
     // Execute on Unicorn
     if (!unicorn_execute_one(validation_state.unicorn)) {
-        // Unicorn execution failed
+        // Unicorn execution failed - dump full CPU state for debugging
         fprintf(stderr, "\n❌ Unicorn execution failed at PC=0x%08X\n", uae_pc_before);
         fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
+        fprintf(stderr, "\nCPU State (before instruction):\n");
+        fprintf(stderr, "D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                uae_dregs_before[0], uae_dregs_before[1], uae_dregs_before[2], uae_dregs_before[3],
+                uae_dregs_before[4], uae_dregs_before[5], uae_dregs_before[6], uae_dregs_before[7]);
+        fprintf(stderr, "A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                uae_aregs_before[0], uae_aregs_before[1], uae_aregs_before[2], uae_aregs_before[3],
+                uae_aregs_before[4], uae_aregs_before[5], uae_aregs_before[6], uae_aregs_before[7]);
+        fprintf(stderr, "SR: %04X, VBR: %08X, CACR: %08X\n", uae_sr_before, uae_get_vbr(), uae_get_cacr());
+        fprintf(stderr, "\nCPU State (after UAE executed successfully):\n");
+        fprintf(stderr, "D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                uae_dregs_after[0], uae_dregs_after[1], uae_dregs_after[2], uae_dregs_after[3],
+                uae_dregs_after[4], uae_dregs_after[5], uae_dregs_after[6], uae_dregs_after[7]);
+        fprintf(stderr, "A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                uae_aregs_after[0], uae_aregs_after[1], uae_aregs_after[2], uae_aregs_after[3],
+                uae_aregs_after[4], uae_aregs_after[5], uae_aregs_after[6], uae_aregs_after[7]);
 
         if (validation_state.log_file) {
             fprintf(validation_state.log_file, "\n[%lu] UNICORN EXECUTION FAILED\n", validation_state.instruction_count);
             fprintf(validation_state.log_file, "PC: 0x%08X, Opcode: 0x%04X\n", uae_pc_before, opcode);
             fprintf(validation_state.log_file, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
+            fprintf(validation_state.log_file, "\nCPU State (before instruction):\n");
+            fprintf(validation_state.log_file, "D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                    uae_dregs_before[0], uae_dregs_before[1], uae_dregs_before[2], uae_dregs_before[3],
+                    uae_dregs_before[4], uae_dregs_before[5], uae_dregs_before[6], uae_dregs_before[7]);
+            fprintf(validation_state.log_file, "A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                    uae_aregs_before[0], uae_aregs_before[1], uae_aregs_before[2], uae_aregs_before[3],
+                    uae_aregs_before[4], uae_aregs_before[5], uae_aregs_before[6], uae_aregs_before[7]);
+            fprintf(validation_state.log_file, "SR: %04X, VBR: %08X, CACR: %08X\n", uae_sr_before, uae_get_vbr(), uae_get_cacr());
             fflush(validation_state.log_file);
         }
 
