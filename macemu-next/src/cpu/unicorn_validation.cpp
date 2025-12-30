@@ -96,24 +96,30 @@ bool unicorn_validation_init(void) {
 
     // IMPORTANT: UAE has a bug where rom_lget/wget/bget read from (ROMBaseDiff + addr)
     // without bounds checking. This means UAE can read PAST the end of ROM into
-    // unmapped memory. For example, address 0x0248831C (ROM + 4.5MB) gets read even
-    // though ROM is only 1MB. To match this buggy behavior and avoid UC_ERR_READ_UNMAPPED,
-    // we map additional dummy memory after ROM. Map 16MB to be safe.
+    // host memory. For example, address 0x0248831C (ROM + 4.5MB) gets read even
+    // though ROM is only 1MB. UAE reads whatever garbage exists in host memory.
+    // The host allocation is RAMSize + 0x100000 (see main.cpp:119). ROM is at
+    // RAMBaseHost + RAMSize, and is 1MB, so the full allocation ends at
+    // RAMBaseHost + RAMSize + 0x100000. However, ROM already uses the full 0x100000,
+    // so there's NO extra space after ROM. We need to allocate 16MB of dummy memory
+    // to catch UAE's out-of-bounds reads. We'll fill it with a pattern to detect reads.
     uint32_t dummy_region_base = ROMBaseMac + ROMSize;
     uint32_t dummy_region_size = 16 * 1024 * 1024;  // 16 MB
-    uint8_t *dummy_buffer = (uint8_t *)calloc(1, dummy_region_size);  // Zero-filled
+    uint8_t *dummy_buffer = (uint8_t *)malloc(dummy_region_size);
     if (!dummy_buffer) {
         fprintf(stderr, "Failed to allocate dummy memory buffer\n");
         unicorn_destroy(validation_state.unicorn);
         return false;
     }
+    // Fill with 0xFF pattern to match uninitialized memory behavior
+    memset(dummy_buffer, 0xFF, dummy_region_size);
     if (!unicorn_map_ram(validation_state.unicorn, dummy_region_base, dummy_buffer, dummy_region_size)) {
         fprintf(stderr, "Failed to map dummy region to Unicorn\n");
         free(dummy_buffer);
         unicorn_destroy(validation_state.unicorn);
         return false;
     }
-    printf("✓ Dummy region mapped (0x%08X - 0x%08X, %u MB) to match UAE out-of-bounds reads\n",
+    printf("✓ Dummy region mapped (0x%08X - 0x%08X, %u MB) with 0xFF pattern\n",
            dummy_region_base, dummy_region_base + dummy_region_size, dummy_region_size / (1024*1024));
 
     // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
