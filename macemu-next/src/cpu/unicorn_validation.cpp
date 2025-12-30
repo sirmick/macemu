@@ -20,12 +20,19 @@ extern uint32 ROMBaseMac;
 extern uint8 *ROMBaseHost;
 extern uint32 ROMSize;
 
+// Master CPU selection for EmulOps and traps
+typedef enum {
+    MASTER_CPU_UAE,      // UAE handles EmulOps/traps, sync to Unicorn
+    MASTER_CPU_UNICORN   // Unicorn handles EmulOps/traps, sync to UAE
+} MasterCPU;
+
 // Validation state
 static struct {
     UnicornCPU *unicorn;
     bool enabled;
     bool initialized;
     FILE *log_file;
+    MasterCPU master_cpu;
 
     uint64_t instruction_count;
     uint64_t divergence_count;
@@ -43,6 +50,24 @@ bool unicorn_validation_init(void) {
     }
 
     printf("\n=== Initializing Unicorn Validation ===\n");
+
+    // Configure master CPU (defaults to UAE)
+    validation_state.master_cpu = MASTER_CPU_UAE;
+    const char *master_env = getenv("DUALCPU_MASTER");
+    if (master_env) {
+        if (strcmp(master_env, "unicorn") == 0 || strcmp(master_env, "UNICORN") == 0) {
+            validation_state.master_cpu = MASTER_CPU_UNICORN;
+            printf("✓ Master CPU: UNICORN (EmulOps/traps on Unicorn, sync to UAE)\n");
+        } else if (strcmp(master_env, "uae") == 0 || strcmp(master_env, "UAE") == 0) {
+            validation_state.master_cpu = MASTER_CPU_UAE;
+            printf("✓ Master CPU: UAE (EmulOps/traps on UAE, sync to Unicorn)\n");
+        } else {
+            fprintf(stderr, "Warning: Unknown DUALCPU_MASTER value '%s', defaulting to UAE\n", master_env);
+            validation_state.master_cpu = MASTER_CPU_UAE;
+        }
+    } else {
+        printf("✓ Master CPU: UAE (default)\n");
+    }
 
     // Create Unicorn CPU with 68040 model
     #define UC_CPU_M68K_M68040 3
@@ -180,21 +205,44 @@ bool unicorn_validation_step(void) {
     if ((opcode & 0xFF00) == 0x7100) {
         validation_state.emulop_count++;
 
-        // Execute EMUL_OP on UAE only
-        uae_cpu_execute_one();
+        if (validation_state.master_cpu == MASTER_CPU_UAE) {
+            // Execute EMUL_OP on UAE, sync to Unicorn
+            uae_cpu_execute_one();
 
-        // Sync entire state from UAE to Unicorn (EMUL_OP can modify anything)
-        for (int i = 0; i < 8; i++) {
-            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
-            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+            // Sync entire state from UAE to Unicorn (EMUL_OP can modify anything)
+            for (int i = 0; i < 8; i++) {
+                unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
+                unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+            }
+            unicorn_set_pc(validation_state.unicorn, uae_get_pc());
+            unicorn_set_sr(validation_state.unicorn, uae_get_sr());
+
+            // Sync all RAM (EMUL_OP can write anywhere)
+            unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+
+            validation_state.last_good_pc = uae_get_pc();
+        } else {
+            // Execute EMUL_OP on Unicorn, sync to UAE
+            if (!unicorn_execute_one(validation_state.unicorn)) {
+                fprintf(stderr, "\n❌ Unicorn EmulOp execution failed at PC=0x%08X\n", pc);
+                fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
+                return false;
+            }
+
+            // Sync entire state from Unicorn to UAE
+            for (int i = 0; i < 8; i++) {
+                uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
+                uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
+            }
+            uae_set_pc(unicorn_get_pc(validation_state.unicorn));
+            uae_set_sr(unicorn_get_sr(validation_state.unicorn));
+
+            // Sync all RAM (EMUL_OP can write anywhere)
+            unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+
+            validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
         }
-        unicorn_set_pc(validation_state.unicorn, uae_get_pc());
-        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
 
-        // Sync all RAM (EMUL_OP can write anywhere)
-        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-
-        validation_state.last_good_pc = uae_get_pc();
         return true;  // EMUL_OP handled, no divergence to report
     }
 
@@ -203,22 +251,44 @@ bool unicorn_validation_step(void) {
     bool is_fline = (opcode & 0xF000) == 0xF000;
 
     if (is_aline || is_fline) {
-        // Execute on UAE (it will handle the exception)
-        uae_cpu_execute_one();
+        if (validation_state.master_cpu == MASTER_CPU_UAE) {
+            // Execute on UAE (it will handle the exception), sync to Unicorn
+            uae_cpu_execute_one();
 
-        // For now, just sync state from UAE to Unicorn without executing on Unicorn
-        // TODO: Make Unicorn handle A-line/F-line exceptions properly
-        for (int i = 0; i < 8; i++) {
-            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
-            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+            // Sync state from UAE to Unicorn
+            for (int i = 0; i < 8; i++) {
+                unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
+                unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
+            }
+            unicorn_set_pc(validation_state.unicorn, uae_get_pc());
+            unicorn_set_sr(validation_state.unicorn, uae_get_sr());
+
+            // Sync all RAM (exception handlers write to stack, etc.)
+            unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+
+            validation_state.last_good_pc = uae_get_pc();
+        } else {
+            // Execute on Unicorn (it has exception handlers), sync to UAE
+            if (!unicorn_execute_one(validation_state.unicorn)) {
+                fprintf(stderr, "\n❌ Unicorn A-line/F-line execution failed at PC=0x%08X\n", pc);
+                fprintf(stderr, "Error: %s\n", unicorn_get_error(validation_state.unicorn));
+                return false;
+            }
+
+            // Sync state from Unicorn to UAE
+            for (int i = 0; i < 8; i++) {
+                uae_set_dreg(i, unicorn_get_dreg(validation_state.unicorn, i));
+                uae_set_areg(i, unicorn_get_areg(validation_state.unicorn, i));
+            }
+            uae_set_pc(unicorn_get_pc(validation_state.unicorn));
+            uae_set_sr(unicorn_get_sr(validation_state.unicorn));
+
+            // Sync all RAM
+            unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+
+            validation_state.last_good_pc = unicorn_get_pc(validation_state.unicorn);
         }
-        unicorn_set_pc(validation_state.unicorn, uae_get_pc());
-        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
 
-        // Sync all RAM (exception handlers write to stack, etc.)
-        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-
-        validation_state.last_good_pc = uae_get_pc();
         return true;  // Exception handled, no divergence to report
     }
 
