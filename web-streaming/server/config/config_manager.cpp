@@ -243,10 +243,7 @@ std::string generate_sheepshaver_prefs(const MacemuConfig& config,
     // Screen (IPC mode for web streaming)
     prefs << "screen ipc/" << config.common.screen << "\n\n";
 
-    // Hardware
-    prefs << "modelid " << config.ppc.modelid << "\n";
-    prefs << "cpu " << config.ppc.cpu << "\n";
-    prefs << "fpu " << (config.ppc.fpu ? "true" : "false") << "\n";
+    // Hardware (SheepShaver only uses ramsize, not modelid/cpu/fpu)
     prefs << "ramsize " << (config.common.ram * 1024 * 1024) << "\n\n";
 
     // JIT settings
@@ -264,11 +261,6 @@ std::string generate_sheepshaver_prefs(const MacemuConfig& config,
     // ExtFS
     prefs << "extfs " << config.common.extfs << "\n\n";
 
-    // Web-specific
-    prefs << "# Web streaming settings\n";
-    prefs << "webcodec " << config.web.codec << "\n";
-    prefs << "mousemode " << config.web.mousemode << "\n\n";
-
     // Boot settings
     prefs << "bootdrive 0\n";
     prefs << "bootdriver 0\n\n";
@@ -276,12 +268,10 @@ std::string generate_sheepshaver_prefs(const MacemuConfig& config,
     // Disable GUI (headless)
     prefs << "nogui true\n";
 
-    // Serial/Network defaults
-    prefs << "\n# Serial/Network\n";
+    // Serial defaults
+    prefs << "\n# Serial\n";
     prefs << "seriala /dev/null\n";
     prefs << "serialb /dev/null\n";
-    prefs << "udptunnel false\n";
-    prefs << "udpport 6066\n";
 
     return prefs.str();
 }
