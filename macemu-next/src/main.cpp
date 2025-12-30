@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <thread>
+#include <chrono>
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
@@ -363,6 +365,21 @@ int main(int argc, char **argv)
 	// Reset CPU to ROM entry point
 	g_platform.cpu_reset();
 	printf("CPU reset to PC=0x%08x\n", g_platform.cpu_get_pc());
+
+	// Optional auto-exit timer (set EMULATOR_TIMEOUT=2 for 2 seconds)
+	const char *timeout_env = getenv("EMULATOR_TIMEOUT");
+	if (timeout_env) {
+		int timeout_sec = atoi(timeout_env);
+		if (timeout_sec > 0) {
+			printf("Auto-exit timer set: %d seconds\n", timeout_sec);
+			std::thread timeout_thread([timeout_sec]() {
+				std::this_thread::sleep_for(std::chrono::seconds(timeout_sec));
+				fprintf(stderr, "\n[Timeout: %d seconds elapsed, exiting]\n", timeout_sec);
+				exit(0);
+			});
+			timeout_thread.detach();
+		}
+	}
 
 	// Execution loop - uses platform CPU API
 	int result;

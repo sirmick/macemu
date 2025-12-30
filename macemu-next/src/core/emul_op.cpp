@@ -54,11 +54,109 @@ extern bool tick_inhibit;
 void PlayStartupSound();
 
 /*
+ *  Optional verbose logging for EmulOp debugging
+ *  Set EMULOP_VERBOSE=1 environment variable to enable
+ */
+static void emulop_log_verbose(uint16 opcode, M68kRegisters *r)
+{
+	static int emulop_verbose = -1;  // -1 = uninitialized
+	if (emulop_verbose == -1) {
+		const char *env = getenv("EMULOP_VERBOSE");
+		emulop_verbose = (env && atoi(env) > 0) ? 1 : 0;
+	}
+
+	if (!emulop_verbose)
+		return;
+
+	// Map opcode to name for debugging
+	const char *op_name = "UNKNOWN";
+	switch (opcode) {
+		case M68K_EMUL_BREAK: op_name = "BREAK"; break;
+		case M68K_EMUL_OP_SHUTDOWN: op_name = "SHUTDOWN"; break;
+		case M68K_EMUL_OP_RESET: op_name = "RESET"; break;
+		case M68K_EMUL_OP_CLKNOMEM: op_name = "CLKNOMEM"; break;
+		case M68K_EMUL_OP_READ_XPRAM: op_name = "READ_XPRAM"; break;
+		case M68K_EMUL_OP_READ_XPRAM2: op_name = "READ_XPRAM2"; break;
+		case M68K_EMUL_OP_PATCH_BOOT_GLOBS: op_name = "PATCH_BOOT_GLOBS"; break;
+		case M68K_EMUL_OP_FIX_BOOTSTACK: op_name = "FIX_BOOTSTACK"; break;
+		case M68K_EMUL_OP_FIX_MEMSIZE: op_name = "FIX_MEMSIZE"; break;
+		case M68K_EMUL_OP_INSTALL_DRIVERS: op_name = "INSTALL_DRIVERS"; break;
+		case M68K_EMUL_OP_SERD: op_name = "SERD"; break;
+		case M68K_EMUL_OP_SONY_OPEN: op_name = "SONY_OPEN"; break;
+		case M68K_EMUL_OP_SONY_PRIME: op_name = "SONY_PRIME"; break;
+		case M68K_EMUL_OP_SONY_CONTROL: op_name = "SONY_CONTROL"; break;
+		case M68K_EMUL_OP_SONY_STATUS: op_name = "SONY_STATUS"; break;
+		case M68K_EMUL_OP_DISK_OPEN: op_name = "DISK_OPEN"; break;
+		case M68K_EMUL_OP_DISK_PRIME: op_name = "DISK_PRIME"; break;
+		case M68K_EMUL_OP_DISK_CONTROL: op_name = "DISK_CONTROL"; break;
+		case M68K_EMUL_OP_DISK_STATUS: op_name = "DISK_STATUS"; break;
+		case M68K_EMUL_OP_CDROM_OPEN: op_name = "CDROM_OPEN"; break;
+		case M68K_EMUL_OP_CDROM_PRIME: op_name = "CDROM_PRIME"; break;
+		case M68K_EMUL_OP_CDROM_CONTROL: op_name = "CDROM_CONTROL"; break;
+		case M68K_EMUL_OP_CDROM_STATUS: op_name = "CDROM_STATUS"; break;
+		case M68K_EMUL_OP_VIDEO_OPEN: op_name = "VIDEO_OPEN"; break;
+		case M68K_EMUL_OP_VIDEO_CONTROL: op_name = "VIDEO_CONTROL"; break;
+		case M68K_EMUL_OP_VIDEO_STATUS: op_name = "VIDEO_STATUS"; break;
+		case M68K_EMUL_OP_SERIAL_OPEN: op_name = "SERIAL_OPEN"; break;
+		case M68K_EMUL_OP_SERIAL_PRIME: op_name = "SERIAL_PRIME"; break;
+		case M68K_EMUL_OP_SERIAL_CONTROL: op_name = "SERIAL_CONTROL"; break;
+		case M68K_EMUL_OP_SERIAL_STATUS: op_name = "SERIAL_STATUS"; break;
+		case M68K_EMUL_OP_SERIAL_CLOSE: op_name = "SERIAL_CLOSE"; break;
+		case M68K_EMUL_OP_ETHER_OPEN: op_name = "ETHER_OPEN"; break;
+		case M68K_EMUL_OP_ETHER_CONTROL: op_name = "ETHER_CONTROL"; break;
+		case M68K_EMUL_OP_ETHER_READ_PACKET: op_name = "ETHER_READ_PACKET"; break;
+		case M68K_EMUL_OP_ADBOP: op_name = "ADBOP"; break;
+		case M68K_EMUL_OP_INSTIME: op_name = "INSTIME"; break;
+		case M68K_EMUL_OP_RMVTIME: op_name = "RMVTIME"; break;
+		case M68K_EMUL_OP_PRIMETIME: op_name = "PRIMETIME"; break;
+		case M68K_EMUL_OP_MICROSECONDS: op_name = "MICROSECONDS"; break;
+		case M68K_EMUL_OP_SCSI_DISPATCH: op_name = "SCSI_DISPATCH"; break;
+		case M68K_EMUL_OP_IRQ: op_name = "IRQ"; break;
+		case M68K_EMUL_OP_PUT_SCRAP: op_name = "PUT_SCRAP"; break;
+		case M68K_EMUL_OP_GET_SCRAP: op_name = "GET_SCRAP"; break;
+		case M68K_EMUL_OP_CHECKLOAD: op_name = "CHECKLOAD"; break;
+		case M68K_EMUL_OP_AUDIO: op_name = "AUDIO"; break;
+		case M68K_EMUL_OP_EXTFS_COMM: op_name = "EXTFS_COMM"; break;
+		case M68K_EMUL_OP_EXTFS_HFS: op_name = "EXTFS_HFS"; break;
+		case M68K_EMUL_OP_BLOCK_MOVE: op_name = "BLOCK_MOVE"; break;
+		case M68K_EMUL_OP_SOUNDIN_OPEN: op_name = "SOUNDIN_OPEN"; break;
+		case M68K_EMUL_OP_SOUNDIN_PRIME: op_name = "SOUNDIN_PRIME"; break;
+		case M68K_EMUL_OP_SOUNDIN_CONTROL: op_name = "SOUNDIN_CONTROL"; break;
+		case M68K_EMUL_OP_SOUNDIN_STATUS: op_name = "SOUNDIN_STATUS"; break;
+		case M68K_EMUL_OP_SOUNDIN_CLOSE: op_name = "SOUNDIN_CLOSE"; break;
+		case M68K_EMUL_OP_DEBUGUTIL: op_name = "DEBUGUTIL"; break;
+		case M68K_EMUL_OP_IDLE_TIME: op_name = "IDLE_TIME"; break;
+		case M68K_EMUL_OP_SUSPEND: op_name = "SUSPEND"; break;
+	}
+
+	printf("[EmulOp] %04x (%s)\n", opcode, op_name);
+
+	// Print register state for important EmulOps
+	switch (opcode) {
+		case M68K_EMUL_OP_RESET:
+		case M68K_EMUL_OP_PATCH_BOOT_GLOBS:
+		case M68K_EMUL_OP_FIX_BOOTSTACK:
+		case M68K_EMUL_OP_FIX_MEMSIZE:
+		case M68K_EMUL_OP_INSTALL_DRIVERS:
+			printf("  d0=%08x d1=%08x a0=%08x a4=%08x a6=%08x a7=%08x sr=%04x\n",
+			       r->d[0], r->d[1], r->a[0], r->a[4], r->a[6], r->a[7], r->sr);
+			break;
+		case M68K_EMUL_OP_CLKNOMEM:
+			printf("  XPRAM d1=%08x d2=%08x (reg=%02x %s)\n",
+			       r->d[1], r->d[2], (unsigned)((r->d[1] >> 2) & 0x1f),
+			       (r->d[1] & 0x80) ? "read" : "write");
+			break;
+	}
+}
+
+
+/*
  *  Execute EMUL_OP opcode (called by 68k emulator or Illegal Instruction trap handler)
  */
 
 void EmulOp(uint16 opcode, M68kRegisters *r)
 {
+	emulop_log_verbose(opcode, r);
 	D(bug("EmulOp %04x\n", opcode));
 	switch (opcode) {
 		case M68K_EMUL_BREAK: {				// Breakpoint
