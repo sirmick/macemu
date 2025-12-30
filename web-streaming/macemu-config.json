@@ -24,18 +24,18 @@
     "disks": [],
     "fpu": true,
     "idlewait": true,
-    "ignoreillegal": true,
+    "ignoreillegal": false,
     "ignoresegv": true,
     "jit": true,
-    "jit68k": true,
+    "jit68k": false,
     "keyboardtype": 5,
     "modelid": 14,
-    "rom": ""
+    "rom": "4MB ROMs/1997-02 - 960E4BE9 - Power Mac 7300 & 7600 & 8600 & 9600 (v1).ROM"
   },
   "version": 1,
   "web": {
     "codec": "h264",
-    "emulator": "m68k",
+    "emulator": "ppc",
     "mousemode": "relative"
   }
 }

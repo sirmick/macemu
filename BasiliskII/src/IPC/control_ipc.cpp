@@ -177,6 +177,9 @@ static void process_binary_input(const uint8_t* data, size_t len) {
             if (len < sizeof(MacEmuMouseInput)) return;
             const MacEmuMouseInput* mouse = (const MacEmuMouseInput*)data;
 
+            static bool debug_mouse = (getenv("MACEMU_DEBUG_MOUSE") != nullptr);
+            static int mouse_event_count = 0;
+
             // Check if absolute or relative mode
             bool absolute = (mouse->hdr.flags & MACEMU_MOUSE_ABSOLUTE) != 0;
 
@@ -191,6 +194,11 @@ static void process_binary_input(const uint8_t* data, size_t len) {
                 x = mouse->x;
                 y = mouse->y;
                 ADBSetRelMouseMode(true);
+            }
+
+            if (debug_mouse && (mouse_event_count++ % 60 == 0)) {
+                fprintf(stderr, "[IPC] Mouse event #%d: mode=%s x=%d y=%d buttons=0x%02x\n",
+                        mouse_event_count, absolute ? "abs" : "rel", x, y, mouse->buttons);
             }
 
             if (absolute || x != 0 || y != 0) {
