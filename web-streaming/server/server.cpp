@@ -404,6 +404,17 @@ static bool start_emulator() {
     // Load unified JSON config
     config::MacemuConfig cfg = config::load_config("macemu-config.json");
 
+    // Update server codec from config
+    if (cfg.web.codec == "h264") {
+        g_config.server_codec = CodecType::H264;
+    } else if (cfg.web.codec == "av1") {
+        g_config.server_codec = CodecType::AV1;
+    } else if (cfg.web.codec == "vp9") {
+        g_config.server_codec = CodecType::VP9;
+    } else {
+        g_config.server_codec = CodecType::PNG;
+    }
+
     // Determine which emulator to launch
     bool is_ppc = (cfg.web.emulator == "ppc");
     const char* emu_name = is_ppc ? "SheepShaver" : "BasiliskII";
