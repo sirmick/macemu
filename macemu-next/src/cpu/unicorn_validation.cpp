@@ -111,15 +111,22 @@ bool unicorn_validation_init(void) {
         unicorn_destroy(validation_state.unicorn);
         return false;
     }
-    // Fill with 0xFF pattern to match uninitialized memory behavior
-    memset(dummy_buffer, 0xFF, dummy_region_size);
+    // Fill with 0xFF00FF00 pattern to match UAE's garbage reads
+    // UAE reads this specific pattern from uninitialized host memory
+    // IMPORTANT: Must use big-endian byte order for 68K
+    for (uint32_t i = 0; i < dummy_region_size; i += 4) {
+        dummy_buffer[i + 0] = 0xFF;
+        dummy_buffer[i + 1] = 0x00;
+        dummy_buffer[i + 2] = 0xFF;
+        dummy_buffer[i + 3] = 0x00;
+    }
     if (!unicorn_map_ram(validation_state.unicorn, dummy_region_base, dummy_buffer, dummy_region_size)) {
         fprintf(stderr, "Failed to map dummy region to Unicorn\n");
         free(dummy_buffer);
         unicorn_destroy(validation_state.unicorn);
         return false;
     }
-    printf("✓ Dummy region mapped (0x%08X - 0x%08X, %u MB) with 0xFF pattern\n",
+    printf("✓ Dummy region mapped (0x%08X - 0x%08X, %u MB) with 0xFF00FF00 pattern\n",
            dummy_region_base, dummy_region_base + dummy_region_size, dummy_region_size / (1024*1024));
 
     // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
