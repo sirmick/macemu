@@ -3,6 +3,7 @@ cpu_sources = [
   'cpu_uae.c',                # UAE backend for platform API
   'cpu_unicorn.cpp',          # Unicorn backend for platform API (C++ for EmulOp linkage)
   'cpu_dualcpu.c',            # DualCPU backend for platform API
+  'cpu_trace.c',              # CPU execution tracing infrastructure
   'uae_wrapper.cpp',          # UAE CPU wrapper
   'unicorn_wrapper.c',        # Unicorn wrapper
   'unicorn_exception.c',      # Exception simulation for Unicorn

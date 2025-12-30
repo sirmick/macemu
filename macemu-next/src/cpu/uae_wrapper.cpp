@@ -3,6 +3,7 @@
  */
 
 #include "uae_wrapper.h"
+#include "cpu_trace.h"
 
 // UAE CPU headers
 extern "C" {
@@ -232,55 +233,36 @@ extern "C" {
 
 /* Execution */
 
-// Debug trace control (set CPU_TRACE=1 environment variable to enable)
-static int cpu_trace_enabled = -1;  // -1 = uninitialized
-static uint64_t cpu_trace_count = 0;
-static uint64_t cpu_trace_max = 10;  // Default: trace first 10 instructions
-
-static void cpu_trace_init(void) {
-    const char *env = getenv("CPU_TRACE");
-    if (env && atoi(env) > 0) {
-        cpu_trace_enabled = 1;
-        // Optional: CPU_TRACE=N to trace first N instructions
-        int n = atoi(env);
-        if (n > 1) {
-            cpu_trace_max = n;
-        }
-        fprintf(stderr, "[CPU trace enabled: will trace first %lu instructions]\n",
-                (unsigned long)cpu_trace_max);
-    } else {
-        cpu_trace_enabled = 0;
-    }
-}
-
 void uae_cpu_execute_one(void) {
-    /* Initialize trace on first call */
-    if (cpu_trace_enabled == -1) {
+    /* Initialize trace on first call (from shared cpu_trace infrastructure) */
+    static bool trace_initialized = false;
+    if (!trace_initialized) {
         cpu_trace_init();
+        trace_initialized = true;
     }
 
     /* Execute one instruction */
     uae_u32 opcode = GET_OPCODE;
 
     // Optional trace output (enabled via CPU_TRACE env var)
-    if (cpu_trace_enabled && cpu_trace_count < cpu_trace_max) {
+    if (cpu_trace_should_log()) {
         uae_u32 pc_before = m68k_getpc();
-        fprintf(stderr, "[%04lu] PC=%08X OP=%04X | D0=%08X D1=%08X A0=%08X A7=%08X SR=%04X\n",
-            (unsigned long)cpu_trace_count,
-            (unsigned int)pc_before,
-            (unsigned int)opcode,
+        // Read raw opcode bytes (big-endian) for trace display
+        uae_u16 opcode_raw = get_iword(0);
+        cpu_trace_log_simple(
+            pc_before,
+            opcode_raw,
             (unsigned int)regs.regs[0],   // D0
             (unsigned int)regs.regs[1],   // D1
             (unsigned int)regs.regs[8],   // A0
             (unsigned int)regs.regs[15],  // A7
-            (unsigned int)regs.sr);
-        cpu_trace_count++;
-        if (cpu_trace_count == cpu_trace_max) {
-            fprintf(stderr, "[Trace limit reached, disabling trace]\n");
-        }
+            (unsigned int)regs.sr
+        );
     }
 
     (*cpufunctbl[opcode])(opcode);
+
+    cpu_trace_increment();
 }
 
 /* Set memory base pointers directly (for dual-CPU mode) */

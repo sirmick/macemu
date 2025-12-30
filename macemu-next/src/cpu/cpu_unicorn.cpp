@@ -8,6 +8,8 @@
 #include "platform.h"
 #include "unicorn_wrapper.h"
 #include "unicorn_exception.h"
+#include "cpu_trace.h"
+#include <unicorn/unicorn.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -31,9 +33,11 @@ extern void EmulOp(uint16_t opcode, struct M68kRegisters *r);
 
 static UnicornCPU *unicorn_cpu = NULL;
 
-// EmulOp handler for Unicorn-only mode
-static void unicorn_emulop_handler(uint16_t opcode, void *user_data) {
-	(void)user_data;
+// Platform EmulOp handler for Unicorn-only mode
+// This needs to use platform API because it's called from within Unicorn's hook context
+// and needs to properly sync registers back to Unicorn
+static bool unicorn_platform_emulop_handler(uint16_t opcode, bool is_primary) {
+	(void)is_primary;  // Unicorn is always primary in standalone mode
 
 	// Build M68kRegisters structure from Unicorn state
 	struct M68kRegisters regs;
@@ -46,12 +50,23 @@ static void unicorn_emulop_handler(uint16_t opcode, void *user_data) {
 	// Call EmulOp handler
 	EmulOp(opcode, &regs);
 
-	// Write registers back to Unicorn
+	// IMPORTANT: Write registers back to Unicorn directly
+	// We're outside uc_emu_start() so register writes will persist
 	for (int i = 0; i < 8; i++) {
-		unicorn_set_dreg(unicorn_cpu, i, regs.d[i]);
-		unicorn_set_areg(unicorn_cpu, i, regs.a[i]);
+		g_platform.cpu_set_dreg(i, regs.d[i]);
+		g_platform.cpu_set_areg(i, regs.a[i]);
 	}
-	unicorn_set_sr(unicorn_cpu, regs.sr);
+	g_platform.cpu_set_sr(regs.sr);
+
+	// Debug: Verify A7 write for RESET EmulOp
+	if (opcode == 0x7103) {
+		uint32_t a7_readback = g_platform.cpu_get_areg(7);
+		fprintf(stderr, "[EmulOp 0x7103] Set A7=0x%08X, readback=0x%08X\n",
+		        regs.a[7], a7_readback);
+	}
+
+	// Return false to indicate PC was not advanced (caller will advance it)
+	return false;
 }
 
 // CPU Lifecycle
@@ -69,6 +84,8 @@ static bool unicorn_backend_init(void) {
 	}
 
 	// Map RAM to Unicorn
+	fprintf(stderr, "[DEBUG] Mapping RAM to unicorn_cpu=%p: Mac=0x%08X Host=%p Size=0x%08X (%u MB)\n",
+		(void*)unicorn_cpu, RAMBaseMac, RAMBaseHost, RAMSize, RAMSize / (1024*1024));
 	if (!unicorn_map_ram(unicorn_cpu, RAMBaseMac, RAMBaseHost, RAMSize)) {
 		fprintf(stderr, "Failed to map RAM to Unicorn\n");
 		unicorn_destroy(unicorn_cpu);
@@ -77,6 +94,8 @@ static bool unicorn_backend_init(void) {
 	}
 
 	// Map ROM as writable (BasiliskII patches ROM during boot)
+	fprintf(stderr, "[DEBUG] Mapping ROM to unicorn_cpu=%p: Mac=0x%08X Host=%p Size=0x%08X (%u KB)\n",
+		(void*)unicorn_cpu, ROMBaseMac, ROMBaseHost, ROMSize, ROMSize / 1024);
 	if (!unicorn_map_rom_writable(unicorn_cpu, ROMBaseMac, ROMBaseHost, ROMSize)) {
 		fprintf(stderr, "Failed to map ROM to Unicorn\n");
 		unicorn_destroy(unicorn_cpu);
@@ -84,10 +103,17 @@ static bool unicorn_backend_init(void) {
 		return false;
 	}
 
-	// Register EmulOp handler for 0x71xx illegal instructions
-	unicorn_set_emulop_handler(unicorn_cpu, unicorn_emulop_handler, NULL);
+	fprintf(stderr, "[DEBUG] unicorn_cpu instance at init: %p\n", (void*)unicorn_cpu);
 
-	// Register exception handler for A-line/F-line traps
+	// Initialize CPU tracing from environment variable
+	cpu_trace_init();
+
+	// Register EmulOp handler via platform API
+	// EmulOps are now handled in unicorn_execute_one() when UC_ERR_INSN_INVALID occurs
+	// No hooks needed - this is faster and compatible with JIT
+	g_platform.emulop_handler = unicorn_platform_emulop_handler;
+
+	// Register exception handler for A-line/F-line traps (also handled via UC_ERR_INSN_INVALID)
 	unicorn_set_exception_handler(unicorn_cpu, unicorn_simulate_exception);
 
 	return true;
@@ -125,9 +151,35 @@ static int unicorn_backend_execute_one(void) {
 		return 3;  // CPU_EXEC_EXCEPTION
 	}
 
+	/* CPU tracing (controlled by CPU_TRACE env var) */
+	if (cpu_trace_should_log()) {
+		uint32_t pc = unicorn_get_pc(unicorn_cpu);
+		uint16_t opcode = 0;
+		uc_mem_read((uc_engine*)unicorn_get_uc(unicorn_cpu), pc, &opcode, sizeof(opcode));
+		#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+		opcode = __builtin_bswap16(opcode);
+		#endif
+
+		cpu_trace_log_simple(
+			pc, opcode,
+			unicorn_get_dreg(unicorn_cpu, 0),
+			unicorn_get_dreg(unicorn_cpu, 1),
+			unicorn_get_areg(unicorn_cpu, 0),
+			unicorn_get_areg(unicorn_cpu, 7),
+			unicorn_get_sr(unicorn_cpu)
+		);
+	}
+
 	if (!unicorn_execute_one(unicorn_cpu)) {
+		uint32_t pc = unicorn_get_pc(unicorn_cpu);
+		uint32_t a7 = unicorn_get_areg(unicorn_cpu, 7);
+		fprintf(stderr, "Unicorn execution failed: %s (unicorn_cpu=%p)\n",
+			unicorn_get_error(unicorn_cpu), (void*)unicorn_cpu);
+		fprintf(stderr, "PC=0x%08X A7=0x%08X A7-4=0x%08X\n", pc, a7, a7-4);
 		return 3;  // CPU_EXEC_EXCEPTION
 	}
+
+	cpu_trace_increment();
 
 	// Unicorn doesn't track STOP state separately
 	return 0;  // CPU_EXEC_OK

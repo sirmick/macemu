@@ -28,6 +28,27 @@ typedef enum {
     MASTER_CPU_UNICORN   // Unicorn handles EmulOps/traps, sync to UAE
 } MasterCPU;
 
+// Instruction trace entry for ringbuffer
+typedef struct {
+    uint64_t instruction_num;
+    uint32_t pc;
+    uint16_t opcode;
+
+    // UAE state (after execution)
+    uint32_t uae_pc;
+    uint16_t uae_sr;
+    uint32_t uae_d[8];
+    uint32_t uae_a[8];
+
+    // Unicorn state (after execution)
+    uint32_t uc_pc;
+    uint16_t uc_sr;
+    uint32_t uc_d[8];
+    uint32_t uc_a[8];
+
+    bool was_emulop;
+} InstructionTrace;
+
 // Validation state
 static struct {
     UnicornCPU *unicorn;
@@ -42,6 +63,15 @@ static struct {
 
     // Last known good state
     uint32_t last_good_pc;
+
+    // Ringbuffer for instruction trace (circular buffer)
+    InstructionTrace *trace_buffer;
+    uint32_t trace_buffer_size;  // Size of ringbuffer (from env var)
+    uint32_t trace_buffer_pos;   // Current write position (wraps around)
+    bool trace_buffer_full;      // Has buffer wrapped around at least once?
+
+    // Separate memory for Unicorn
+    uint8_t *unicorn_ram;        // Private RAM copy for Unicorn
 } validation_state = {0};
 
 /* Dummy handler to trigger invalid instruction hook registration */
@@ -137,6 +167,45 @@ bool unicorn_validation_init(void) {
     printf("✓ Dummy region mapped (0x%08X - 0x%08X, %u MB) with 0xFF00FF00 pattern\n",
            dummy_region_base, dummy_region_base + dummy_region_size, dummy_region_size / (1024*1024));
 
+    // Allocate separate RAM for Unicorn
+    validation_state.unicorn_ram = (uint8_t *)malloc(RAMSize);
+    if (!validation_state.unicorn_ram) {
+        fprintf(stderr, "Failed to allocate separate RAM for Unicorn\n");
+        unicorn_destroy(validation_state.unicorn);
+        return false;
+    }
+    // Initialize with same content as UAE's RAM
+    memcpy(validation_state.unicorn_ram, RAMBaseHost, RAMSize);
+
+    // Remap Unicorn to use its own private RAM
+    // First unmap the shared RAM
+    unicorn_unmap(validation_state.unicorn, RAMBaseMac, RAMSize);
+    // Then map the private copy
+    if (!unicorn_map_ram(validation_state.unicorn, RAMBaseMac, validation_state.unicorn_ram, RAMSize)) {
+        fprintf(stderr, "Failed to map private RAM to Unicorn\n");
+        free(validation_state.unicorn_ram);
+        unicorn_destroy(validation_state.unicorn);
+        return false;
+    }
+    printf("✓ Unicorn private RAM allocated (%u MB)\n", RAMSize / (1024*1024));
+
+    // Allocate instruction trace ringbuffer
+    const char *trace_depth_env = getenv("DUALCPU_TRACE_DEPTH");
+    validation_state.trace_buffer_size = trace_depth_env ? atoi(trace_depth_env) : 50;
+    if (validation_state.trace_buffer_size < 10) validation_state.trace_buffer_size = 10;
+    if (validation_state.trace_buffer_size > 1000) validation_state.trace_buffer_size = 1000;
+
+    validation_state.trace_buffer = (InstructionTrace *)calloc(validation_state.trace_buffer_size, sizeof(InstructionTrace));
+    if (!validation_state.trace_buffer) {
+        fprintf(stderr, "Failed to allocate instruction trace buffer\n");
+        free(validation_state.unicorn_ram);
+        unicorn_destroy(validation_state.unicorn);
+        return false;
+    }
+    validation_state.trace_buffer_pos = 0;
+    validation_state.trace_buffer_full = false;
+    printf("✓ Instruction trace buffer allocated (last %u instructions)\n", validation_state.trace_buffer_size);
+
     // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
     // State will be synced on first instruction execution in unicorn_validation_step()
     printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
@@ -196,6 +265,16 @@ void unicorn_validation_shutdown(void) {
         fprintf(validation_state.log_file, "Divergences: %lu\n", validation_state.divergence_count);
         fclose(validation_state.log_file);
         validation_state.log_file = NULL;
+    }
+
+    if (validation_state.trace_buffer) {
+        free(validation_state.trace_buffer);
+        validation_state.trace_buffer = NULL;
+    }
+
+    if (validation_state.unicorn_ram) {
+        free(validation_state.unicorn_ram);
+        validation_state.unicorn_ram = NULL;
     }
 
     if (validation_state.unicorn) {
@@ -272,7 +351,10 @@ static bool unified_emulop_handler(uint16_t opcode, bool is_uae_calling) {
         unicorn_set_sr(validation_state.unicorn, uae_get_sr());
 
         // Sync all RAM (EmulOp can write anywhere)
-        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        // Copy UAE's RAM to Unicorn's private RAM
+        memcpy(validation_state.unicorn_ram, RAMBaseHost, RAMSize);
+        // Then write to Unicorn
+        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, validation_state.unicorn_ram, RAMSize);
         return false;  // UAE advances PC in caller
     } else {
         // Unicorn is primary: Execute EmulOp and sync to UAE
@@ -308,7 +390,9 @@ static bool unified_emulop_handler(uint16_t opcode, bool is_uae_calling) {
         uae_set_sr(regs.sr);
 
         // Sync all RAM (EmulOp can write anywhere)
-        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        // Read from Unicorn to its private RAM, then copy to UAE
+        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, validation_state.unicorn_ram, RAMSize);
+        memcpy(RAMBaseHost, validation_state.unicorn_ram, RAMSize);
         return true;  // We advanced PC ourselves
     }
 }
@@ -345,7 +429,8 @@ static bool unified_trap_handler(int vector, uint16_t opcode, bool is_uae_callin
         unicorn_set_sr(validation_state.unicorn, uae_get_sr());
 
         // Sync all RAM
-        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        memcpy(validation_state.unicorn_ram, RAMBaseHost, RAMSize);
+        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, validation_state.unicorn_ram, RAMSize);
         return false;  // UAE's Exception() advances PC
     } else {
         // Unicorn is primary: Execute trap and sync to UAE
@@ -362,11 +447,86 @@ static bool unified_trap_handler(int vector, uint16_t opcode, bool is_uae_callin
         uae_set_sr(unicorn_get_sr(validation_state.unicorn));
 
         // Sync all RAM
-        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
+        unicorn_mem_read(validation_state.unicorn, RAMBaseMac, validation_state.unicorn_ram, RAMSize);
+        memcpy(RAMBaseHost, validation_state.unicorn_ram, RAMSize);
         return true;  // unicorn_simulate_exception advances PC
     }
 }
 
+
+/* Helper: Add instruction to trace ringbuffer */
+static void trace_add_instruction(uint64_t instruction_num, uint32_t pc, uint16_t opcode,
+                                   uint32_t uae_pc, uint16_t uae_sr, uint32_t *uae_d, uint32_t *uae_a,
+                                   uint32_t uc_pc, uint16_t uc_sr, uint32_t *uc_d, uint32_t *uc_a,
+                                   bool was_emulop) {
+    if (!validation_state.trace_buffer) return;
+
+    InstructionTrace *trace = &validation_state.trace_buffer[validation_state.trace_buffer_pos];
+    trace->instruction_num = instruction_num;
+    trace->pc = pc;
+    trace->opcode = opcode;
+    trace->uae_pc = uae_pc;
+    trace->uae_sr = uae_sr;
+    memcpy(trace->uae_d, uae_d, sizeof(trace->uae_d));
+    memcpy(trace->uae_a, uae_a, sizeof(trace->uae_a));
+    trace->uc_pc = uc_pc;
+    trace->uc_sr = uc_sr;
+    memcpy(trace->uc_d, uc_d, sizeof(trace->uc_d));
+    memcpy(trace->uc_a, uc_a, sizeof(trace->uc_a));
+    trace->was_emulop = was_emulop;
+
+    validation_state.trace_buffer_pos++;
+    if (validation_state.trace_buffer_pos >= validation_state.trace_buffer_size) {
+        validation_state.trace_buffer_pos = 0;
+        validation_state.trace_buffer_full = true;
+    }
+}
+
+/* Helper: Format SR flags as string */
+static const char* format_sr_flags(uint16_t sr) {
+    static char buf[16];
+    snprintf(buf, sizeof(buf), "%c%c%c%c%c",
+             (sr & 0x10) ? 'X' : '-',
+             (sr & 0x08) ? 'N' : '-',
+             (sr & 0x04) ? 'Z' : '-',
+             (sr & 0x02) ? 'V' : '-',
+             (sr & 0x01) ? 'C' : '-');
+    return buf;
+}
+
+/* Helper: Dump trace ringbuffer on divergence */
+static void trace_dump_on_divergence(uint32_t divergence_pc, uint16_t divergence_opcode) {
+    if (!validation_state.trace_buffer) return;
+
+    fprintf(stderr, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    fprintf(stderr, "Last %u instructions before divergence:\n\n",
+            validation_state.trace_buffer_full ? validation_state.trace_buffer_size : validation_state.trace_buffer_pos);
+
+    // Determine start position (oldest entry in ringbuffer)
+    uint32_t start_pos = validation_state.trace_buffer_full ? validation_state.trace_buffer_pos : 0;
+    uint32_t count = validation_state.trace_buffer_full ? validation_state.trace_buffer_size : validation_state.trace_buffer_pos;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t idx = (start_pos + i) % validation_state.trace_buffer_size;
+        InstructionTrace *t = &validation_state.trace_buffer[idx];
+
+        // Check if states match
+        bool pc_match = (t->uae_pc == t->uc_pc);
+        bool sr_match = (t->uae_sr == t->uc_sr);
+        bool all_match = pc_match && sr_match;
+        for (int j = 0; j < 8 && all_match; j++) {
+            if (t->uae_d[j] != t->uc_d[j] || t->uae_a[j] != t->uc_a[j]) all_match = false;
+        }
+
+        fprintf(stderr, "[%lu] PC=%08X OP=%04X%s | SR: UAE=%04X UC=%04X %s\n",
+                t->instruction_num, t->pc, t->opcode,
+                t->was_emulop ? " (EmulOp)" : "        ",
+                t->uae_sr, t->uc_sr,
+                all_match ? "✓" : "❌");
+    }
+
+    fprintf(stderr, "\n");
+}
 
 /* Validate one instruction */
 bool unicorn_validation_step(void) {
@@ -641,28 +801,77 @@ bool unicorn_validation_step(void) {
         }
     }
 
+    // Get Unicorn data/address registers for trace
+    uint32_t uc_dregs[8], uc_aregs[8];
+    for (int i = 0; i < 8; i++) {
+        uc_dregs[i] = unicorn_get_dreg(validation_state.unicorn, i);
+        uc_aregs[i] = unicorn_get_areg(validation_state.unicorn, i);
+    }
+
+    // Add to trace ringbuffer BEFORE checking divergence
+    trace_add_instruction(validation_state.instruction_count, uae_pc_before, opcode,
+                          uae_pc_after, uae_sr_after, uae_dregs_after, uae_aregs_after,
+                          uc_pc, uc_sr, uc_dregs, uc_aregs,
+                          is_emulop);
+
     if (divergence) {
         validation_state.divergence_count++;
         if (validation_state.log_file) {
             fflush(validation_state.log_file);
         }
 
-        // Print to console every 10th divergence
-        if (validation_state.divergence_count % 10 == 0) {
-            printf("⚠️  Divergence #%lu at PC=0x%08X (total: %lu instructions)\n",
-                   validation_state.divergence_count, uae_pc_before, validation_state.instruction_count);
+        // Dump ringbuffer trace
+        trace_dump_on_divergence(uae_pc_before, opcode);
+
+        // Print detailed divergence report
+        fprintf(stderr, "❌ DIVERGENCE #%lu at instruction #%lu\n",
+                validation_state.divergence_count, validation_state.instruction_count);
+        fprintf(stderr, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
+        fprintf(stderr, "PC: 0x%08X, Opcode: 0x%04X\n", uae_pc_before, opcode);
+
+        fprintf(stderr, "\nUAE state (after execution):\n");
+        fprintf(stderr, "  PC: 0x%08X → 0x%08X\n", uae_pc_before, uae_pc_after);
+        fprintf(stderr, "  SR: 0x%04X → 0x%04X  [%s]\n", uae_sr_before, uae_sr_after, format_sr_flags(uae_sr_after));
+        fprintf(stderr, "  D0-D3: %08X %08X %08X %08X\n",
+                uae_dregs_after[0], uae_dregs_after[1], uae_dregs_after[2], uae_dregs_after[3]);
+        fprintf(stderr, "  D4-D7: %08X %08X %08X %08X\n",
+                uae_dregs_after[4], uae_dregs_after[5], uae_dregs_after[6], uae_dregs_after[7]);
+
+        fprintf(stderr, "\nUnicorn state (after execution):\n");
+        fprintf(stderr, "  PC: 0x%08X → 0x%08X\n", uae_pc_before, uc_pc);
+        fprintf(stderr, "  SR: 0x%04X → 0x%04X  [%s]\n", uae_sr_before, uc_sr, format_sr_flags(uc_sr));
+        fprintf(stderr, "  D0-D3: %08X %08X %08X %08X\n",
+                uc_dregs[0], uc_dregs[1], uc_dregs[2], uc_dregs[3]);
+        fprintf(stderr, "  D4-D7: %08X %08X %08X %08X\n",
+                uc_dregs[4], uc_dregs[5], uc_dregs[6], uc_dregs[7]);
+
+        fprintf(stderr, "\nDifferences:\n");
+        if (uc_pc != uae_pc_after)
+            fprintf(stderr, "  ❌ PC: UAE=0x%08X vs UC=0x%08X\n", uae_pc_after, uc_pc);
+        if (uc_sr != uae_sr_after)
+            fprintf(stderr, "  ❌ SR: UAE=0x%04X [%s] vs UC=0x%04X [%s]\n",
+                    uae_sr_after, format_sr_flags(uae_sr_after),
+                    uc_sr, format_sr_flags(uc_sr));
+        for (int i = 0; i < 8; i++) {
+            if (uc_dregs[i] != uae_dregs_after[i])
+                fprintf(stderr, "  ❌ D%d: UAE=0x%08X vs UC=0x%08X\n", i, uae_dregs_after[i], uc_dregs[i]);
         }
+        for (int i = 0; i < 8; i++) {
+            if (uc_aregs[i] != uae_aregs_after[i])
+                fprintf(stderr, "  ❌ A%d: UAE=0x%08X vs UC=0x%08X\n", i, uae_aregs_after[i], uc_aregs[i]);
+        }
+
+        fprintf(stderr, "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        fprintf(stderr, "ABORTING on first divergence.\n");
+        fprintf(stderr, "See cpu_validation.log for full details.\n\n");
 
         return false;
     }
 
     validation_state.last_good_pc = uae_pc_after;
 
-    // Sync RAM from UAE to Unicorn periodically (every 100 instructions)
-    // This is slow but ensures Unicorn sees memory writes
-    if (validation_state.instruction_count % 100 == 0) {
-        unicorn_mem_write(validation_state.unicorn, RAMBaseMac, RAMBaseHost, RAMSize);
-    }
+    // NO LONGER sync RAM periodically - CPUs have separate memory spaces
+    // RAM only synced during EmulOps/traps by master CPU
 
     return true;
 }
