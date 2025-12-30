@@ -2686,8 +2686,23 @@ int main(int argc, char* argv[]) {
     // Create minimal prefs file if it doesn't exist (for cold boot)
     create_minimal_prefs_if_needed();
 
-    // Note: Codec preference is read when emulator starts (not at server boot)
-    // This allows users to change codec via prefs dialog and restart
+    // Load codec from JSON config at startup
+    // This ensures browser connections use the correct codec from the start
+    try {
+        config::MacemuConfig cfg = config::load_config("macemu-config.json");
+        if (cfg.web.codec == "h264") {
+            g_config.server_codec = CodecType::H264;
+        } else if (cfg.web.codec == "av1") {
+            g_config.server_codec = CodecType::AV1;
+        } else if (cfg.web.codec == "vp9") {
+            g_config.server_codec = CodecType::VP9;
+        } else {
+            g_config.server_codec = CodecType::PNG;
+        }
+    } catch (...) {
+        // If config load fails, keep default PNG codec
+        fprintf(stderr, "WARNING: Failed to load codec from macemu-config.json, using PNG\n");
+    }
 
     // Print configuration summary
     g_config.print_summary();
