@@ -4,6 +4,7 @@ dnl Written in 2025
 AC_INIT([macemu-webrtc], [1.0], [])
 AC_CONFIG_SRCDIR([server/server.cpp])
 AC_CONFIG_HEADERS([config.h])
+AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIRS([m4])
 AC_PREREQ([2.69])
 
