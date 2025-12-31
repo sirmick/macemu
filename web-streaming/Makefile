@@ -19,7 +19,7 @@ CMAKE =
 
 # Compiler and linker flags from configure
 SERVER_CFLAGS = -I../BasiliskII/src/IPC -Ilibdatachannel/include -Ilibdatachannel/deps/json/include -Iserver  -I/usr/include/svt-av1 -DEB_DLL   -msse4.1 -mpclmul -I/usr/include/svt-av1 -DEB_DLL
-SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lpthread -lrt -lopus  -lSvtAv1Enc  -lvpx -lm  -lopus -lSvtAv1Enc
+SERVER_LIBS = libdatachannel/build/libdatachannel.a libdatachannel/build/deps/libjuice/libjuice.a libdatachannel/build/deps/libsrtp/libsrtp2.a libdatachannel/build/deps/usrsctp/usrsctplib/libusrsctp.a -lopenh264  -lssl -lcrypto  -lyuv -lpthread -lrt -lopus  -lSvtAv1Enc  -lvpx -lm  -lopus -lSvtAv1Enc -lwebp
 FPNG_CFLAGS = -msse4.1 -mpclmul
 
 # Source files
@@ -38,6 +38,7 @@ SERVER_SRCS = $(SERVER_DIR)/server.cpp \
               $(SERVER_DIR)/av1_encoder.cpp \
               $(SERVER_DIR)/opus_encoder.cpp \
               $(SERVER_DIR)/png_encoder.cpp \
+              $(SERVER_DIR)/webp_encoder.cpp \
               $(SERVER_DIR)/fpng.cpp
 
 # Object files
@@ -57,6 +58,7 @@ SERVER_OBJS = $(BUILD_DIR)/server.o \
               $(BUILD_DIR)/vp9_encoder.o \
               $(BUILD_DIR)/opus_encoder.o \
               $(BUILD_DIR)/png_encoder.o \
+              $(BUILD_DIR)/webp_encoder.o \
               $(BUILD_DIR)/fpng.o
 
 # Target
@@ -124,6 +126,11 @@ $(BUILD_DIR)/png_encoder.o: $(SERVER_DIR)/png_encoder.cpp \
                              $(SERVER_DIR)/png_encoder.h \
                              $(SERVER_DIR)/codec.h \
                              $(SERVER_DIR)/fpng.h
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/webp_encoder.o: $(SERVER_DIR)/webp_encoder.cpp \
+                              $(SERVER_DIR)/webp_encoder.h \
+                              $(SERVER_DIR)/codec.h
 	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
 # Compile fpng (fast PNG library)

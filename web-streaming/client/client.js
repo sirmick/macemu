@@ -347,7 +347,8 @@ const CodecType = {
     H264: 'h264',   // WebRTC video track with H.264
     AV1: 'av1',     // WebRTC video track with AV1
     VP9: 'vp9',     // WebRTC video track with VP9
-    PNG: 'png'      // PNG over DataChannel
+    PNG: 'png',     // PNG over DataChannel
+    WEBP: 'webp'    // WebP over DataChannel (faster encoding than PNG)
 };
 
 // Base class for video decoders
@@ -836,6 +837,8 @@ function createDecoder(codecType, element) {
         case CodecType.VP9:
             return new VP9Decoder(element);
         case CodecType.PNG:
+        case CodecType.WEBP:
+            // Both PNG and WebP use the same decoder (both are images over DataChannel)
             return new PNGDecoder(element);
         default:
             logger.error('Unknown codec type', { codecType });
@@ -850,6 +853,7 @@ function parseCodecString(codecStr) {
         case 'av1': return CodecType.AV1;
         case 'vp9': return CodecType.VP9;
         case 'png': return CodecType.PNG;
+        case 'webp': return CodecType.WEBP;
         default:
             logger.warn('Unknown codec string, defaulting to PNG', { codec: codecStr });
             return CodecType.PNG;
@@ -977,8 +981,8 @@ class BasiliskWebRTC {
             return false;
         }
 
-        // Set up frame callback for PNG decoder to update screen dimensions
-        if (this.codecType === CodecType.PNG) {
+        // Set up frame callback for still-image decoders (PNG/WebP) to update screen dimensions
+        if (this.codecType === CodecType.PNG || this.codecType === CodecType.WEBP) {
             this.decoder.onFrame = (frameCount, metadata) => {
                 // Update screen dimensions for absolute mouse mode
                 if (metadata && metadata.frameWidth && metadata.frameHeight) {

@@ -15,6 +15,7 @@
 #include "av1_encoder.h"
 #include "vp9_encoder.h"
 #include "png_encoder.h"
+#include "webp_encoder.h"
 #include "opus_encoder.h"
 #include "audio_config.h"
 
@@ -274,7 +275,8 @@ static void crash_handler(int sig, siginfo_t *info, void *context) {
     fprintf(stderr, "  Codec:              %s\n",
         g_server_codec == CodecType::H264 ? "H.264" :
         g_server_codec == CodecType::AV1 ? "AV1" :
-        g_server_codec == CodecType::VP9 ? "VP9" : "PNG");
+        g_server_codec == CodecType::VP9 ? "VP9" :
+        g_server_codec == CodecType::WEBP ? "WebP" : "PNG");
     fprintf(stderr, "=== END SERVER STATE ===\n\n");
 
     fprintf(stderr, "Crash report complete. Generating core dump...\n");
@@ -411,6 +413,8 @@ static bool start_emulator() {
         g_config.server_codec = CodecType::AV1;
     } else if (cfg.web.codec == "vp9") {
         g_config.server_codec = CodecType::VP9;
+    } else if (cfg.web.codec == "webp") {
+        g_config.server_codec = CodecType::WEBP;
     } else {
         g_config.server_codec = CodecType::PNG;
     }
@@ -705,7 +709,7 @@ struct PeerConnection {
     std::string id;
     CodecType codec = CodecType::H264;  // Codec type for this peer
     bool ready = false;
-    bool needs_first_frame = true;  // PNG peers need full first frame
+    bool needs_first_frame = true;  // Still-image peers (PNG/WebP) need full first frame
     // Note: pending_candidates removed - libdatachannel queues candidates internally
 };
 
@@ -1162,7 +1166,8 @@ public:
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
         for (auto& [id, peer] : peers_) {
-            if (peer->codec != CodecType::PNG) continue;  // Skip non-PNG peers
+            // Skip non-still-image peers (only PNG/WebP use DataChannel for video)
+            if (peer->codec != CodecType::PNG && peer->codec != CodecType::WEBP) continue;
             if (peer->ready && peer->data_channel && peer->data_channel->isOpen()) {
                 try {
                     peer->data_channel->send(
@@ -1229,7 +1234,8 @@ public:
     bool png_peer_needs_first_frame() {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         for (auto& [id, peer] : peers_) {
-            if (peer->codec == CodecType::PNG && peer->ready && peer->needs_first_frame) {
+            // Check if still-image peer (PNG or WebP) needs first frame
+            if ((peer->codec == CodecType::PNG || peer->codec == CodecType::WEBP) && peer->ready && peer->needs_first_frame) {
                 peer->needs_first_frame = false;  // Clear flag so next frame uses dirty rect
                 return true;
             }
@@ -1243,6 +1249,7 @@ public:
         int av1 = 0;
         int vp9 = 0;
         int png = 0;
+        int webp = 0;
     };
 
     CodecPeerCounts get_codec_peer_counts() {
@@ -1255,6 +1262,7 @@ public:
                 case CodecType::AV1: counts.av1++; break;
                 case CodecType::VP9: counts.vp9++; break;
                 case CodecType::PNG: counts.png++; break;
+                case CodecType::WEBP: counts.webp++; break;
             }
         }
         return counts;
@@ -1291,7 +1299,8 @@ public:
     void notify_codec_change(CodecType new_codec) {
         const char* codec_name = (new_codec == CodecType::H264) ? "h264" :
                                  (new_codec == CodecType::AV1) ? "av1" :
-                                 (new_codec == CodecType::VP9) ? "vp9" : "png";
+                                 (new_codec == CodecType::VP9) ? "vp9" :
+                                 (new_codec == CodecType::WEBP) ? "webp" : "png";
 
         json msg = {
             {"type", "reconnect"},
@@ -1487,7 +1496,8 @@ private:
             peer->codec = g_server_codec;
             const char* codec_name = (g_server_codec == CodecType::H264) ? "h264" :
                                      (g_server_codec == CodecType::AV1) ? "av1" :
-                                     (g_server_codec == CodecType::VP9) ? "vp9" : "png";
+                                     (g_server_codec == CodecType::VP9) ? "vp9" :
+                                     (g_server_codec == CodecType::WEBP) ? "webp" : "png";
             if (g_debug_connection) {
                 fprintf(stderr, "[WebRTC] Peer %s using %s codec (server-configured)\n",
                         peer_id.c_str(), codec_name);
@@ -1599,14 +1609,26 @@ private:
                 }
             });
 
-            // Add data channel for input
-            peer->data_channel = peer->pc->createDataChannel("input");
+            // Add data channel for input (and video for still-image codecs)
+            // For PNG/WebP: Use unreliable, unordered mode for lowest latency
+            // - Each frame is independent (no inter-frame dependencies)
+            // - Newer frames make old frames obsolete
+            // - No retransmission delays
+            rtc::DataChannelInit dc_init;
+            if (peer->codec == CodecType::PNG || peer->codec == CodecType::WEBP) {
+                dc_init.reliability.unordered = true;
+                dc_init.reliability.maxRetransmits = 0;  // No retransmits = unreliable
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Creating unreliable DataChannel for %s (still-image codec)\n", peer_id.c_str());
+                }
+            }
+            peer->data_channel = peer->pc->createDataChannel("input", dc_init);
             peer->data_channel->onOpen([peer, peer_id = peer->id]() {
                 if (g_debug_connection) {
                     fprintf(stderr, "[WebRTC] DataChannel OPEN for %s\n", peer_id.c_str());
                 }
-                // For PNG codec (no video track), mark peer as ready when DataChannel opens
-                if (peer->codec == CodecType::PNG) {
+                // For still-image codecs (no video track), mark peer as ready when DataChannel opens
+                if (peer->codec == CodecType::PNG || peer->codec == CodecType::WEBP) {
                     peer->ready = true;
                     if (g_debug_connection) {
                         fprintf(stderr, "[WebRTC] PNG peer %s marked ready (DataChannel opened)\n", peer_id.c_str());
@@ -2054,7 +2076,7 @@ static void connection_manager_loop(WebRTCServer& webrtc,
  * This thread just waits for frames, encodes them, and sends to WebRTC
  */
 
-static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, VP9Encoder& vp9_encoder, PNGEncoder& png_encoder) {
+static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encoder& av1_encoder, VP9Encoder& vp9_encoder, PNGEncoder& png_encoder, WebPEncoder& webp_encoder) {
     auto last_stats_time = std::chrono::steady_clock::now();
     int frames_encoded = 0;
 
@@ -2234,8 +2256,10 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             }
         }
 
-        // Encode and send to PNG peers using dirty rects from emulator
-        if (webrtc.has_codec_peer(CodecType::PNG)) {
+        // Encode and send to still-image codec peers (PNG/WebP) using dirty rects from emulator
+        // Both PNG and WebP use the same dirty rect logic, differ only in encoding
+        bool has_stillimage_peer = webrtc.has_codec_peer(CodecType::PNG) || webrtc.has_codec_peer(CodecType::WEBP);
+        if (has_stillimage_peer) {
             // Read dirty rect from SHM (plain reads - synchronized by eventfd)
             uint32_t dirty_x = g_ipc_shm->dirty_x;
             uint32_t dirty_y = g_ipc_shm->dirty_y;
@@ -2246,13 +2270,13 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             if (g_debug_png) {
                 static int dirty_log_counter = 0;
                 if (++dirty_log_counter % 30 == 0) {
-                    fprintf(stderr, "PNG: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %ux%u)\n",
+                    fprintf(stderr, "StillImage: Dirty rect from emulator: x=%u y=%u w=%u h=%u (frame: %ux%u)\n",
                             dirty_x, dirty_y, dirty_width, dirty_height, width, height);
                 }
             }
 
-            // Force full frame if any PNG peer needs their first frame
-            // PNG peers need a full first frame to initialize the canvas
+            // Force full frame if any still-image peer needs their first frame
+            // Still-image peers need a full first frame to initialize the canvas
             bool needs_first = webrtc.png_peer_needs_first_frame();
             if (needs_first) {
                 dirty_x = 0;
@@ -2288,46 +2312,66 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, AV1Encod
             // Only encode if there are changes (dirty_width > 0) or heartbeat triggered
             // Ping echoes are carried in the frame metadata header of any frame being sent
             if (dirty_width > 0 && dirty_height > 0) {
-                EncodedFrame frame;
-
                 // Check if this is a full frame or dirty rect
                 bool is_full_frame = (dirty_x == 0 && dirty_y == 0 && dirty_width == width && dirty_height == height);
 
                 if (g_debug_png) {
                     static int encode_log_counter = 0;
                     if (++encode_log_counter % 30 == 0) {
-                        fprintf(stderr, "PNG: Encoding %s (x=%u y=%u w=%u h=%u)\n",
+                        fprintf(stderr, "StillImage: Encoding %s (x=%u y=%u w=%u h=%u)\n",
                                 is_full_frame ? "FULL FRAME" : "dirty rect",
                                 dirty_x, dirty_y, dirty_width, dirty_height);
                     }
                 }
 
-                if (is_full_frame) {
-                    // Full frame
-                    frame = png_encoder.encode_bgra(frame_data, width, height, stride);
-                } else {
-                    // Dirty rectangle only
-                    frame = png_encoder.encode_bgra_rect(frame_data, width, height, stride,
-                                                         dirty_x, dirty_y, dirty_width, dirty_height);
+                // Encode with PNG encoder if we have PNG peers
+                if (webrtc.has_codec_peer(CodecType::PNG)) {
+                    EncodedFrame frame;
+                    if (is_full_frame) {
+                        frame = png_encoder.encode_bgra(frame_data, width, height, stride);
+                    } else {
+                        frame = png_encoder.encode_bgra_rect(frame_data, width, height, stride,
+                                                             dirty_x, dirty_y, dirty_width, dirty_height);
+                    }
+
+                    // T6: Capture encode done timestamp
+                    struct timespec ts_enc;
+                    clock_gettime(CLOCK_REALTIME, &ts_enc);
+                    uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
+
+                    if (!frame.data.empty()) {
+                        webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+                        uint64_t t1_frame_ready_ms = frame_timestamp_us / 1000;
+                        webrtc.send_png_frame(frame, t1_frame_ready_ms,
+                                              dirty_x, dirty_y, dirty_width, dirty_height,
+                                              width, height);
+                        frames_encoded++;
+                    }
                 }
 
-                // T6: Capture encode done timestamp
-                struct timespec ts_enc;
-                clock_gettime(CLOCK_REALTIME, &ts_enc);
-                uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
+                // Encode with WebP encoder if we have WebP peers
+                if (webrtc.has_codec_peer(CodecType::WEBP)) {
+                    EncodedFrame frame;
+                    if (is_full_frame) {
+                        frame = webp_encoder.encode_bgra(frame_data, width, height, stride);
+                    } else {
+                        frame = webp_encoder.encode_bgra_rect(frame_data, width, height, stride,
+                                                              dirty_x, dirty_y, dirty_width, dirty_height);
+                    }
 
-                if (!frame.data.empty()) {
-                    // Populate cursor and ping/pong metadata
-                    webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+                    // T6: Capture encode done timestamp
+                    struct timespec ts_enc;
+                    clock_gettime(CLOCK_REALTIME, &ts_enc);
+                    uint64_t t6_encode_done_us = (uint64_t)ts_enc.tv_sec * 1000000 + ts_enc.tv_nsec / 1000;
 
-                    // T1: Frame ready time from emulator (convert from microseconds to milliseconds)
-                    uint64_t t1_frame_ready_ms = frame_timestamp_us / 1000;
-
-                    // Send PNG with dirty rect metadata, full frame resolution, and timestamps
-                    webrtc.send_png_frame(frame, t1_frame_ready_ms,
-                                          dirty_x, dirty_y, dirty_width, dirty_height,
-                                          width, height);
-                    frames_encoded++;
+                    if (!frame.data.empty()) {
+                        webrtc.populate_frame_metadata(frame, t5_server_read_us, t6_encode_done_us);
+                        uint64_t t1_frame_ready_ms = frame_timestamp_us / 1000;
+                        webrtc.send_png_frame(frame, t1_frame_ready_ms,
+                                              dirty_x, dirty_y, dirty_width, dirty_height,
+                                              width, height);
+                        frames_encoded++;
+                    }
                 }
             }
             // else: no changes (dirty_width == 0), skip encoding
@@ -2721,6 +2765,8 @@ int main(int argc, char* argv[]) {
             g_config.server_codec = CodecType::AV1;
         } else if (cfg.web.codec == "vp9") {
             g_config.server_codec = CodecType::VP9;
+        } else if (cfg.web.codec == "webp") {
+            g_config.server_codec = CodecType::WEBP;
         } else {
             g_config.server_codec = CodecType::PNG;
         }
@@ -2757,6 +2803,7 @@ int main(int argc, char* argv[]) {
     AV1Encoder av1_encoder;
     VP9Encoder vp9_encoder;
     PNGEncoder png_encoder;
+    WebPEncoder webp_encoder;
     g_audio_encoder = std::make_unique<OpusAudioEncoder>();
 
     // Initialize audio encoder using centralized audio_config.h constants
@@ -2798,7 +2845,7 @@ int main(int argc, char* argv[]) {
 
     // Launch worker threads
     std::thread audio_thread(audio_loop, std::ref(webrtc));
-    std::thread video_thread(video_loop, std::ref(webrtc), std::ref(h264_encoder), std::ref(av1_encoder), std::ref(vp9_encoder), std::ref(png_encoder));
+    std::thread video_thread(video_loop, std::ref(webrtc), std::ref(h264_encoder), std::ref(av1_encoder), std::ref(vp9_encoder), std::ref(png_encoder), std::ref(webp_encoder));
 
     // Run connection manager in main thread
     // This handles scanning, connecting, disconnecting, process management, restarts

@@ -438,8 +438,10 @@ Response APIRouter::handle_codec_post(const Request& req) {
         new_codec = CodecType::VP9;
     } else if (codec_str == "png" || codec_str == "PNG") {
         new_codec = CodecType::PNG;
+    } else if (codec_str == "webp" || codec_str == "WEBP" || codec_str == "WebP") {
+        new_codec = CodecType::WEBP;
     } else {
-        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, vp9, or png\"}");
+        return Response::json("{\"error\": \"Invalid codec. Use h264, av1, vp9, png, or webp\"}");
     }
 
     // Update codec
