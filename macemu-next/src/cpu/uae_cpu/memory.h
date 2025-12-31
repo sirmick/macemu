@@ -132,20 +132,43 @@ static __inline__ uae_u32 do_get_virtual_address(uae_u8 *addr)
 {
 	return (uintptr)addr - MEMBaseDiff;
 }
+
+/* Forward declarations for CPU tracing */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern void cpu_trace_log_mem_read(uint32_t addr, uint32_t value, int size);
+extern bool cpu_trace_memory_enabled(void);
+#ifdef __cplusplus
+}
+#endif
+
 static __inline__ uae_u32 get_long(uaecptr addr)
 {
     uae_u32 * const m = (uae_u32 *)do_get_real_address(addr);
-    return do_get_mem_long(m);
+    uae_u32 value = do_get_mem_long(m);
+    if (cpu_trace_memory_enabled()) {
+        cpu_trace_log_mem_read(addr, value, 4);
+    }
+    return value;
 }
 static __inline__ uae_u32 get_word(uaecptr addr)
 {
     uae_u16 * const m = (uae_u16 *)do_get_real_address(addr);
-    return do_get_mem_word(m);
+    uae_u32 value = do_get_mem_word(m);
+    if (cpu_trace_memory_enabled()) {
+        cpu_trace_log_mem_read(addr, value, 2);
+    }
+    return value;
 }
 static __inline__ uae_u32 get_byte(uaecptr addr)
 {
     uae_u8 * const m = (uae_u8 *)do_get_real_address(addr);
-    return do_get_mem_byte(m);
+    uae_u32 value = do_get_mem_byte(m);
+    if (cpu_trace_memory_enabled()) {
+        cpu_trace_log_mem_read(addr, value, 1);
+    }
+    return value;
 }
 static __inline__ void put_long(uaecptr addr, uae_u32 l)
 {

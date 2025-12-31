@@ -249,12 +249,25 @@ void uae_cpu_execute_one(void) {
         uae_u32 pc_before = m68k_getpc();
         // Read raw opcode bytes (big-endian) for trace display
         uae_u16 opcode_raw = get_iword(0);
-        cpu_trace_log_simple(
+        cpu_trace_log_detailed(
+            "UAE",
             pc_before,
             opcode_raw,
             (unsigned int)regs.regs[0],   // D0
             (unsigned int)regs.regs[1],   // D1
+            (unsigned int)regs.regs[2],   // D2
+            (unsigned int)regs.regs[3],   // D3
+            (unsigned int)regs.regs[4],   // D4
+            (unsigned int)regs.regs[5],   // D5
+            (unsigned int)regs.regs[6],   // D6
+            (unsigned int)regs.regs[7],   // D7
             (unsigned int)regs.regs[8],   // A0
+            (unsigned int)regs.regs[9],   // A1
+            (unsigned int)regs.regs[10],  // A2
+            (unsigned int)regs.regs[11],  // A3
+            (unsigned int)regs.regs[12],  // A4
+            (unsigned int)regs.regs[13],  // A5
+            (unsigned int)regs.regs[14],  // A6
             (unsigned int)regs.regs[15],  // A7
             (unsigned int)regs.sr
         );

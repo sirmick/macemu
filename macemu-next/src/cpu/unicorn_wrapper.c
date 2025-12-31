@@ -4,6 +4,7 @@
 
 #include "unicorn_wrapper.h"
 #include "platform.h"
+#include "cpu_trace.h"
 #include <unicorn/unicorn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@ struct UnicornCPU {
 
     uc_hook code_hook;  // UC_HOOK_CODE for EmulOps/traps (allows register modification)
     uc_hook trap_hook;  // UC_HOOK_MEM_FETCH_UNMAPPED for MMIO trap region
+    uc_hook trace_hook; // UC_HOOK_MEM_READ for CPU tracing
 
     /* MMIO trap context */
     TrapContext trap_ctx;
@@ -236,6 +238,29 @@ static void hook_memory(uc_engine *uc, uc_mem_type type,
     }
 }
 
+/* Memory read trace hook for CPU_TRACE_MEMORY */
+static void hook_mem_trace(uc_engine *uc, uc_mem_type type,
+                           uint64_t address, int size, int64_t value,
+                           void *user_data)
+{
+    /* Only trace reads */
+    if (type != UC_MEM_READ) return;
+
+    /* Read the actual value from memory */
+    uint32_t val = 0;
+    uc_mem_read(uc, address, &val, size);
+
+    /* Byte-swap if needed (M68K is big-endian) */
+    if (size == 2) {
+        val = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF);
+    } else if (size == 4) {
+        val = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) |
+              ((val & 0xFF0000) >> 8) | ((val >> 24) & 0xFF);
+    }
+
+    cpu_trace_log_mem_read((uint32_t)address, val, size);
+}
+
 /* CPU lifecycle */
 UnicornCPU* unicorn_create(UnicornArch arch) {
     return unicorn_create_with_model(arch, -1);  /* Use default CPU model */
@@ -306,6 +331,19 @@ UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model) {
     cpu->trap_ctx.in_emulop = false;
     cpu->trap_ctx.in_trap = false;
     cpu->trap_ctx.trap_opcode = 0;
+
+    /* Install memory trace hook if CPU_TRACE_MEMORY is enabled */
+    if (cpu_trace_memory_enabled()) {
+        err = uc_hook_add(cpu->uc, &cpu->trace_hook,
+                         UC_HOOK_MEM_READ,
+                         hook_mem_trace,
+                         cpu,  /* user_data */
+                         1, 0);  /* All addresses */
+        if (err != UC_ERR_OK) {
+            fprintf(stderr, "Warning: Failed to register memory trace hook: %s\n", uc_strerror(err));
+            /* Not fatal - continue without memory tracing */
+        }
+    }
 
     return cpu;
 }

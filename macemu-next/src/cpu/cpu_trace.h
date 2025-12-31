@@ -20,6 +20,7 @@ extern "C" {
 /* CPU trace state */
 typedef struct {
 	bool enabled;
+	bool trace_memory;      /* Also log memory reads (CPU_TRACE_MEMORY=1) */
 	uint64_t start_count;   /* Start tracing at this instruction */
 	uint64_t end_count;     /* Stop tracing at this instruction */
 	uint64_t current_count; /* Current instruction count */
@@ -47,6 +48,20 @@ void cpu_trace_log_simple(uint32_t pc, uint16_t opcode,
                           uint32_t d0, uint32_t d1,
                           uint32_t a0, uint32_t a7,
                           uint16_t sr);
+
+/* Detailed log with CPU name and condition codes expanded */
+void cpu_trace_log_detailed(const char *cpu_name, uint32_t pc, uint16_t opcode,
+                             uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3,
+                             uint32_t d4, uint32_t d5, uint32_t d6, uint32_t d7,
+                             uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                             uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7,
+                             uint16_t sr);
+
+/* Log a memory read operation */
+void cpu_trace_log_mem_read(uint32_t addr, uint32_t value, int size);
+
+/* Check if memory tracing is enabled */
+bool cpu_trace_memory_enabled(void);
 
 #ifdef __cplusplus
 }

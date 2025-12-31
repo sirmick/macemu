@@ -160,11 +160,24 @@ static int unicorn_backend_execute_one(void) {
 		opcode = __builtin_bswap16(opcode);
 		#endif
 
-		cpu_trace_log_simple(
+		cpu_trace_log_detailed(
+			"Unicorn",
 			pc, opcode,
 			unicorn_get_dreg(unicorn_cpu, 0),
 			unicorn_get_dreg(unicorn_cpu, 1),
+			unicorn_get_dreg(unicorn_cpu, 2),
+			unicorn_get_dreg(unicorn_cpu, 3),
+			unicorn_get_dreg(unicorn_cpu, 4),
+			unicorn_get_dreg(unicorn_cpu, 5),
+			unicorn_get_dreg(unicorn_cpu, 6),
+			unicorn_get_dreg(unicorn_cpu, 7),
 			unicorn_get_areg(unicorn_cpu, 0),
+			unicorn_get_areg(unicorn_cpu, 1),
+			unicorn_get_areg(unicorn_cpu, 2),
+			unicorn_get_areg(unicorn_cpu, 3),
+			unicorn_get_areg(unicorn_cpu, 4),
+			unicorn_get_areg(unicorn_cpu, 5),
+			unicorn_get_areg(unicorn_cpu, 6),
 			unicorn_get_areg(unicorn_cpu, 7),
 			unicorn_get_sr(unicorn_cpu)
 		);

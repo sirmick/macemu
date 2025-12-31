@@ -13,6 +13,7 @@ void cpu_trace_init(void) {
 	const char *trace_env = getenv("CPU_TRACE");
 	if (!trace_env) {
 		g_trace.enabled = false;
+		g_trace.trace_memory = false;
 		return;
 	}
 
@@ -21,8 +22,11 @@ void cpu_trace_init(void) {
 		/* Range format: "start-end" */
 		if (sscanf(trace_env, "%lu-%lu", &g_trace.start_count, &g_trace.end_count) == 2) {
 			g_trace.enabled = true;
-			fprintf(stderr, "[CPU trace enabled: instructions %lu-%lu]\n",
-			        g_trace.start_count, g_trace.end_count);
+			/* Only print banner if CPU_TRACE_QUIET is not set */
+			if (!getenv("CPU_TRACE_QUIET")) {
+				fprintf(stderr, "[CPU trace enabled: instructions %lu-%lu]\n",
+				        g_trace.start_count, g_trace.end_count);
+			}
 		}
 	} else {
 		/* Simple count: "N" means trace first N instructions */
@@ -31,9 +35,15 @@ void cpu_trace_init(void) {
 			g_trace.enabled = true;
 			g_trace.start_count = 0;
 			g_trace.end_count = count;
-			fprintf(stderr, "[CPU trace enabled: will trace first %ld instructions]\n", count);
+			/* Only print banner if CPU_TRACE_QUIET is not set */
+			if (!getenv("CPU_TRACE_QUIET")) {
+				fprintf(stderr, "[CPU trace enabled: will trace first %ld instructions]\n", count);
+			}
 		}
 	}
+
+	/* Check if memory tracing is enabled */
+	g_trace.trace_memory = (getenv("CPU_TRACE_MEMORY") != NULL);
 
 	g_trace.current_count = 0;
 }
@@ -70,4 +80,42 @@ void cpu_trace_log(uint32_t pc, uint16_t opcode,
 	        d0, d1, d2, d3, d4, d5, d6, d7,
 	        a0, a1, a2, a3, a4, a5, a6, a7,
 	        sr);
+}
+
+void cpu_trace_log_detailed(const char *cpu_name, uint32_t pc, uint16_t opcode,
+                             uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3,
+                             uint32_t d4, uint32_t d5, uint32_t d6, uint32_t d7,
+                             uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                             uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7,
+                             uint16_t sr) {
+	/* Extract condition codes from SR */
+	uint8_t ccr = sr & 0x1F;
+	uint8_t x = (ccr >> 4) & 1;
+	uint8_t n = (ccr >> 3) & 1;
+	uint8_t z = (ccr >> 2) & 1;
+	uint8_t v = (ccr >> 1) & 1;
+	uint8_t c = (ccr >> 0) & 1;
+
+	/* Format: [count] PC OP | Dregs | Aregs | SR [flags] */
+	fprintf(stderr, "[%05lu] %08X %04X | "
+	        "%08X %08X %08X %08X %08X %08X %08X %08X | "
+	        "%08X %08X %08X %08X %08X %08X %08X %08X | "
+	        "%04X %d%d%d%d%d\n",
+	        g_trace.current_count, pc, opcode,
+	        d0, d1, d2, d3, d4, d5, d6, d7,
+	        a0, a1, a2, a3, a4, a5, a6, a7,
+	        sr, x, n, z, v, c);
+}
+
+void cpu_trace_log_mem_read(uint32_t addr, uint32_t value, int size) {
+	if (!g_trace.trace_memory) return;
+	if (!cpu_trace_should_log()) return;
+
+	/* Format: "  MEM[addr] = value (size)" on same line as instruction */
+	const char *size_str = (size == 1) ? "B" : (size == 2) ? "W" : "L";
+	fprintf(stderr, "  MEM[%08X]=%08X (%s)\n", addr, value, size_str);
+}
+
+bool cpu_trace_memory_enabled(void) {
+	return g_trace.trace_memory && cpu_trace_should_log();
 }
