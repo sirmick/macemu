@@ -27,7 +27,7 @@ if [ ! -f configure ]; then
     ./autogen.sh
 fi
 
-./configure --enable-ipc-video --enable-ipc-audio
+./configure --enable-ipc-video --enable-ipc-audio --enable-jit
 make -j$(nproc)
 
 echo -e "${GREEN}✓ BasiliskII built: BasiliskII/src/Unix/BasiliskII${NC}"
@@ -43,7 +43,7 @@ if [ ! -f configure ]; then
     ./autogen.sh
 fi
 
-./configure --enable-ipc-video --enable-ipc-audio
+./configure --enable-ipc-video --enable-ipc-audio --enable-jit
 make -j$(nproc)
 
 echo -e "${GREEN}✓ SheepShaver built: SheepShaver/src/Unix/SheepShaver${NC}"
