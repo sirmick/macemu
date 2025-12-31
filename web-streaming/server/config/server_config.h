@@ -24,8 +24,8 @@ struct ServerConfig {
     std::string stun_server = "stun:stun.l.google.com:19302";
 
     // Paths
-    std::string roms_path = "storage/roms";
-    std::string images_path = "storage/images";
+    std::string roms_path = "$HOME/.macemu/storage/roms";
+    std::string images_path = "$HOME/.macemu/storage/images";
     std::string prefs_path = "basilisk_ii.prefs";
     std::string emulator_path;  // Path to BasiliskII/SheepShaver executable
 

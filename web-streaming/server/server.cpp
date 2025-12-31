@@ -80,6 +80,19 @@
 // Configuration (centralized in ServerConfig)
 static server_config::ServerConfig g_config;
 
+// Helper: Expand $HOME in paths
+static std::string expand_path(const std::string& path) {
+    if (path.find("$HOME") == 0) {
+        const char* home = getenv("HOME");
+        if (!home) {
+            struct passwd* pw = getpwuid(getuid());
+            home = pw ? pw->pw_dir : "/tmp";
+        }
+        return std::string(home) + path.substr(5);  // Skip "$HOME"
+    }
+    return path;
+}
+
 // Legacy accessors for gradual migration
 // TODO: Phase 7 - Pass ServerConfig reference instead of using globals
 #define g_http_port         (g_config.http_port)
@@ -403,8 +416,14 @@ static bool start_emulator() {
         g_started_emulator_pid = -1;
     }
 
-    // Load unified JSON config
-    config::MacemuConfig cfg = config::load_config("macemu-config.json");
+    // Load unified JSON config from ~/.macemu/
+    const char* home = getenv("HOME");
+    if (!home) {
+        struct passwd* pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : "/tmp";
+    }
+    std::string config_path = std::string(home) + "/.macemu/macemu-config.json";
+    config::MacemuConfig cfg = config::load_config(config_path);
 
     // Update server codec from config
     if (cfg.web.codec == "h264") {
@@ -419,39 +438,31 @@ static bool start_emulator() {
         g_config.server_codec = CodecType::PNG;
     }
 
-    // Determine which emulator to launch
+    // Determine which emulator to launch (use binaries in PATH)
     bool is_ppc = (cfg.web.emulator == "ppc");
-    const char* emu_name = is_ppc ? "SheepShaver" : "BasiliskII";
-    std::string emu_binary = std::string("./bin/") + emu_name;
+    const char* emu_name = is_ppc ? "sheepshaver-webrtc" : "basiliskii-webrtc";
 
-    // Check if binary exists
-    if (access(emu_binary.c_str(), X_OK) != 0) {
-        fprintf(stderr, "Emulator: Binary not found or not executable: %s\n", emu_binary.c_str());
-        // Try fallback to other emulator
-        emu_name = is_ppc ? "BasiliskII" : "SheepShaver";
-        emu_binary = std::string("./bin/") + emu_name;
-        if (access(emu_binary.c_str(), X_OK) != 0) {
-            fprintf(stderr, "Emulator: No emulator found in ./bin/\n");
-            return false;
-        }
-        is_ppc = !is_ppc;  // Update flag to match fallback
-    }
-
-    // Generate appropriate prefs file
+    // Generate appropriate prefs file and ensure config directories exist
     std::string prefs_content;
     std::string prefs_file;
+    // home already declared above when loading config
+
     if (is_ppc) {
         prefs_content = config::generate_sheepshaver_prefs(cfg, g_roms_path, g_images_path);
         // SheepShaver reads from ~/.config/SheepShaver/prefs by default
-        const char* home = getenv("HOME");
-        std::string config_dir = std::string(home ? home : ".") + "/.config/SheepShaver";
+        std::string config_dir = std::string(home) + "/.config/SheepShaver";
         // Create directory if it doesn't exist
-        mkdir((std::string(home ? home : ".") + "/.config").c_str(), 0755);
+        mkdir((std::string(home) + "/.config").c_str(), 0755);
         mkdir(config_dir.c_str(), 0755);
         prefs_file = config_dir + "/prefs";
     } else {
         prefs_content = config::generate_basilisk_prefs(cfg, g_roms_path, g_images_path);
-        prefs_file = "basilisk_ii.prefs";
+        // BasiliskII will use --config flag
+        std::string config_dir = std::string(home) + "/.config/BasiliskII";
+        // Create directory if it doesn't exist
+        mkdir((std::string(home) + "/.config").c_str(), 0755);
+        mkdir(config_dir.c_str(), 0755);
+        prefs_file = config_dir + "/prefs";
     }
 
     // Write prefs file
@@ -462,8 +473,8 @@ static bool start_emulator() {
 
     fprintf(stderr, "\n");
     fprintf(stderr, "🚀 LAUNCHING EMULATOR:\n");
-    fprintf(stderr, "   Type:   %s\n", emu_name);
-    fprintf(stderr, "   Binary: %s\n", emu_binary.c_str());
+    fprintf(stderr, "   Type:   %s\n", is_ppc ? "SheepShaver (PPC)" : "BasiliskII (68k)");
+    fprintf(stderr, "   Binary: %s (from PATH)\n", emu_name);
     fprintf(stderr, "   Prefs:  %s (generated from macemu-config.json)\n", prefs_file.c_str());
     fprintf(stderr, "   Codec:  %s\n", cfg.web.codec.c_str());
     fprintf(stderr, "   Mouse:  %s\n", cfg.web.mousemode.c_str());
@@ -488,19 +499,24 @@ static bool start_emulator() {
         if (g_debug_perf) setenv("MACEMU_DEBUG_PERF", "1", 1);
         if (g_debug_frames) setenv("MACEMU_DEBUG_FRAMES", "1", 1);
 
-        // Execute emulator with generated prefs file
-        // BasiliskII uses --config flag, SheepShaver reads from ~/.config/SheepShaver/prefs
+        // Execute emulator with generated prefs file (search PATH)
+        // BasiliskII uses --config and --xpram flags
+        // SheepShaver reads from ~/.config/SheepShaver/prefs by default
         if (is_ppc) {
             // SheepShaver: no args needed, reads prefs from default location
-            execl(emu_binary.c_str(), emu_binary.c_str(), nullptr);
+            execlp(emu_name, emu_name, nullptr);
         } else {
-            // BasiliskII: use --config flag
-            execl(emu_binary.c_str(), emu_binary.c_str(),
-                  "--config", prefs_file.c_str(), nullptr);
+            // BasiliskII: use --config and --xpram flags
+            std::string xpram_path = std::string(home) + "/.config/BasiliskII/xpram";
+            execlp(emu_name, emu_name,
+                   "--config", prefs_file.c_str(),
+                   "--xpram", xpram_path.c_str(),
+                   nullptr);
         }
 
         // If exec fails
-        fprintf(stderr, "Emulator: Exec failed: %s\n", strerror(errno));
+        fprintf(stderr, "Emulator: Failed to execute %s: %s\n", emu_name, strerror(errno));
+        fprintf(stderr, "Emulator: Make sure %s is installed and in your PATH\n", emu_name);
         _exit(1);
     }
 
@@ -630,7 +646,15 @@ public:
 
         // Create API router and static file handler
         api_router_ = std::make_unique<http::APIRouter>(&api_ctx_);
-        static_handler_ = std::make_unique<http::StaticFileHandler>("client");
+
+        // Client files are in ~/.macemu/client/
+        const char* home = getenv("HOME");
+        if (!home) {
+            struct passwd* pw = getpwuid(getuid());
+            home = pw ? pw->pw_dir : "/tmp";
+        }
+        std::string client_path = std::string(home) + "/.macemu/client";
+        static_handler_ = std::make_unique<http::StaticFileHandler>(client_path);
 
         // Start HTTP server with combined request handler
         auto handler = [this](const http::Request& req) -> http::Response {
@@ -2724,6 +2748,19 @@ int main(int argc, char* argv[]) {
     g_config.parse_command_line(argc, argv);
     g_config.load_from_env();
 
+    // Expand $HOME in paths
+    g_config.roms_path = expand_path(g_config.roms_path);
+    g_config.images_path = expand_path(g_config.images_path);
+
+    // Ensure ~/.macemu directory exists
+    const char* home = getenv("HOME");
+    if (!home) {
+        struct passwd* pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : "/tmp";
+    }
+    std::string macemu_dir = std::string(home) + "/.macemu";
+    mkdir(macemu_dir.c_str(), 0755);
+
     // Sync debug flags (needed by encoders)
     g_debug_mode_switch = g_config.debug_mode_switch;
     g_debug_png = g_config.debug_png;
@@ -2757,8 +2794,9 @@ int main(int argc, char* argv[]) {
 
     // Load codec from JSON config at startup
     // This ensures browser connections use the correct codec from the start
+    std::string config_path = macemu_dir + "/macemu-config.json";
     try {
-        config::MacemuConfig cfg = config::load_config("macemu-config.json");
+        config::MacemuConfig cfg = config::load_config(config_path);
         if (cfg.web.codec == "h264") {
             g_config.server_codec = CodecType::H264;
         } else if (cfg.web.codec == "av1") {
@@ -2772,7 +2810,7 @@ int main(int argc, char* argv[]) {
         }
     } catch (...) {
         // If config load fails, keep default PNG codec
-        fprintf(stderr, "WARNING: Failed to load codec from macemu-config.json, using PNG\n");
+        fprintf(stderr, "WARNING: Failed to load codec from %s, using PNG\n", config_path.c_str());
     }
 
     // Print configuration summary
