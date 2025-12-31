@@ -32,6 +32,7 @@ sudo apt-get update && sudo apt-get install -y \
     libwebp-dev \
     libopus-dev \
     libyuv-dev \
+    libmpfr-dev \
     libsdl2-dev \
     libgtk-3-dev
 ```
@@ -50,6 +51,7 @@ sudo apt-get update && sudo apt-get install -y \
 **Shared libraries:**
 - `libyuv-dev` - Fast YUV/RGB color space conversion (used by all video codecs)
 - `libssl-dev` - TLS/crypto for WebRTC connections
+- `libmpfr-dev` - Multi-precision floating-point (BasiliskII/SheepShaver dependency)
 - `libsdl2-dev`, `libgtk-3-dev` - Emulator UI dependencies
 
 ## Build Instructions
