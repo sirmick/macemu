@@ -24,7 +24,7 @@ This project enables browser-based streaming of classic Mac emulation using WebR
 
 ```bash
 sudo apt-get update && sudo apt-get install -y \
-    build-essential cmake pkg-config git autoconf automake libtool \
+    build-essential cmake pkg-config git autoconf automake libtool autogen \
     libssl-dev \
     libopenh264-dev \
     libsvtav1-dev libsvtav1enc-dev \
