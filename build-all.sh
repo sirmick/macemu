@@ -55,9 +55,12 @@ echo -e "${BLUE}[3/3] Building WebRTC streaming server...${NC}"
 cd web-streaming
 
 if [ ! -f configure ]; then
-    echo "ERROR: configure script not found in web-streaming/"
-    echo "Please run 'autoconf' in web-streaming/ to generate it"
-    exit 1
+    echo "Generating configure script with autoconf..."
+    autoconf
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to generate configure script"
+        exit 1
+    fi
 fi
 
 ./configure
