@@ -9,6 +9,7 @@
 #include "unicorn_wrapper.h"
 #include "unicorn_exception.h"
 #include "cpu_trace.h"
+#include "memory_access.h"  // For direct memory access (UAE-independent)
 #include <unicorn/unicorn.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -123,19 +124,18 @@ static void unicorn_backend_reset(void) {
 	if (!unicorn_cpu) return;
 
 	// M68K reset: Initialize registers to power-on state
+	// IMPORTANT: Set PC and SR first, THEN registers
+	// Setting PC may clear A7 in Unicorn, so A7 must be set after PC
+	unicorn_set_pc(unicorn_cpu, ROMBaseMac + 0x2a);
+	unicorn_set_sr(unicorn_cpu, 0x2700);  // S=1, I=111
+
 	for (int i = 0; i < 8; i++) {
 		unicorn_set_dreg(unicorn_cpu, i, 0);
 		unicorn_set_areg(unicorn_cpu, i, 0);
 	}
 
-	// Set A7 (SSP) to initial stack pointer value
+	// Set A7 (SSP) after PC to avoid it being cleared
 	unicorn_set_areg(unicorn_cpu, 7, 0x2000);
-
-	// Set PC to ROM entry point (matching UAE's m68k_reset)
-	unicorn_set_pc(unicorn_cpu, ROMBaseMac + 0x2a);
-
-	// Set SR: Supervisor mode, interrupt mask 7
-	unicorn_set_sr(unicorn_cpu, 0x2700);  // S=1, I=111
 }
 
 static void unicorn_backend_destroy(void) {
@@ -266,6 +266,109 @@ static void unicorn_backend_trigger_interrupt(int level) {
 	(void)level;
 }
 
+// Memory access (Unicorn-specific: uses uc_mem_read/write, NOT host pointers)
+// These are called from UAE's get_long/put_long functions via platform API
+//
+// IMPORTANT: During initialization (before unicorn_backend_init()), unicorn_cpu is NULL.
+// In this phase, PatchROM() needs to patch ROM, so we fall back to DirectReadMacInt*()
+// which patches ROMBaseHost directly. After unicorn_backend_init(), Unicorn copies the
+// patched ROM, and all subsequent access uses uc_mem_read/write on Unicorn's internal memory.
+static uint32_t unicorn_mem_read_long(uint32_t addr) {
+	if (!unicorn_cpu) {
+		// Before Unicorn initialization: read from host memory directly
+		return DirectReadMacInt32(addr);
+	}
+	uint32_t value = 0;
+	uc_err err = uc_mem_read((uc_engine*)unicorn_get_uc(unicorn_cpu), addr, &value, 4);
+	if (err != UC_ERR_OK) {
+		fprintf(stderr, "unicorn_mem_read_long: failed to read from 0x%08X: %s\n",
+		        addr, uc_strerror(err));
+		return 0;
+	}
+	// Unicorn stores memory in big-endian (M68K native), convert to host byte order for processing
+	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	return __builtin_bswap32(value);
+	#else
+	return value;
+	#endif
+}
+
+static uint16_t unicorn_mem_read_word(uint32_t addr) {
+	if (!unicorn_cpu) {
+		return DirectReadMacInt16(addr);
+	}
+	uint16_t value = 0;
+	uc_err err = uc_mem_read((uc_engine*)unicorn_get_uc(unicorn_cpu), addr, &value, 2);
+	if (err != UC_ERR_OK) {
+		fprintf(stderr, "unicorn_mem_read_word: failed to read from 0x%08X: %s\n",
+		        addr, uc_strerror(err));
+		return 0;
+	}
+	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	return __builtin_bswap16(value);
+	#else
+	return value;
+	#endif
+}
+
+static uint8_t unicorn_mem_read_byte(uint32_t addr) {
+	if (!unicorn_cpu) {
+		return DirectReadMacInt8(addr);
+	}
+	uint8_t value = 0;
+	uc_err err = uc_mem_read((uc_engine*)unicorn_get_uc(unicorn_cpu), addr, &value, 1);
+	if (err != UC_ERR_OK) {
+		fprintf(stderr, "unicorn_mem_read_byte: failed to read from 0x%08X: %s\n",
+		        addr, uc_strerror(err));
+		return 0;
+	}
+	return value;
+}
+
+static void unicorn_mem_write_long(uint32_t addr, uint32_t value) {
+	if (!unicorn_cpu) {
+		// Before Unicorn initialization: write to host memory directly
+		DirectWriteMacInt32(addr, value);
+		return;
+	}
+	// Convert from host byte order to big-endian (M68K native) for Unicorn
+	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	value = __builtin_bswap32(value);
+	#endif
+	uc_err err = uc_mem_write((uc_engine*)unicorn_get_uc(unicorn_cpu), addr, &value, 4);
+	if (err != UC_ERR_OK) {
+		fprintf(stderr, "unicorn_mem_write_long: failed to write to 0x%08X: %s\n",
+		        addr, uc_strerror(err));
+	}
+}
+
+static void unicorn_mem_write_word(uint32_t addr, uint16_t value) {
+	if (!unicorn_cpu) {
+		DirectWriteMacInt16(addr, value);
+		return;
+	}
+	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	value = __builtin_bswap16(value);
+	#endif
+	uc_err err = uc_mem_write((uc_engine*)unicorn_get_uc(unicorn_cpu), addr, &value, 2);
+	if (err != UC_ERR_OK) {
+		fprintf(stderr, "unicorn_mem_write_word: failed to write to 0x%08X: %s\n",
+		        addr, uc_strerror(err));
+	}
+}
+
+static void unicorn_mem_write_byte(uint32_t addr, uint8_t value) {
+	if (!unicorn_cpu) {
+		DirectWriteMacInt8(addr, value);
+		return;
+	}
+	uc_err err = uc_mem_write((uc_engine*)unicorn_get_uc(unicorn_cpu), addr, &value, 1);
+	if (err != UC_ERR_OK) {
+		fprintf(stderr, "unicorn_mem_write_byte: failed to write to 0x%08X: %s\n",
+		        addr, uc_strerror(err));
+	}
+}
+
 /**
  * Install Unicorn CPU backend into platform
  */
@@ -300,4 +403,20 @@ void cpu_unicorn_install(Platform *p) {
 
 	// Interrupts
 	p->cpu_trigger_interrupt = unicorn_backend_trigger_interrupt;
+
+	// Memory system (Unicorn-specific: uses uc_mem_read/write to access Unicorn's internal memory)
+	// IMPORTANT: Do NOT use DirectReadMacInt* functions - they read from RAMBaseHost/ROMBaseHost
+	// which is UAE's memory space, not Unicorn's internal memory!
+	p->mem_read_byte = unicorn_mem_read_byte;
+	p->mem_read_word = unicorn_mem_read_word;
+	p->mem_read_long = unicorn_mem_read_long;
+	p->mem_write_byte = unicorn_mem_write_byte;
+	p->mem_write_word = unicorn_mem_write_word;
+	p->mem_write_long = unicorn_mem_write_long;
+
+	// Address translation: Unicorn doesn't support direct host pointer access
+	// Mac2HostAddr/Host2MacAddr are only valid for UAE's memory space
+	// For Unicorn, these should NOT be used - all access must go through uc_mem_read/write
+	p->mem_mac_to_host = NULL;  // Not supported for Unicorn
+	p->mem_host_to_mac = NULL;  // Not supported for Unicorn
 }

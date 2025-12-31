@@ -302,6 +302,53 @@ void uae_mem_set_rom_ptr_with_addr(void *ptr, uint32_t addr, uint32_t size) {
     ROMBaseMac = addr;  /* Use provided ROM address */
 }
 
+/* Memory access (individual sizes, big-endian) */
+/*
+ * IMPORTANT: These functions call the LOW-LEVEL do_get_mem_* functions directly,
+ * NOT get_long/put_long, to avoid circular dependency when get_long/put_long
+ * redirect to the platform API.
+ *
+ * do_get_mem_* handles endianness conversion (little-endian storage → big-endian return)
+ */
+uint8_t uae_mem_read_byte(uint32_t addr) {
+    uae_u8 * const m = (uae_u8 *)do_get_real_address(addr);
+    return do_get_mem_byte(m);
+}
+
+uint16_t uae_mem_read_word(uint32_t addr) {
+    uae_u16 * const m = (uae_u16 *)do_get_real_address(addr);
+    return do_get_mem_word(m);
+}
+
+uint32_t uae_mem_read_long(uint32_t addr) {
+    uae_u32 * const m = (uae_u32 *)do_get_real_address(addr);
+    return do_get_mem_long(m);
+}
+
+void uae_mem_write_byte(uint32_t addr, uint8_t val) {
+    uae_u8 * const m = (uae_u8 *)do_get_real_address(addr);
+    do_put_mem_byte(m, val);
+}
+
+void uae_mem_write_word(uint32_t addr, uint16_t val) {
+    uae_u16 * const m = (uae_u16 *)do_get_real_address(addr);
+    do_put_mem_word(m, val);
+}
+
+void uae_mem_write_long(uint32_t addr, uint32_t val) {
+    uae_u32 * const m = (uae_u32 *)do_get_real_address(addr);
+    do_put_mem_long(m, val);
+}
+
+/* Address translation */
+uint8_t* uae_mem_mac_to_host(uint32_t addr) {
+    return do_get_real_address(addr);
+}
+
+uint32_t uae_mem_host_to_mac(uint8_t *ptr) {
+    return do_get_virtual_address(ptr);
+}
+
 /* Disassembly */
 void uae_disasm(uint32_t addr, uint32_t *next_pc, int count) {
     uaecptr npc;

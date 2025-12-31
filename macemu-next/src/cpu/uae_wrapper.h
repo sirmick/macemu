@@ -40,6 +40,18 @@ void uae_mem_set_rom_ptr_with_addr(void *ptr, uint32_t addr, uint32_t size);
 void uae_mem_write(uint32_t addr, const void *data, uint32_t size);
 void uae_mem_read(uint32_t addr, void *data, uint32_t size);
 
+/* Memory access (individual sizes, big-endian) */
+uint8_t  uae_mem_read_byte(uint32_t addr);
+uint16_t uae_mem_read_word(uint32_t addr);
+uint32_t uae_mem_read_long(uint32_t addr);
+void uae_mem_write_byte(uint32_t addr, uint8_t val);
+void uae_mem_write_word(uint32_t addr, uint16_t val);
+void uae_mem_write_long(uint32_t addr, uint32_t val);
+
+/* Address translation */
+uint8_t* uae_mem_mac_to_host(uint32_t addr);
+uint32_t uae_mem_host_to_mac(uint8_t *ptr);
+
 /* Register access - implementation matches our stubs */
 uint32_t uae_get_dreg(int reg);  /* D0-D7 */
 uint32_t uae_get_areg(int reg);  /* A0-A7 */
