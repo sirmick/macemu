@@ -27,6 +27,11 @@ extern struct regstruct {
 
 extern bool quit_program;
 
+// CPU Configuration
+static void uae_backend_set_type(int cpu_type, int fpu_type) {
+	uae_set_cpu_type(cpu_type, fpu_type);
+}
+
 // CPU Lifecycle
 static bool uae_backend_init(void) {
 	return uae_cpu_init();
@@ -120,6 +125,9 @@ static void uae_backend_trigger_interrupt(int level) {
 void cpu_uae_install(Platform *p) {
 	p->cpu_name = "UAE Interpreter";
 
+	// Configuration
+	p->cpu_set_type = uae_backend_set_type;
+
 	// Lifecycle
 	p->cpu_init = uae_backend_init;
 	p->cpu_reset = uae_backend_reset;
@@ -148,4 +156,14 @@ void cpu_uae_install(Platform *p) {
 
 	// Interrupts
 	p->cpu_trigger_interrupt = uae_backend_trigger_interrupt;
+
+	// Memory system (for ROM patching and initialization)
+	p->mem_read_byte = uae_mem_read_byte;
+	p->mem_read_word = uae_mem_read_word;
+	p->mem_read_long = uae_mem_read_long;
+	p->mem_write_byte = uae_mem_write_byte;
+	p->mem_write_word = uae_mem_write_word;
+	p->mem_write_long = uae_mem_write_long;
+	p->mem_mac_to_host = uae_mem_mac_to_host;
+	p->mem_host_to_mac = uae_mem_host_to_mac;
 }

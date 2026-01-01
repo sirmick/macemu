@@ -31,8 +31,23 @@ extern uint32_t ROMBaseMac;  // ROM base in Mac address space
 extern uint8_t *ROMBaseHost; // ROM base in host address space
 extern uint32_t ROMSize;     // ROM size
 extern void EmulOp(uint16_t opcode, struct M68kRegisters *r);
+extern int CPUType;          // CPU type from config (2=68020, 3=68030, 4=68040)
 
 static UnicornCPU *unicorn_cpu = NULL;
+int unicorn_cpu_type = 2;   // Default to 68020 (extern for DualCPU)
+int unicorn_fpu_type = 0;   // Default to no FPU (extern for DualCPU)
+
+// CPU Configuration
+static void unicorn_backend_set_type(int cpu_type, int fpu_type) {
+	unicorn_cpu_type = cpu_type;
+	unicorn_fpu_type = fpu_type;
+	fprintf(stderr, "[Unicorn] CPU type set to %d, FPU=%d\n", cpu_type, fpu_type);
+}
+
+// For DualCPU backend - simple wrapper function
+void unicorn_set_cpu_type(int cpu_type, int fpu_type) {
+	unicorn_backend_set_type(cpu_type, fpu_type);
+}
 
 // Platform EmulOp handler for Unicorn-only mode
 // This needs to use platform API because it's called from within Unicorn's hook context
@@ -76,9 +91,15 @@ static bool unicorn_backend_init(void) {
 		return true;  // Already initialized
 	}
 
-	// Create Unicorn CPU with 68030 model (matches UAE CPUType=3)
-	#define UC_CPU_M68K_M68030 3
-	unicorn_cpu = unicorn_create_with_model(UCPU_ARCH_M68K, UC_CPU_M68K_M68030);
+	// Create Unicorn CPU with model from cpu_set_type()
+	// Unicorn model values: 2=68020, 3=68030, 4=68040
+	int uc_model = unicorn_cpu_type;
+	if (uc_model < 2) uc_model = 2;  // Default to 68020
+	if (uc_model > 4) uc_model = 4;  // Max 68040
+
+	fprintf(stderr, "[Unicorn] Creating CPU with model %d (cpu_type=%d, fpu=%d)\n",
+		uc_model, unicorn_cpu_type, unicorn_fpu_type);
+	unicorn_cpu = unicorn_create_with_model(UCPU_ARCH_M68K, uc_model);
 	if (!unicorn_cpu) {
 		fprintf(stderr, "Failed to create Unicorn CPU\n");
 		return false;
@@ -374,6 +395,9 @@ static void unicorn_mem_write_byte(uint32_t addr, uint8_t value) {
  */
 void cpu_unicorn_install(Platform *p) {
 	p->cpu_name = "Unicorn Engine";
+
+	// Configuration
+	p->cpu_set_type = unicorn_backend_set_type;
 
 	// Lifecycle
 	p->cpu_init = unicorn_backend_init;

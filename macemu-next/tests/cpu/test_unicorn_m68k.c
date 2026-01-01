@@ -130,6 +130,14 @@ void test_memory_mapping() {
     printf("  [PASS]\n\n");
 }
 
+/* Stub implementations for platform functions (not used by this test) */
+#include "../../src/common/include/platform.h"
+Platform g_platform;
+
+void QuitEmulator() {}
+void ErrorAlert(const char *msg) { fprintf(stderr, "ERROR: %s\n", msg); }
+bool TwentyFourBitAddressing = false;
+
 int main(int argc, char **argv) {
     printf("\n");
     printf("===========================================\n");

@@ -46,6 +46,9 @@ UnicornCPU* unicorn_create(UnicornArch arch);
 UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model); /* M68K: UC_CPU_M68K_M68040, etc. */
 void unicorn_destroy(UnicornCPU *cpu);
 
+/* Configuration (for DualCPU backend - stores CPU type for later use) */
+void unicorn_set_cpu_type(int cpu_type, int fpu_type);
+
 /* Memory mapping */
 bool unicorn_map_ram(UnicornCPU *cpu, uint64_t addr, void *host_ptr, uint64_t size);
 bool unicorn_map_rom(UnicornCPU *cpu, uint64_t addr, const void *host_ptr, uint64_t size);

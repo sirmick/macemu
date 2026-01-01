@@ -208,9 +208,43 @@ bool unicorn_validation_init(void) {
     validation_state.trace_buffer_full = false;
     printf("✓ Instruction trace buffer allocated (last %u instructions)\n", validation_state.trace_buffer_size);
 
-    // NOTE: Don't sync CPU state here - UAE CPU isn't initialized yet (PC is NULL)
-    // State will be synced on first instruction execution in unicorn_validation_step()
-    printf("✓ Unicorn initialized (state sync deferred until first instruction)\n");
+    // Explicitly initialize both CPUs to identical Macintosh boot state
+    // This replaces the old approach of syncing UAE→Unicorn on first instruction
+    printf("✓ Setting explicit Macintosh boot state on both CPUs...\n");
+
+    uint32_t initial_pc = ROMBaseMac + 0x2a;  // Macintosh ROM entry point
+    uint32_t initial_a7 = 0x2000;             // Initial stack pointer
+    uint16_t initial_sr = 0x2700;             // Supervisor mode, interrupts masked
+
+    // Set UAE to Macintosh boot state
+    uae_set_pc(initial_pc);
+    uae_set_sr(initial_sr);
+    for (int i = 0; i < 8; i++) {
+        uae_set_dreg(i, 0);
+        uae_set_areg(i, 0);
+    }
+    uae_set_areg(7, initial_a7);  // Set A7 after loop
+
+    // Set Unicorn to identical Macintosh boot state
+    unicorn_set_pc(validation_state.unicorn, initial_pc);
+    unicorn_set_sr(validation_state.unicorn, initial_sr);
+    for (int i = 0; i < 8; i++) {
+        unicorn_set_dreg(validation_state.unicorn, i, 0);
+        unicorn_set_areg(validation_state.unicorn, i, 0);
+    }
+    unicorn_set_areg(validation_state.unicorn, 7, initial_a7);  // Set A7 after loop
+
+    // Control registers
+    unicorn_set_cacr(validation_state.unicorn, 0);
+    unicorn_set_vbr(validation_state.unicorn, 0);
+
+    printf("  UAE:     PC=0x%08X A7=0x%08X SR=0x%04X\n",
+           uae_get_pc(), uae_get_areg(7), uae_get_sr());
+    printf("  Unicorn: PC=0x%08X A7=0x%08X SR=0x%04X\n",
+           unicorn_get_pc(validation_state.unicorn),
+           unicorn_get_areg(validation_state.unicorn, 7),
+           unicorn_get_sr(validation_state.unicorn));
+    printf("✓ Both CPUs initialized to identical state\n");
 
     // NOTE: EmulOp/trap handlers are now registered by cpu_dualcpu_install() via platform API
     // However, we still need to install the code hook on Unicorn so it can intercept
@@ -540,23 +574,8 @@ bool unicorn_validation_step(void) {
         return true;  // Validation disabled, no divergence
     }
 
-    // Sync state on first instruction (UAE CPU is initialized after reset)
-    if (validation_state.instruction_count == 0) {
-        // IMPORTANT: Set PC and SR first, THEN registers
-        // Setting PC clears A7 in Unicorn (bug or feature?), so A7 must be set after PC
-        unicorn_set_pc(validation_state.unicorn, uae_get_pc());
-        unicorn_set_sr(validation_state.unicorn, uae_get_sr());
-
-        for (int i = 0; i < 8; i++) {
-            unicorn_set_dreg(validation_state.unicorn, i, uae_get_dreg(i));
-            unicorn_set_areg(validation_state.unicorn, i, uae_get_areg(i));
-        }
-
-        // Sync control registers (CACR, VBR, etc.)
-        unicorn_set_cacr(validation_state.unicorn, uae_get_cacr());
-        unicorn_set_vbr(validation_state.unicorn, uae_get_vbr());
-    }
-
+    // Both CPUs are now explicitly initialized to identical state in unicorn_validation_init()
+    // No sync needed here - validation starts from instruction #1
     validation_state.instruction_count++;
 
     // Get current PC and opcode

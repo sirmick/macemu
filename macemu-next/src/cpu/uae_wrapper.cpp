@@ -249,6 +249,8 @@ void uae_cpu_execute_one(void) {
         uae_u32 pc_before = m68k_getpc();
         // Read raw opcode bytes (big-endian) for trace display
         uae_u16 opcode_raw = get_iword(0);
+        // Materialize lazy condition codes before reading SR
+        MakeSR();
         cpu_trace_log_detailed(
             "UAE",
             pc_before,

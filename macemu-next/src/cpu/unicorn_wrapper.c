@@ -1,5 +1,27 @@
 /**
  * Unicorn Engine Wrapper Implementation
+ *
+ * ============================================================================
+ * CRITICAL ENDIANNESS NOTES:
+ * ============================================================================
+ * UAE and Unicorn have different memory storage formats:
+ *
+ * UAE (68k emulator):
+ *   - RAM: Stored in LITTLE-ENDIAN (x86 native) in RAMBaseHost
+ *   - ROM: Stored in BIG-ENDIAN (as loaded from file) in ROMBaseHost
+ *   - get_long/put_long: Byte-swap on-the-fly when accessing memory
+ *
+ * Unicorn (M68K mode):
+ *   - RAM: Expected in BIG-ENDIAN (M68K native)
+ *   - ROM: Expected in BIG-ENDIAN (M68K native)
+ *   - No automatic byte-swapping
+ *
+ * When copying memory to Unicorn:
+ *   - RAM: MUST byte-swap (LE -> BE) or Unicorn reads garbage
+ *   - ROM: NO byte-swap (already BE) or instructions get corrupted
+ *
+ * See unicorn_map_ram() and unicorn_map_rom_writable() for implementation.
+ * ============================================================================
  */
 
 #include "unicorn_wrapper.h"
@@ -368,9 +390,38 @@ bool unicorn_map_ram(UnicornCPU *cpu, uint64_t addr, void *host_ptr, uint64_t si
         return false;
     }
 
-    /* Then write the host data into it (if host_ptr is not NULL) */
+    /* ============================================================================
+     * CRITICAL: Byte-swapping for RAM
+     * ============================================================================
+     * ENDIANNESS WARNING:
+     * - UAE stores RAM in LITTLE-ENDIAN format (x86 native byte order)
+     * - UAE's memory accessors (get_long/put_long) byte-swap on-the-fly
+     * - Unicorn (M68K mode) expects RAM in BIG-ENDIAN format (M68K native)
+     * - We MUST byte-swap RAM when copying from UAE's RAMBaseHost to Unicorn
+     * - Without this, Unicorn reads garbage values and diverges immediately
+     * ============================================================================
+     */
     if (host_ptr) {
-        err = uc_mem_write(cpu->uc, addr, host_ptr, size);
+        // Allocate temporary buffer for byte-swapped RAM
+        uint8_t *swapped_ram = (uint8_t *)malloc(size);
+        if (!swapped_ram) {
+            fprintf(stderr, "Failed to allocate RAM swap buffer\n");
+            return false;
+        }
+
+        // Byte-swap from little-endian to big-endian (swap 32-bit values)
+        const uint32_t *src32 = (const uint32_t *)host_ptr;
+        uint32_t *dst32 = (uint32_t *)swapped_ram;
+        for (uint64_t i = 0; i < size / 4; i++) {
+            uint32_t val = src32[i];
+            // Convert: 0xAABBCCDD (LE in memory) -> 0xDDCCBBAA (BE in memory)
+            dst32[i] = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) |
+                       ((val & 0xFF0000) >> 8) | ((val >> 24) & 0xFF);
+        }
+
+        err = uc_mem_write(cpu->uc, addr, swapped_ram, size);
+        free(swapped_ram);
+
         if (err != UC_ERR_OK) {
             set_error(cpu, err);
             return false;
@@ -410,7 +461,19 @@ bool unicorn_map_rom_writable(UnicornCPU *cpu, uint64_t addr, const void *host_p
         return false;
     }
 
-    /* Write ROM data */
+    /* ============================================================================
+     * CRITICAL: NO byte-swapping for ROM!
+     * ============================================================================
+     * ENDIANNESS WARNING:
+     * - ROM is kept in BIG-ENDIAN format (as loaded from ROM file)
+     * - ROM is NOT stored in little-endian like RAM
+     * - UAE's memory accessors still byte-swap when reading ROM, but the
+     *   underlying storage in ROMBaseHost is already big-endian
+     * - Unicorn (M68K mode) expects ROM in BIG-ENDIAN format
+     * - Therefore, copy ROM directly WITHOUT byte-swapping
+     * - DO NOT byte-swap ROM or instructions will be corrupted!
+     * ============================================================================
+     */
     if (host_ptr) {
         err = uc_mem_write(cpu->uc, addr, host_ptr, size);
         if (err != UC_ERR_OK) {

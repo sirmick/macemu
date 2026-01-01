@@ -62,7 +62,7 @@ void cpu_trace_log_simple(uint32_t pc, uint16_t opcode,
                           uint32_t d0, uint32_t d1,
                           uint32_t a0, uint32_t a7,
                           uint16_t sr) {
-	fprintf(stderr, "[%04lu] PC=%08X OP=%04X | D0=%08X D1=%08X A0=%08X A7=%08X SR=%04X\n",
+	fprintf(stdout, "[%04lu] PC=%08X OP=%04X | D0=%08X D1=%08X A0=%08X A7=%08X SR=%04X\n",
 	        g_trace.current_count, pc, opcode, d0, d1, a0, a7, sr);
 }
 
@@ -72,7 +72,7 @@ void cpu_trace_log(uint32_t pc, uint16_t opcode,
                    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                    uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7,
                    uint16_t sr) {
-	fprintf(stderr, "[%04lu] PC=%08X OP=%04X | "
+	fprintf(stdout, "[%04lu] PC=%08X OP=%04X | "
 	        "D0=%08X D1=%08X D2=%08X D3=%08X D4=%08X D5=%08X D6=%08X D7=%08X | "
 	        "A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X A6=%08X A7=%08X | "
 	        "SR=%04X\n",
@@ -97,7 +97,7 @@ void cpu_trace_log_detailed(const char *cpu_name, uint32_t pc, uint16_t opcode,
 	uint8_t c = (ccr >> 0) & 1;
 
 	/* Format: [count] PC OP | Dregs | Aregs | SR [flags] */
-	fprintf(stderr, "[%05lu] %08X %04X | "
+	fprintf(stdout, "[%05lu] %08X %04X | "
 	        "%08X %08X %08X %08X %08X %08X %08X %08X | "
 	        "%08X %08X %08X %08X %08X %08X %08X %08X | "
 	        "%04X %d%d%d%d%d\n",
@@ -105,6 +105,7 @@ void cpu_trace_log_detailed(const char *cpu_name, uint32_t pc, uint16_t opcode,
 	        d0, d1, d2, d3, d4, d5, d6, d7,
 	        a0, a1, a2, a3, a4, a5, a6, a7,
 	        sr, x, n, z, v, c);
+	fflush(stdout);
 }
 
 void cpu_trace_log_mem_read(uint32_t addr, uint32_t value, int size) {
@@ -113,7 +114,8 @@ void cpu_trace_log_mem_read(uint32_t addr, uint32_t value, int size) {
 
 	/* Format: "  MEM[addr] = value (size)" on same line as instruction */
 	const char *size_str = (size == 1) ? "B" : (size == 2) ? "W" : "L";
-	fprintf(stderr, "  MEM[%08X]=%08X (%s)\n", addr, value, size_str);
+	fprintf(stdout, "  MEM[%08X]=%08X (%s)\n", addr, value, size_str);
+	fflush(stdout);
 }
 
 bool cpu_trace_memory_enabled(void) {

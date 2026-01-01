@@ -39,6 +39,14 @@ extern struct regstruct {
 
 extern bool quit_program;
 
+// CPU Configuration
+static void dualcpu_backend_set_type(int cpu_type, int fpu_type) {
+	// Set CPU type for both UAE and Unicorn
+	uae_set_cpu_type(cpu_type, fpu_type);
+	unicorn_set_cpu_type(cpu_type, fpu_type);
+	fprintf(stderr, "[DualCPU] CPU type set to %d, FPU=%d (for both UAE and Unicorn)\n", cpu_type, fpu_type);
+}
+
 // CPU Lifecycle
 static bool dualcpu_backend_init(void) {
 	// Initialize UAE
@@ -58,8 +66,10 @@ static bool dualcpu_backend_init(void) {
 }
 
 static void dualcpu_backend_reset(void) {
-	uae_cpu_reset();
-	// Unicorn state will be synced in validation module
+	// Explicit initialization for both CPUs to Macintosh boot state
+	// This is done by the validation module, which initializes both CPUs identically
+	// Don't call uae_cpu_reset() here - that would overwrite the explicit state
+	// The validation module handles initialization in unicorn_validation_init()
 }
 
 static void dualcpu_backend_destroy(void) {
@@ -152,6 +162,9 @@ static void dualcpu_backend_trigger_interrupt(int level) {
  */
 void cpu_dualcpu_install(Platform *p) {
 	p->cpu_name = "DualCPU (UAE + Unicorn Validation)";
+
+	// Configuration
+	p->cpu_set_type = dualcpu_backend_set_type;
 
 	// Lifecycle
 	p->cpu_init = dualcpu_backend_init;

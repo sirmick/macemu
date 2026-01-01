@@ -302,15 +302,79 @@ int main(int argc, char **argv)
 	XPRAM[0x58] = uint8(main_monitor.depth_to_apple_mode(main_monitor.get_current_mode().depth));
 	XPRAM[0x59] = 0;
 
+	// ============================================================
+	// Select CPU Backend (before initialization)
+	// ============================================================
+	// CURRENT ARCHITECTURE (as of 2025):
+	//   - All backends (UAE/Unicorn/DualCPU) use Init680x0()
+	//   - Init680x0() sets up UAE's memory banking system
+	//   - PatchROM() uses UAE's WriteMacInt*() to patch ROM
+	//   - Unicorn copies the patched ROM in unicorn_backend_init()
+	//
+	// FUTURE ARCHITECTURE (goal for Unicorn-only):
+	//   - Remove Init680x0() call for Unicorn backend
+	//   - Use direct memory access (see memory_access.h)
+	//   - PatchROM() uses DirectWriteMacInt*() instead of UAE functions
+	//   - Completely eliminate UAE dependency for Unicorn-only builds
+	//
+	// To achieve this:
+	//   1. Make Init680x0() conditional (only for UAE backend)
+	//   2. Switch PatchROM() to use backend-independent memory functions
+	//   3. Move RAM/ROM variable definitions out of basilisk_glue.cpp
+	//   4. Create unicorn-specific build configuration
+	// ============================================================
+
+	// Select CPU backend via environment variable
+	const char *cpu_backend = getenv("CPU_BACKEND");
+	if (!cpu_backend) {
+		cpu_backend = "uae";  // Default
+	}
+
+	printf("\n=== Selected CPU Backend: %s ===\n", cpu_backend);
+
 #if EMULATED_68K
-	// Init 680x0 emulation (this also activates the memory system which is needed for PatchROM())
+	// Init 680x0 emulation (UAE's memory banking system)
+	// NOTE: Required for all backends currently, but Unicorn will use direct access in future
 	if (!Init680x0()) {
 		fprintf(stderr, "CPU initialization failed\n");
 		return 1;
 	}
 #endif
 
-	// Install ROM patches (skip for test ROMs)
+	// ============================================================
+	// Install CPU Backend (BEFORE PatchROM)
+	// ============================================================
+	// We install the backend early so that PatchROM() can use g_platform.mem_*
+	// functions for backend-independent memory access
+	// ============================================================
+
+	if (strcmp(cpu_backend, "unicorn") == 0) {
+		cpu_unicorn_install(&g_platform);
+	} else if (strcmp(cpu_backend, "dualcpu") == 0) {
+		cpu_dualcpu_install(&g_platform);
+	} else {
+		cpu_uae_install(&g_platform);  // Default to UAE
+	}
+
+	printf("CPU Backend: %s\n", g_platform.cpu_name);
+
+	// Configure CPU type (must be called after backend install, before cpu_init)
+	if (g_platform.cpu_set_type) {
+		g_platform.cpu_set_type(CPUType, FPUType);
+	}
+
+	// ============================================================
+	// Install ROM Patches
+	// ============================================================
+	// NOTE: PatchROM() currently still uses UAE's WriteMacInt*() functions directly.
+	// The Platform API provides g_platform.mem_write_*() functions for backend-
+	// independent memory access, but PatchROM() hasn't been converted yet.
+	//
+	// Future: Convert PatchROM() to use g_platform.mem_* functions to enable
+	// Unicorn-only builds without UAE dependency.
+	//
+	// Patches include runtime addresses and may differ between runs due to ASLR.
+	// ============================================================
 	if (!is_test_rom) {
 		if (!PatchROM()) {
 			ErrorAlert(STR_UNSUPPORTED_ROM_TYPE_ERR);
@@ -336,27 +400,12 @@ int main(int argc, char **argv)
 	printf("24-bit addressing: %s\n", TwentyFourBitAddressing ? "Yes" : "No");
 
 	// ============================================================
-	// Start Execution (Platform CPU API)
+	// Initialize CPU Backend
 	// ============================================================
 	printf("\n=== Starting Emulation ===\n");
 
-	// Select CPU backend via environment variable
-	const char *cpu_backend = getenv("CPU_BACKEND");
-	if (!cpu_backend) {
-		cpu_backend = "uae";  // Default
-	}
-
-	if (strcmp(cpu_backend, "unicorn") == 0) {
-		cpu_unicorn_install(&g_platform);
-	} else if (strcmp(cpu_backend, "dualcpu") == 0) {
-		cpu_dualcpu_install(&g_platform);
-	} else {
-		cpu_uae_install(&g_platform);  // Default to UAE
-	}
-
-	printf("CPU Backend: %s\n", g_platform.cpu_name);
-
-	// Initialize CPU
+	// Backend was already installed before PatchROM() to provide memory access functions
+	// Now we call cpu_init() to complete backend initialization
 	if (!g_platform.cpu_init()) {
 		fprintf(stderr, "Failed to initialize CPU\n");
 		return 1;

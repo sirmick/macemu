@@ -42,6 +42,7 @@ extern "C" {
 
 	extern struct regstruct regs;
 	extern bool quit_program;
+	extern uint32_t ROMBaseMac;  // For explicit reset initialization
 }
 
 /*
@@ -53,7 +54,15 @@ static bool uae_backend_init(void) {
 }
 
 static void uae_backend_reset(void) {
-	uae_cpu_reset();
+	// Explicit Macintosh boot state initialization (matches Unicorn and DualCPU)
+	// Don't use m68k_reset() - it reads from ROM which might not be loaded yet
+	uae_set_pc(ROMBaseMac + 0x2a);   // ROM entry point
+	uae_set_sr(0x2700);               // Supervisor, interrupt mask 7
+	for (int i = 0; i < 8; i++) {
+		uae_set_dreg(i, 0);
+		uae_set_areg(i, 0);
+	}
+	uae_set_areg(7, 0x2000);         // Initial stack pointer
 }
 
 static void uae_backend_destroy(void) {

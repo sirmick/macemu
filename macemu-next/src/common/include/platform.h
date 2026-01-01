@@ -126,6 +126,9 @@ typedef struct {
     void (*cpu_reset)(void);
     void (*cpu_destroy)(void);
 
+    // Configuration (must be called before cpu_init)
+    void (*cpu_set_type)(int cpu_type, int fpu_type);  // cpu_type: 2=68020, 3=68030, 4=68040
+
     // Execution - returns: 0=ok, 1=stopped, 2=breakpoint, 3=exception, 4=emulop, 5=divergence
     int (*cpu_execute_one)(void);
     void (*cpu_execute_fast)(void);  // Optional: run until stopped (NULL if not supported)
@@ -149,6 +152,28 @@ typedef struct {
 
     // Interrupts
     void (*cpu_trigger_interrupt)(int level);
+
+    /*
+     *  Memory System API (backend-independent)
+     *
+     *  These functions provide memory access for initialization and ROM patching.
+     *  Different backends implement these differently:
+     *    - UAE: Uses memory banking system (get_long/put_long with byte-swapping)
+     *    - Unicorn: Direct memory access to ROMBaseHost/RAMBaseHost
+     *    - DualCPU: Uses UAE's implementation
+     *
+     *  All functions read/write in big-endian (M68K native) format.
+     */
+    uint8_t (*mem_read_byte)(uint32_t addr);
+    uint16_t (*mem_read_word)(uint32_t addr);
+    uint32_t (*mem_read_long)(uint32_t addr);
+    void (*mem_write_byte)(uint32_t addr, uint8_t val);
+    void (*mem_write_word)(uint32_t addr, uint16_t val);
+    void (*mem_write_long)(uint32_t addr, uint32_t val);
+
+    // Address translation (Mac address <-> Host pointer)
+    uint8_t* (*mem_mac_to_host)(uint32_t addr);
+    uint32_t (*mem_host_to_mac)(uint8_t *ptr);
 
     /*
      *  CPU Special Instruction Handlers
