@@ -34,6 +34,7 @@ extern void EmulOp(uint16_t opcode, struct M68kRegisters *r);
 extern int CPUType;          // CPU type from config (2=68020, 3=68030, 4=68040)
 
 static UnicornCPU *unicorn_cpu = NULL;
+static uint8_t *unicorn_dummy_buffer = NULL;  // Dummy region for UAE out-of-bounds compatibility
 int unicorn_cpu_type = 2;   // Default to 68020 (extern for DualCPU)
 int unicorn_fpu_type = 0;   // Default to no FPU (extern for DualCPU)
 
@@ -125,6 +126,37 @@ static bool unicorn_backend_init(void) {
 		return false;
 	}
 
+	// Map dummy region after ROM to handle UAE's out-of-bounds reads
+	// UAE has a bug where it reads past ROM end without bounds checking
+	// We need to provide the same memory layout that UAE sees for compatibility
+	uint32_t dummy_region_base = ROMBaseMac + ROMSize;
+	uint32_t dummy_region_size = 16 * 1024 * 1024;  // 16 MB
+	unicorn_dummy_buffer = (uint8_t *)malloc(dummy_region_size);
+	if (!unicorn_dummy_buffer) {
+		fprintf(stderr, "Failed to allocate dummy region buffer\n");
+		unicorn_destroy(unicorn_cpu);
+		unicorn_cpu = NULL;
+		return false;
+	}
+	// Fill with 0xFF00FF00 pattern (same as UAE reads from uninitialized memory)
+	// Write in big-endian format for M68K
+	for (uint32_t i = 0; i < dummy_region_size; i += 4) {
+		unicorn_dummy_buffer[i + 0] = 0xFF;  // MSB
+		unicorn_dummy_buffer[i + 1] = 0x00;
+		unicorn_dummy_buffer[i + 2] = 0xFF;
+		unicorn_dummy_buffer[i + 3] = 0x00;  // LSB
+	}
+	if (!unicorn_map_ram(unicorn_cpu, dummy_region_base, unicorn_dummy_buffer, dummy_region_size)) {
+		fprintf(stderr, "Failed to map dummy region to Unicorn\n");
+		free(unicorn_dummy_buffer);
+		unicorn_dummy_buffer = NULL;
+		unicorn_destroy(unicorn_cpu);
+		unicorn_cpu = NULL;
+		return false;
+	}
+	fprintf(stderr, "[DEBUG] Dummy region mapped: 0x%08X - 0x%08X (%u MB) with 0xFF00FF00 pattern\n",
+		dummy_region_base, dummy_region_base + dummy_region_size, dummy_region_size / (1024*1024));
+
 	fprintf(stderr, "[DEBUG] unicorn_cpu instance at init: %p\n", (void*)unicorn_cpu);
 
 	// Initialize CPU tracing from environment variable
@@ -163,6 +195,10 @@ static void unicorn_backend_destroy(void) {
 	if (unicorn_cpu) {
 		unicorn_destroy(unicorn_cpu);
 		unicorn_cpu = NULL;
+	}
+	if (unicorn_dummy_buffer) {
+		free(unicorn_dummy_buffer);
+		unicorn_dummy_buffer = NULL;
 	}
 }
 
