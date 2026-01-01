@@ -1040,7 +1040,11 @@ static bool patch_rom_32(void)
 	// Set hardware base addresses to scratch memory area
 	if (PatchHWBases) {
 		extern uint8 *ScratchMem;
-		const uint32 ScratchMemBase = Host2MacAddr(ScratchMem);
+		// Don't patch if ScratchMem is not initialized - Host2MacAddr(NULL) produces non-deterministic values
+		if (ScratchMem == NULL) {
+			printf("[WARNING] PatchHWBases requested but ScratchMem is NULL, skipping hardware base patching\n");
+		} else {
+			const uint32 ScratchMemBase = Host2MacAddr(ScratchMem);
 		
 		D(bug("LMGlob\tOfs/4\tBase\n"));
 		base = ROMBaseMac + UniversalInfo + ReadMacInt32(ROMBaseMac + UniversalInfo); // decoderInfoPtr
@@ -1049,11 +1053,12 @@ static bool patch_rom_32(void)
 			int16 ofs = ntohs(*wp++);			// offset in decoderInfo (/4)
 			int16 lmg = ntohs(*wp++);			// address of LowMem global
 			D(bug("0x%04x\t%d\t0x%08x\n", lmg, ofs, ReadMacInt32(base + ofs*4)));
-			
+
 			// Fake address only if this is not the ASC base
 			if (lmg != 0xcc0)
 				WriteMacInt32(base + ofs*4, ScratchMemBase);
 		}
+		} // end else (ScratchMem != NULL)
 	}
 #else
 #error System specific handling for writable ROM is required here
