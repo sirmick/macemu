@@ -11,6 +11,7 @@
 #include "cpu_trace.h"
 #include "memory_access.h"  // For direct memory access (UAE-independent)
 #include <unicorn/unicorn.h>
+#include <unicorn/m68k.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -111,12 +112,26 @@ static bool unicorn_backend_init(void) {
 	}
 
 	// Create Unicorn CPU with model from cpu_set_type()
-	// Unicorn model values: 2=68020, 3=68030, 4=68040
-	int uc_model = unicorn_cpu_type;
-	if (uc_model < 2) uc_model = 2;  // Default to 68020
-	if (uc_model > 4) uc_model = 4;  // Max 68040
+	// Follow same logic as UAE's cpu_level calculation:
+	// - If cpu_type==4: use 68040 (with FPU)
+	// - Else if fpu_type: use 68030 (68020 with FPU)
+	// - Else if cpu_type>=2: use 68020
+	// - Else: use 68000
+	// NOTE: Unicorn's CPU table uses array indices, not UC_CPU_M68K enum values!
+	// Array order: 0=m68000, 1=m68020, 2=m68030, 3=m68040, 4=m68060...
+	int uc_model;
+	if (unicorn_cpu_type == 4) {
+		uc_model = 3;  // 68040 (array index)
+	} else {
+		if (unicorn_fpu_type)
+			uc_model = 2;  // 68030 (array index)
+		else if (unicorn_cpu_type >= 2)
+			uc_model = 1;  // 68020 (array index)
+		else
+			uc_model = 0;  // 68000 (array index)
+	}
 
-	fprintf(stderr, "[Unicorn] Creating CPU with model %d (cpu_type=%d, fpu=%d)\n",
+	fprintf(stderr, "[Unicorn] Creating CPU with model %d (array index, cpu_type=%d, fpu=%d) - matches UAE cpu_level\n",
 		uc_model, unicorn_cpu_type, unicorn_fpu_type);
 	unicorn_cpu = unicorn_create_with_model(UCPU_ARCH_M68K, uc_model);
 	if (!unicorn_cpu) {
