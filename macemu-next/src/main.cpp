@@ -473,9 +473,9 @@ int main(int argc, char **argv)
 				continue;
 
 			case 3:  // CPU_EXEC_EXCEPTION
-				fprintf(stderr, "\n=== Unhandled Exception ===\n");
-				fprintf(stderr, "Instructions executed: %lu\n", instruction_count);
-				fprintf(stderr, "PC = 0x%08x\n", g_platform.cpu_get_pc());
+				printf("\n=== Unhandled Exception ===\n");
+				printf("Instructions executed: %lu\n", instruction_count);
+				printf("PC = 0x%08x\n", g_platform.cpu_get_pc());
 				goto exit_loop;
 
 			case 2:  // CPU_EXEC_BREAKPOINT

@@ -86,6 +86,24 @@ static bool unicorn_platform_emulop_handler(uint16_t opcode, bool is_primary) {
 	return false;
 }
 
+// Platform trap handler for Unicorn-only mode
+// Handles A-line and F-line traps by simulating M68K exceptions
+static bool unicorn_platform_trap_handler(int vector, uint16_t opcode, bool is_primary) {
+	(void)is_primary; // Unicorn is always primary in standalone mode
+
+	fprintf(stderr, "[DEBUG] Trap handler called: vector=%d, opcode=0x%04X, PC=0x%08X\n",
+	        vector, opcode, unicorn_get_pc(unicorn_cpu));
+
+	// Use Unicorn's exception simulation (defined in unicorn_exception.c)
+	extern void unicorn_simulate_exception(UnicornCPU *cpu, int vector_nr, uint16_t opcode);
+	unicorn_simulate_exception(unicorn_cpu, vector, opcode);
+
+	fprintf(stderr, "[DEBUG] After trap: new PC=0x%08X\n", unicorn_get_pc(unicorn_cpu));
+
+	// Return true to indicate we handled PC advancement
+	return true;
+}
+
 // CPU Lifecycle
 static bool unicorn_backend_init(void) {
 	if (unicorn_cpu) {
@@ -167,6 +185,9 @@ static bool unicorn_backend_init(void) {
 	// No hooks needed - this is faster and compatible with JIT
 	g_platform.emulop_handler = unicorn_platform_emulop_handler;
 
+	// Register trap handler for A-line/F-line traps
+	g_platform.trap_handler = unicorn_platform_trap_handler;
+
 	// Register exception handler for A-line/F-line traps (also handled via UC_ERR_INSN_INVALID)
 	unicorn_set_exception_handler(unicorn_cpu, unicorn_simulate_exception);
 
@@ -189,6 +210,17 @@ static void unicorn_backend_reset(void) {
 
 	// Set A7 (SSP) after PC to avoid it being cleared
 	unicorn_set_areg(unicorn_cpu, 7, 0x2000);
+
+	// Initialize control registers (68040)
+	uc_engine *uc = (uc_engine *)unicorn_get_uc(unicorn_cpu);
+	uint32_t zero = 0;
+	uc_reg_write(uc, UC_M68K_REG_CR_VBR, &zero);   // Vector Base Register = 0
+	uc_reg_write(uc, UC_M68K_REG_CR_CACR, &zero);  // Cache Control Register = 0
+
+	// Verify VBR was actually set to 0
+	uint32_t vbr_readback = 0;
+	uc_reg_read(uc, UC_M68K_REG_CR_VBR, &vbr_readback);
+	fprintf(stderr, "[Unicorn] Reset: VBR=0 (readback=0x%08X), CACR=0\n", vbr_readback);
 }
 
 static void unicorn_backend_destroy(void) {

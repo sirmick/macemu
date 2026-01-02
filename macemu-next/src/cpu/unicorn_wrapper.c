@@ -158,6 +158,18 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) 
         return;  // Not an EmulOp or trap, continue normally
     }
 
+    /* DEBUG: Check trap vector when A-trap is about to execute */
+    if (opcode_high == 0xA && pc == 0x02000780) {
+        uint8_t vec_bytes[4];
+        uc_mem_read(uc, 0x28, vec_bytes, 4);
+        fprintf(stderr, "[DEBUG] Before A-trap 0x%04X at PC=0x%08X:\n", opcode, pc);
+        fprintf(stderr, "        RAM[0x28] = %02X %02X %02X %02X\n",
+               vec_bytes[0], vec_bytes[1], vec_bytes[2], vec_bytes[3]);
+        uint32_t vec_value = (vec_bytes[0] << 0) | (vec_bytes[1] << 8) |
+                            (vec_bytes[2] << 16) | (vec_bytes[3] << 24);
+        fprintf(stderr, "        As LE uint32: 0x%08X\n", vec_value);
+    }
+
     /* Check platform handlers first (g_platform declared in platform.h) */
 
     /* Check if EmulOp (0x71xx for M68K) */
@@ -210,12 +222,17 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) 
 
     /* Check for A-line trap (0xAxxx) */
     if ((opcode & 0xF000) == 0xA000) {
+        fprintf(stderr, "[DEBUG] A-trap detected: 0x%04X at PC=0x%08X, g_platform.trap_handler=%p\n",
+               opcode, pc, (void*)g_platform.trap_handler);
         if (g_platform.trap_handler) {
+            fprintf(stderr, "[DEBUG] Calling platform trap handler\n");
             /* Platform handler - pass is_primary=false for Unicorn */
             g_platform.trap_handler(0xA, opcode, false);
             /* Handler handles PC advancement for traps */
             uc_emu_stop(uc);
             return;
+        } else {
+            fprintf(stderr, "[DEBUG] No platform trap handler - letting Unicorn handle it\n");
         }
         /* Fallback to per-CPU handler */
         if (cpu->exception_handler) {
