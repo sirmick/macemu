@@ -194,8 +194,107 @@ def format_trace_with_disasm(entry, disasm):
     return f"[{entry.inst_num:05d}] {entry.pc:08X} {entry.opcode} | {inst_str} | D: {d_regs_str} | A: {a_regs_str} | SR: {entry.sr}"
 
 
+def compare_traces_sequential(trace1, trace2, disassembler, max_diff=50, context=3):
+    """Compare two traces sequentially to find first divergence point"""
+
+    print(f"\nSequential trace comparison:")
+    print(f"Trace 1: {len(trace1)} instructions")
+    print(f"Trace 2: {len(trace2)} instructions")
+    print("=" * 120)
+
+    # Compare instruction by instruction
+    min_len = min(len(trace1), len(trace2))
+    diff_count = 0
+    first_pc_diff = None
+    first_reg_diff = None
+
+    for i in range(min_len):
+        e1 = trace1[i]
+        e2 = trace2[i]
+
+        # Check if PCs differ
+        pc_differs = (e1.pc != e2.pc)
+
+        # Check if register state differs
+        reg_differs = (e1.d_regs != e2.d_regs or e1.a_regs != e2.a_regs or e1.sr != e2.sr)
+
+        if pc_differs or reg_differs:
+            diff_count += 1
+
+            # Record first divergence
+            if first_pc_diff is None and pc_differs:
+                first_pc_diff = i
+            if first_reg_diff is None and reg_differs:
+                first_reg_diff = i
+
+            if diff_count <= max_diff:
+                print(f"\n{diff_count}. DIVERGENCE at instruction #{i}:")
+
+                if pc_differs:
+                    disasm1 = disassembler.get_instruction(e1.pc, e1.opcode)
+                    disasm2 = disassembler.get_instruction(e2.pc, e2.opcode)
+                    print(f"   PC DIFFERS!")
+                    print(f"   Trace1: {format_trace_with_disasm(e1, disasm1)}")
+                    print(f"   Trace2: {format_trace_with_disasm(e2, disasm2)}")
+                else:
+                    disasm = disassembler.get_instruction(e1.pc, e1.opcode)
+                    print(f"   REGISTER STATE DIFFERS at PC={e1.pc:08X}: {disasm}")
+                    print(f"   Trace1: {format_trace_with_disasm(e1, disasm)}")
+                    print(f"   Trace2: {format_trace_with_disasm(e2, disasm)}")
+
+                    # Show which registers differ
+                    if e1.d_regs != e2.d_regs:
+                        for j in range(min(len(e1.d_regs), len(e2.d_regs))):
+                            if e1.d_regs[j] != e2.d_regs[j]:
+                                print(f"      D{j}: {e1.d_regs[j]} vs {e2.d_regs[j]}")
+
+                    if e1.a_regs != e2.a_regs:
+                        for j in range(min(len(e1.a_regs), len(e2.a_regs))):
+                            if e1.a_regs[j] != e2.a_regs[j]:
+                                print(f"      A{j}: {e1.a_regs[j]} vs {e2.a_regs[j]}")
+
+                    if e1.sr != e2.sr:
+                        print(f"      SR: {e1.sr} vs {e2.sr}")
+
+    if diff_count > max_diff:
+        print(f"\n... and {diff_count - max_diff} more differences (use --max-diff to show more)")
+
+    print(f"\n{'=' * 120}")
+    print(f"Total divergences: {diff_count}")
+
+    if first_pc_diff is not None:
+        print(f"First PC divergence at instruction #{first_pc_diff}")
+
+    if first_reg_diff is not None:
+        print(f"First register divergence at instruction #{first_reg_diff}")
+
+    # Show context around first divergence
+    if first_pc_diff is not None or first_reg_diff is not None:
+        first_diff = first_pc_diff if first_pc_diff is not None else first_reg_diff
+        print(f"\nContext around first divergence (instruction #{first_diff}):")
+        print("=" * 120)
+
+        start = max(0, first_diff - context)
+        end = min(min_len, first_diff + context + 1)
+
+        for i in range(start, end):
+            e1 = trace1[i]
+            e2 = trace2[i]
+            marker = ">>>" if i == first_diff else "   "
+
+            disasm1 = disassembler.get_instruction(e1.pc, e1.opcode)
+            disasm2 = disassembler.get_instruction(e2.pc, e2.opcode)
+
+            print(f"{marker} [{i:05d}]")
+            print(f"    T1: {e1.pc:08X} {e1.opcode} | {disasm1:30s} | D0={e1.d_regs[0] if e1.d_regs else '?'}")
+            print(f"    T2: {e2.pc:08X} {e2.opcode} | {disasm2:30s} | D0={e2.d_regs[0] if e2.d_regs else '?'}")
+
+    if len(trace1) != len(trace2):
+        print(f"\nLength difference: Trace1 has {len(trace1)} instructions, Trace2 has {len(trace2)}")
+
+
 def compare_traces(trace1, trace2, disassembler, max_diff=50):
-    """Compare two traces and show only differences"""
+    """Compare two traces and show only differences (PC-based comparison)"""
 
     # Build PC-indexed maps
     trace1_map = {e.pc: e for e in trace1}
@@ -204,7 +303,7 @@ def compare_traces(trace1, trace2, disassembler, max_diff=50):
     # Get all unique PCs from both traces
     all_pcs = sorted(set(list(trace1_map.keys()) + list(trace2_map.keys())))
 
-    print(f"\nComparing traces (showing max {max_diff} differences):")
+    print(f"\nPC-based trace comparison (showing max {max_diff} differences):")
     print(f"Trace 1: {len(trace1)} instructions, {len(trace1_map)} unique PCs")
     print(f"Trace 2: {len(trace2)} instructions, {len(trace2_map)} unique PCs")
     print("=" * 120)
@@ -276,12 +375,16 @@ def main():
                        help='Path to ROM file (default: ~/quadra.rom)')
     parser.add_argument('--compare', metavar='TRACE2',
                        help='Compare with another trace file')
+    parser.add_argument('--sequential', action='store_true',
+                       help='Use sequential comparison (instruction-by-instruction) instead of PC-based')
     parser.add_argument('--start', type=int, default=0,
                        help='Start line number (default: 0)')
     parser.add_argument('--end', type=int,
                        help='End line number (default: all)')
     parser.add_argument('--max-diff', type=int, default=50,
                        help='Maximum differences to show when comparing (default: 50)')
+    parser.add_argument('--context', type=int, default=3,
+                       help='Context lines around divergence (sequential mode, default: 3)')
     parser.add_argument('--rom-base', type=lambda x: int(x, 0), default=0x02000000,
                        help='ROM base address (default: 0x02000000)')
 
@@ -301,7 +404,10 @@ def main():
         trace2 = read_trace(args.compare)
         print(f"Loaded {len(trace2)} trace entries", file=sys.stderr)
 
-        compare_traces(trace1, trace2, disassembler, args.max_diff)
+        if args.sequential:
+            compare_traces_sequential(trace1, trace2, disassembler, args.max_diff, args.context)
+        else:
+            compare_traces(trace1, trace2, disassembler, args.max_diff)
     else:
         # Display mode
         show_trace_with_disasm(trace1, disassembler, args.start, args.end)
