@@ -167,15 +167,16 @@ Track what's done and what's next.
   - Impact: Expected 5-10x performance improvement
 
 ### Active Investigations ⏳
-- ⏳ **Timer interrupt timing** (wall-clock vs instruction-count)
-  - Status: Understood (see deepdive/InterruptTimingAnalysis.md)
-  - Not a bug, but a characteristic
-  - Decision needed: accept or add deterministic mode
+- ✅ **Timer interrupt timing** (wall-clock vs instruction-count) - RESOLVED
+  - Status: Fully understood (see deepdive/InterruptTimingAnalysis.md and JIT_Block_Size_Analysis.md)
+  - Not a bug, but a design characteristic
+  - Decision: **Accept non-determinism** for 5-10x performance gain
 
-- ⏳ **Unicorn execution length** (200k vs UAE 250k)
-  - Status: Under investigation
-  - Possible cumulative effect of interrupt timing
-  - Need functional testing approach
+- ✅ **Unicorn execution length** (200k limit) - RESOLVED
+  - Status: No longer an issue - DualCPU validates indefinitely
+  - The "200k limit" was from pre-interrupt-support era (commit 1305d3b2)
+  - After native trap execution (commit d90208dc), execution is stable
+  - DualCPU now runs without divergence until timeout
 
 ---
 
@@ -217,19 +218,31 @@ ba7d6487 - Fix host pointer leak in ROM patching causing non-deterministic behav
 ## Next Actions
 
 ### Immediate (This Week)
-1. ⏳ Review interrupt timing analysis
-2. ⏳ Decide on deterministic mode vs acceptance
+1. ✅ Review interrupt timing analysis - DONE (JIT_Block_Size_Analysis.md)
+2. ✅ Decide on deterministic mode vs acceptance - DONE (Accept non-determinism)
 3. ⏳ Set up functional testing infrastructure
 
 ### Short-Term (This Month)
-1. ⏳ Investigate 200k execution limit
-2. ⏳ Memory state comparison tool
+1. ✅ Investigate 200k execution limit - DONE (Not an issue anymore)
+2. ⏳ Memory state comparison tool (for functional testing)
 3. ⏳ Basic VIA timer emulation
 
 ### Medium-Term (This Quarter)
 1. ⏳ Boot to desktop attempt
 2. ⏳ Full hardware emulation (VIA, SCSI basics)
 3. ⏳ Application testing framework
+
+### **Current Focus**: Phase 2 - Boot to Desktop
+**Blockers Removed**:
+- ✅ Interrupt support working
+- ✅ Native trap execution stable
+- ✅ Timing characteristics understood
+
+**Next Steps**:
+1. Basic hardware emulation (VIA timer chip)
+2. SCSI stubs for boot
+3. Video framebuffer basics
+4. Functional testing approach
 
 ---
 
