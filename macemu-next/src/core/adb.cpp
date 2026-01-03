@@ -28,6 +28,7 @@
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
+#include "uae_wrapper.h"  // For TriggerInterrupt()
 #include "emul_op.h"
 #include "main.h"
 #include "prefs.h"

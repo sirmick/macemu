@@ -365,8 +365,16 @@ void uae_disasm(uint32_t addr, uint32_t *next_pc, int count) {
 
 /* Interrupt handling (shared by all CPU backends) */
 
-/* Forward declare idle_resume stub */
-extern "C" void idle_resume(void);
+extern "C" {
+
+/**
+ * Resume from idle state
+ * Called when an interrupt occurs to wake up the CPU if it was halted
+ * Stub implementation - can be extended if we implement CPU idle states
+ */
+void idle_resume(void) {
+    // Stub - resume from idle if CPU is halted
+}
 
 /**
  * Trigger M68K interrupt level 1
@@ -393,3 +401,5 @@ void TriggerNMI(void) {
 int intlev(void) {
     return InterruptFlags ? 1 : 0;
 }
+
+} /* extern "C" */

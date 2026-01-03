@@ -30,8 +30,7 @@
 #include "main.h"
 #include "emul_op.h"
 #include "platform.h"
-
-extern int intlev(void);	// From baisilisk_glue.cpp
+#include "../uae_wrapper.h"	// For intlev(), PendingInterrupt
 
 #include "m68k.h"
 #include "memory.h"

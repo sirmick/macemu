@@ -35,10 +35,7 @@ void fpu_dump_flags(void) {
     // Stub
 }
 
-// Idle/resume for interrupt handling
-void idle_resume(void) {
-    // Stub
-}
+// Idle/resume for interrupt handling - moved to uae_wrapper.cpp (shared interrupt infrastructure)
 
 // EmulOp handler - now using real implementation from src/core/emul_op.cpp
 // (removed stub - the real EmulOp is linked from libcore.a)

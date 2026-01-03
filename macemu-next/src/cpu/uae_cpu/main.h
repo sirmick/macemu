@@ -22,8 +22,9 @@
 extern int CPUType;
 extern int FPUType;
 
-/* Interrupt flags - minimal for now */
-extern volatile uint32 InterruptFlags;
+/* Interrupt flags - defined in uae_wrapper.cpp */
+// NOTE: Using uint32_t to match uae_wrapper.h declaration
+extern volatile uint32_t InterruptFlags;
 
 #define INTFLAG_60HZ 1
 

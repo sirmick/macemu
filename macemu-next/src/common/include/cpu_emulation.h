@@ -96,8 +96,7 @@ extern void Start680x0_until_stopped(void);					// Reset and run until STOP inst
 extern "C" void Execute68k(uint32 addr, M68kRegisters *r);		// Execute 68k code from EMUL_OP routine
 extern "C" void Execute68kTrap(uint16 trap, M68kRegisters *r);	// Execute MacOS 68k trap from EMUL_OP routine
 
-// Interrupt functions
-extern void TriggerInterrupt(void);								// Trigger interrupt level 1 (InterruptFlag must be set first)
-extern void TriggerNMI(void);									// Trigger interrupt level 7
+// Interrupt functions (now declared in uae_wrapper.h - shared by all CPU backends)
+// TriggerInterrupt() and TriggerNMI() moved to uae_wrapper.cpp for backend-agnostic access
 
 #endif

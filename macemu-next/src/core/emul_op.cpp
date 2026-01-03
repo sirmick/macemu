@@ -23,6 +23,7 @@
 
 #include "sysdeps.h"
 #include "cpu_emulation.h"
+#include "uae_wrapper.h"  // For TriggerNMI()
 #include "main.h"
 #include "macos_util.h"
 #include "rom_patches.h"

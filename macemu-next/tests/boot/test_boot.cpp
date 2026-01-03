@@ -75,7 +75,7 @@ void QuitEmulator(void)
 }
 
 // Interrupt flags (declared in main.h and defined in uae_wrapper.cpp)
-extern uint32 InterruptFlags;
+// NOTE: Using main.h declaration (volatile uint32)
 
 // Disable interrupts (stub)
 void DisableInterrupt(void)
