@@ -1425,6 +1425,13 @@ int m68k_do_specialties (void)
 			regs.stopped = 0;
 		}
 	}
+	/* Check for pending interrupts from shared interrupt system */
+	extern volatile bool PendingInterrupt;
+	if (PendingInterrupt) {
+		PendingInterrupt = false;
+		SPCFLAGS_SET( SPCFLAG_INT );
+	}
+
 	if (SPCFLAGS_TEST( SPCFLAG_INT )) {
 		SPCFLAGS_CLEAR( SPCFLAG_INT );
 		SPCFLAGS_SET( SPCFLAG_DOINT );

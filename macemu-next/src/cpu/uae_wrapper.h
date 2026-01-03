@@ -79,6 +79,13 @@ void uae_cpu_execute_one(void);  /* Execute one instruction */
 /* Disassembly */
 void uae_disasm(uint32_t addr, uint32_t *next_pc, int count);  /* Disassemble instructions */
 
+/* Interrupt handling (shared by all CPU backends) */
+extern volatile uint32_t InterruptFlags;   /* Interrupt flags from devices */
+extern volatile bool PendingInterrupt;     /* Set when interrupt should be processed */
+void TriggerInterrupt(void);               /* Trigger M68K interrupt (call from timers/devices) */
+void TriggerNMI(void);                     /* Trigger Non-Maskable Interrupt */
+int intlev(void);                          /* Get current interrupt level */
+
 #ifdef __cplusplus
 }
 #endif

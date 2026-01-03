@@ -29,6 +29,9 @@ int FPUType = FPU_68881;
 /* Interrupt flags */
 volatile uint32 InterruptFlags = 0;
 
+/* Pending interrupt flag (shared by all CPU backends) */
+volatile bool PendingInterrupt = false;
+
 /* Quit flag */
 volatile bool QuitEmulator = false;
 
@@ -358,4 +361,35 @@ void uae_disasm(uint32_t addr, uint32_t *next_pc, int count) {
     if (next_pc) {
         *next_pc = npc;
     }
+}
+
+/* Interrupt handling (shared by all CPU backends) */
+
+/* Forward declare idle_resume stub */
+extern "C" void idle_resume(void);
+
+/**
+ * Trigger M68K interrupt level 1
+ * Called by timers, ADB, and other devices to signal interrupts
+ * Backend-agnostic - sets PendingInterrupt flag that all backends check
+ */
+void TriggerInterrupt(void) {
+    idle_resume();  /* Resume from idle if CPU is halted */
+    PendingInterrupt = true;  /* Signal interrupt to CPU backend */
+}
+
+/**
+ * Trigger Non-Maskable Interrupt
+ * Not currently implemented
+ */
+void TriggerNMI(void) {
+    // TODO: Implement NMI handling
+}
+
+/**
+ * Get current interrupt level from InterruptFlags
+ * Returns 1 if any interrupt is pending, 0 otherwise
+ */
+int intlev(void) {
+    return InterruptFlags ? 1 : 0;
 }

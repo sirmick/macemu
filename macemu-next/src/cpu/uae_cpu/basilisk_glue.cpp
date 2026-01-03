@@ -179,29 +179,10 @@ void Start680x0_until_stopped(void)
 
 
 /*
- *  Trigger interrupt
+ *  Interrupt handling
+ *  NOTE: TriggerInterrupt(), TriggerNMI(), and intlev() are now in uae_wrapper.cpp
+ *        They are shared by all CPU backends (UAE, Unicorn, DualCPU)
  */
-
-void TriggerInterrupt(void)
-{
-	idle_resume();
-	SPCFLAGS_SET( SPCFLAG_INT );
-}
-
-void TriggerNMI(void)
-{
-	//!! not implemented yet
-}
-
-
-/*
- *  Get 68k interrupt level
- */
-
-int intlev(void)
-{
-	return InterruptFlags ? 1 : 0;
-}
 
 
 /*

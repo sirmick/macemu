@@ -144,6 +144,60 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) 
     uint32_t pc = (uint32_t)address;
     uint16_t opcode;
 
+    /* Check for pending interrupts (shared interrupt system) */
+    extern volatile bool PendingInterrupt;
+    extern volatile uint32_t InterruptFlags;
+    extern int intlev(void);
+
+    if (PendingInterrupt) {
+        PendingInterrupt = false;
+
+        int intr_level = intlev();
+        if (intr_level > 0) {
+            /* Get current SR to check interrupt mask */
+            uint32_t sr;
+            uc_reg_read(uc, UC_M68K_REG_SR, &sr);
+            int current_mask = (sr >> 8) & 7;
+
+            if (intr_level > current_mask) {
+                /* Trigger M68K interrupt - manually handle exception */
+                uint32_t sp;
+                uc_reg_read(uc, UC_M68K_REG_A7, &sp);
+
+                /* Push PC (long, big-endian) */
+                sp -= 4;
+                uint32_t pc_be = __builtin_bswap32(pc);
+                uc_mem_write(uc, sp, &pc_be, 4);
+
+                /* Push SR (word, big-endian) */
+                sp -= 2;
+                uint16_t sr_be = __builtin_bswap16((uint16_t)sr);
+                uc_mem_write(uc, sp, &sr_be, 2);
+
+                /* Update SR: set supervisor mode, set interrupt mask */
+                sr |= (1 << 13);  /* Supervisor mode */
+                sr = (sr & ~0x0700) | ((intr_level & 7) << 8);  /* Set interrupt mask */
+                uc_reg_write(uc, UC_M68K_REG_SR, &sr);
+                uc_reg_write(uc, UC_M68K_REG_A7, &sp);
+
+                /* Read interrupt vector and set PC */
+                /* For level 1 interrupt: vector is at VBR + (24 + level) * 4 */
+                uint32_t vbr = 0;
+                /* TODO: Read VBR register for 68020+ */
+                uint32_t vector_addr = vbr + (24 + intr_level) * 4;
+                uint32_t handler_addr_be;
+                uc_mem_read(uc, vector_addr, &handler_addr_be, 4);
+                uint32_t handler_addr = __builtin_bswap32(handler_addr_be);
+
+                uc_reg_write(uc, UC_M68K_REG_PC, &handler_addr);
+
+                /* Stop emulation to apply register changes */
+                uc_emu_stop(uc);
+                return;
+            }
+        }
+    }
+
     /* Read opcode at PC */
     uc_mem_read(uc, pc, &opcode, sizeof(opcode));
 
