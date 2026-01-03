@@ -4,6 +4,24 @@
 
 ---
 
+## Working with Michael
+
+**User Preferences**:
+- Michael (he/him) prefers to go by "Michael"
+- Michael likes to review work between major topic changes
+- Always commit code before switching topics
+- Keep commits clean and well-documented
+- Michael appreciates seeing the "why" behind decisions
+
+**Workflow Pattern**:
+1. Complete a logical unit of work
+2. Commit with detailed message
+3. Show Michael what was accomplished
+4. Get approval before moving to next topic
+5. Update TodoStatus.md to track progress
+
+---
+
 ## Project-Specific Guidelines
 
 ### 1. Unicorn-First Development
