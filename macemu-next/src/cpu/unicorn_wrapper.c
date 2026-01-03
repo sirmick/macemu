@@ -50,16 +50,15 @@ struct UnicornCPU {
     char error[256];
 
     /* Hooks */
-    EmulOpHandler emulop_handler;
-    void *emulop_user_data;
-
-    ExceptionHandler exception_handler;
+    /* NOTE: Per-CPU emulop_handler and exception_handler removed - use g_platform API instead */
 
     MemoryHookCallback memory_hook;
     void *memory_user_data;
     uc_hook mem_hook_handle;
 
-    uc_hook code_hook;  // UC_HOOK_CODE for EmulOps/traps (allows register modification)
+    /* NOTE: code_hook removed - UC_HOOK_CODE deprecated, using UC_HOOK_INSN_INVALID instead */
+    uc_hook block_hook;       // UC_HOOK_BLOCK for interrupts (efficient)
+    uc_hook insn_invalid_hook;  // UC_HOOK_INSN_INVALID for EmulOps (no per-instruction overhead)
     uc_hook trap_hook;  // UC_HOOK_MEM_FETCH_UNMAPPED for MMIO trap region
     uc_hook trace_hook; // UC_HOOK_MEM_READ for CPU tracing
 
@@ -132,21 +131,19 @@ static void trap_mem_fetch_handler(uc_engine *uc, uc_mem_type type,
 /* Invalid instruction hook for EmulOp/trap handling
  * NOTE: Requires m68k_stop_interrupt() patch in Unicorn (see external/unicorn/qemu/target/m68k/unicorn.c)
  */
-/* CODE hook - called BEFORE each instruction executes
- * This allows register modifications to persist (unlike INSN_INVALID hook)
- * Fast-path: Only checks opcodes that look like EmulOps/traps (0x7xxx, 0xAxxx, 0xFxxx)
- *
- * NOTE: This function is non-static so it can be registered from cpu_unicorn.cpp
- * for Unicorn-only mode (which uses platform handlers instead of per-CPU handlers)
+/**
+ * Hook for basic block execution (UC_HOOK_BLOCK)
+ * Called at the start of each basic block - much more efficient than per-instruction
+ * Used for interrupt checking at block boundaries
  */
-void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-    UnicornCPU *cpu = (UnicornCPU *)user_data;
+static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    (void)size;
+    (void)user_data;
+
     uint32_t pc = (uint32_t)address;
-    uint16_t opcode;
 
     /* Check for pending interrupts (shared interrupt system) */
     extern volatile bool PendingInterrupt;
-    extern volatile uint32_t InterruptFlags;
     extern int intlev(void);
 
     if (PendingInterrupt) {
@@ -175,20 +172,20 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) 
                 uc_mem_write(uc, sp, &sr_be, 2);
 
                 /* Update SR: set supervisor mode, set interrupt mask */
-                sr |= (1 << 13);  /* Supervisor mode */
-                sr = (sr & ~0x0700) | ((intr_level & 7) << 8);  /* Set interrupt mask */
+                sr |= (1 << 13);  /* S bit */
+                sr = (sr & ~0x0700) | ((intr_level & 7) << 8);  /* I2-I0 */
                 uc_reg_write(uc, UC_M68K_REG_SR, &sr);
                 uc_reg_write(uc, UC_M68K_REG_A7, &sp);
 
-                /* Read interrupt vector and set PC */
-                /* For level 1 interrupt: vector is at VBR + (24 + level) * 4 */
-                uint32_t vbr = 0;
-                /* TODO: Read VBR register for 68020+ */
+                /* Read interrupt vector and jump to handler */
+                uint32_t vbr = 0;  /* TODO: Read VBR for 68020+ */
                 uint32_t vector_addr = vbr + (24 + intr_level) * 4;
                 uint32_t handler_addr_be;
                 uc_mem_read(uc, vector_addr, &handler_addr_be, 4);
                 uint32_t handler_addr = __builtin_bswap32(handler_addr_be);
 
+                /* Invalidate cache at current PC and update to handler */
+                uc_ctl_remove_cache(uc, pc, pc + 4);
                 uc_reg_write(uc, UC_M68K_REG_PC, &handler_addr);
 
                 /* Stop emulation to apply register changes */
@@ -197,43 +194,35 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) 
             }
         }
     }
+}
+
+/**
+ * Hook for invalid instructions (UC_HOOK_INSN_INVALID)
+ * Called when Unicorn encounters an illegal instruction
+ * Used for EmulOps (0x71xx) and traps (0xAxxx, 0xFxxx)
+ * Returns true to continue execution, false to stop
+ */
+static bool hook_insn_invalid(uc_engine *uc, void *user_data) {
+    UnicornCPU *cpu = (UnicornCPU *)user_data;
+
+    /* Read PC (at illegal instruction) */
+    uint32_t pc;
+    uc_reg_read(uc, UC_M68K_REG_PC, &pc);
 
     /* Read opcode at PC */
+    uint16_t opcode;
     uc_mem_read(uc, pc, &opcode, sizeof(opcode));
-
-    /* M68K is big-endian, swap if needed */
     #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     opcode = __builtin_bswap16(opcode);
     #endif
 
-    /* Fast path: Skip normal instructions */
-    uint8_t opcode_high = (opcode >> 12) & 0xF;
-    if (opcode_high != 0x7 && opcode_high != 0xA && opcode_high != 0xF) {
-        return;  // Not an EmulOp or trap, continue normally
-    }
-
-    /* DEBUG: Check trap vector when A-trap is about to execute */
-    if (opcode_high == 0xA && pc == 0x02000780) {
-        uint8_t vec_bytes[4];
-        uc_mem_read(uc, 0x28, vec_bytes, 4);
-        fprintf(stderr, "[DEBUG] Before A-trap 0x%04X at PC=0x%08X:\n", opcode, pc);
-        fprintf(stderr, "        RAM[0x28] = %02X %02X %02X %02X\n",
-               vec_bytes[0], vec_bytes[1], vec_bytes[2], vec_bytes[3]);
-        uint32_t vec_value = (vec_bytes[0] << 0) | (vec_bytes[1] << 8) |
-                            (vec_bytes[2] << 16) | (vec_bytes[3] << 24);
-        fprintf(stderr, "        As LE uint32: 0x%08X\n", vec_value);
-    }
-
-    /* Check platform handlers first (g_platform declared in platform.h) */
-
     /* Check if EmulOp (0x71xx for M68K) */
     if ((opcode & 0xFF00) == 0x7100) {
         if (g_platform.emulop_handler) {
-            /* Platform handler - pass is_primary=false for Unicorn */
+            /* Call platform handler */
             bool pc_advanced = g_platform.emulop_handler(opcode, false);
 
-            /* Sync ALL registers back from platform to Unicorn after EmulOp */
-            /* This is necessary for Unicorn-only mode where platform == Unicorn */
+            /* Sync ALL registers back from platform to Unicorn */
             if (g_platform.cpu_get_dreg && g_platform.cpu_get_areg) {
                 for (int i = 0; i < 8; i++) {
                     uint32_t d = g_platform.cpu_get_dreg(i);
@@ -247,74 +236,56 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) 
                 }
             }
 
-            /* Advance past EmulOp only if handler didn't */
+            /* Advance PC if handler didn't */
             if (!pc_advanced) {
                 pc += 2;
-                uc_reg_write(uc, UC_M68K_REG_PC, &pc);
             }
 
-            /* IMPORTANT: Stop emulation to let register writes take effect
-             * UC_HOOK_CODE is called BEFORE instruction execution, so:
-             * 1. Handler modifies registers (A7, etc.)
-             * 2. We write them to Unicorn here
-             * 3. uc_emu_stop() exits cleanly
-             * 4. Next uc_emu_start() generates new TB with updated registers
-             * This is the ONLY way to make register modifications persist in Unicorn.
-             */
-            uc_emu_stop(uc);
-            return;
-        }
-        /* Fallback to per-CPU handler */
-        if (cpu->emulop_handler) {
-            cpu->emulop_handler(opcode, cpu->emulop_user_data);
-            pc += 2;
+            /* CRITICAL: Invalidate cache and update PC to continue execution */
+            uc_ctl_remove_cache(uc, pc - 2, pc + 4);
             uc_reg_write(uc, UC_M68K_REG_PC, &pc);
-            uc_emu_stop(uc);
-            return;
+
+            /* Return true to continue execution */
+            return true;
         }
+        /* No platform handler - invalid EmulOp */
+        fprintf(stderr, "[UNICORN] Unhandled EmulOp 0x%04X at PC=0x%08X (no platform handler)\n", opcode, pc);
+        return false;
     }
 
     /* Check for A-line trap (0xAxxx) */
     if ((opcode & 0xF000) == 0xA000) {
-        fprintf(stderr, "[DEBUG] A-trap detected: 0x%04X at PC=0x%08X, g_platform.trap_handler=%p\n",
-               opcode, pc, (void*)g_platform.trap_handler);
         if (g_platform.trap_handler) {
-            fprintf(stderr, "[DEBUG] Calling platform trap handler\n");
-            /* Platform handler - pass is_primary=false for Unicorn */
+            /* Platform trap handler */
             g_platform.trap_handler(0xA, opcode, false);
-            /* Handler handles PC advancement for traps */
-            uc_emu_stop(uc);
-            return;
-        } else {
-            fprintf(stderr, "[DEBUG] No platform trap handler - letting Unicorn handle it\n");
+            /* Handler handles PC advancement - just continue */
+            return true;
         }
-        /* Fallback to per-CPU handler */
-        if (cpu->exception_handler) {
-            cpu->exception_handler(cpu, 10, opcode);
-            uc_emu_stop(uc);
-            return;
-        }
+        /* No platform handler - real A-line exception */
+        fprintf(stderr, "[UNICORN] Unhandled A-line trap 0x%04X at PC=0x%08X (no platform handler)\n", opcode, pc);
+        return false;
     }
 
     /* Check for F-line trap (0xFxxx) */
     if ((opcode & 0xF000) == 0xF000) {
         if (g_platform.trap_handler) {
-            /* Platform handler - pass is_primary=false for Unicorn */
-            g_platform.trap_handler(0xB, opcode, false);
-            /* Handler handles PC advancement for traps */
-            uc_emu_stop(uc);
-            return;
+            g_platform.trap_handler(0xF, opcode, false);
+            return true;
         }
-        /* Fallback to per-CPU handler */
-        if (cpu->exception_handler) {
-            cpu->exception_handler(cpu, 11, opcode);
-            uc_emu_stop(uc);
-            return;
-        }
+        /* No platform handler - real F-line exception */
+        fprintf(stderr, "[UNICORN] Unhandled F-line trap 0x%04X at PC=0x%08X (no platform handler)\n", opcode, pc);
+        return false;
     }
 
-    /* Not an EmulOp/trap we handle - let it execute normally */
+    /* Real invalid instruction - stop execution */
+    fprintf(stderr, "[UNICORN] Invalid instruction 0x%04X at PC=0x%08X\n", opcode, pc);
+    return false;
 }
+
+/* NOTE: Legacy hook_code() function removed (was lines 296-479)
+ * UC_HOOK_INSN_INVALID (hook_insn_invalid) handles all EmulOps/traps without per-instruction
+ * overhead. Platform API (g_platform) is checked automatically. No UC_HOOK_CODE needed.
+ */
 
 /* Memory access hook */
 static void hook_memory(uc_engine *uc, uc_mem_type type,
@@ -436,6 +407,34 @@ UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model) {
             fprintf(stderr, "Warning: Failed to register memory trace hook: %s\n", uc_strerror(err));
             /* Not fatal - continue without memory tracing */
         }
+    }
+
+    /* Register UC_HOOK_BLOCK for efficient interrupt checking */
+    fprintf(stderr, "[UNICORN] Registering UC_HOOK_BLOCK for interrupt handling\n");
+    err = uc_hook_add(cpu->uc, &cpu->block_hook,
+                     UC_HOOK_BLOCK,
+                     (void*)hook_block,
+                     cpu,  /* user_data */
+                     1, 0);  /* All addresses */
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "Failed to register UC_HOOK_BLOCK: %s\n", uc_strerror(err));
+        uc_close(cpu->uc);
+        free(cpu);
+        return NULL;
+    }
+
+    /* Register UC_HOOK_INSN_INVALID for EmulOps/traps without per-instruction overhead */
+    fprintf(stderr, "[UNICORN] Registering UC_HOOK_INSN_INVALID for EmulOp/trap handling\n");
+    err = uc_hook_add(cpu->uc, &cpu->insn_invalid_hook,
+                     UC_HOOK_INSN_INVALID,
+                     (void*)hook_insn_invalid,
+                     cpu,  /* user_data */
+                     1, 0);  /* All addresses */
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "Failed to register UC_HOOK_INSN_INVALID: %s\n", uc_strerror(err));
+        uc_close(cpu->uc);
+        free(cpu);
+        return NULL;
     }
 
     return cpu;
@@ -826,40 +825,14 @@ void unicorn_set_msr(UnicornCPU *cpu, uint32_t value) {
 }
 
 /* Hooks */
-void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *user_data) {
-    if (!cpu || !cpu->uc) return;
 
-    cpu->emulop_handler = handler;
-    cpu->emulop_user_data = user_data;
-
-    if (handler && !cpu->code_hook) {
-        /* Use UC_HOOK_CODE - called BEFORE instruction execution
-         * This allows register modifications to persist (unlike INSN_INVALID)
-         * Fast-path filtering in hook_code() keeps overhead minimal */
-        fprintf(stderr, "[UNICORN] Registering UC_HOOK_CODE for EmulOp handling\n");
-        uc_hook_add(cpu->uc, &cpu->code_hook, UC_HOOK_CODE,
-                   (void *)hook_code, cpu, 1, 0);
-    } else if (!handler && !cpu->exception_handler && cpu->code_hook) {
-        fprintf(stderr, "[UNICORN] Unregistering UC_HOOK_CODE\n");
-        uc_hook_del(cpu->uc, cpu->code_hook);
-        cpu->code_hook = 0;
-    }
-}
-
-void unicorn_set_exception_handler(UnicornCPU *cpu, ExceptionHandler handler) {
-    if (!cpu || !cpu->uc) return;
-
-    cpu->exception_handler = handler;
-
-    if (handler && !cpu->code_hook) {
-        /* Use UC_HOOK_CODE for trap handling */
-        uc_hook_add(cpu->uc, &cpu->code_hook, UC_HOOK_CODE,
-                   (void *)hook_code, cpu, 1, 0);
-    } else if (!handler && !cpu->emulop_handler && cpu->code_hook) {
-        uc_hook_del(cpu->uc, cpu->code_hook);
-        cpu->code_hook = 0;
-    }
-}
+/* NOTE: Legacy per-CPU hook registration functions removed:
+ * - unicorn_set_emulop_handler() - EmulOps handled by UC_HOOK_INSN_INVALID + g_platform.emulop_handler
+ * - unicorn_set_exception_handler() - Exceptions handled by UC_HOOK_INSN_INVALID + g_platform.trap_handler
+ *
+ * All EmulOps and traps are now handled via platform API (g_platform) which is checked by
+ * hook_insn_invalid() automatically. No per-CPU handlers or UC_HOOK_CODE registration needed.
+ */
 
 void unicorn_set_memory_hook(UnicornCPU *cpu, MemoryHookCallback callback, void *user_data) {
     if (!cpu || !cpu->uc) return;

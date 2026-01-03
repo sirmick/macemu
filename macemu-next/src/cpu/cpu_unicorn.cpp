@@ -196,15 +196,15 @@ static bool unicorn_backend_init(void) {
 	cpu_trace_init();
 
 	// Register EmulOp handler via platform API
-	// EmulOps are now handled in unicorn_execute_one() when UC_ERR_INSN_INVALID occurs
-	// No hooks needed - this is faster and compatible with JIT
+	// EmulOps are handled by UC_HOOK_INSN_INVALID which checks g_platform handlers
 	g_platform.emulop_handler = unicorn_platform_emulop_handler;
 
 	// Register trap handler for A-line/F-line traps
+	// Traps are handled by UC_HOOK_INSN_INVALID which checks g_platform handlers
 	g_platform.trap_handler = unicorn_platform_trap_handler;
 
-	// Register exception handler for A-line/F-line traps (also handled via UC_ERR_INSN_INVALID)
-	unicorn_set_exception_handler(unicorn_cpu, unicorn_simulate_exception);
+	// NOTE: Legacy per-CPU exception handler API removed - UC_HOOK_INSN_INVALID
+	// automatically checks g_platform.trap_handler for A-line/F-line exceptions
 
 	return true;
 }

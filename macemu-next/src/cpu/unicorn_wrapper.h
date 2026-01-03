@@ -25,11 +25,9 @@ typedef enum {
     UCPU_ARCH_PPC64
 } UnicornArch;
 
-/* EmulOp handler callback - called when illegal instruction (0x71xx) is executed */
-typedef void (*EmulOpHandler)(uint16_t opcode, void *user_data);
-
-/* Exception handler callback - called for A-line/F-line traps */
-typedef void (*ExceptionHandler)(UnicornCPU *cpu, int vector_nr, uint16_t opcode);
+/* NOTE: EmulOpHandler and ExceptionHandler typedefs removed - legacy per-CPU API deprecated.
+ * Use platform API (g_platform.emulop_handler, g_platform.trap_handler) instead.
+ */
 
 /* Memory access hook callback */
 typedef enum {
@@ -94,8 +92,10 @@ uint32_t unicorn_get_msr(UnicornCPU *cpu);
 void unicorn_set_msr(UnicornCPU *cpu, uint32_t value);
 
 /* Hooks */
-void unicorn_set_emulop_handler(UnicornCPU *cpu, EmulOpHandler handler, void *user_data);
-void unicorn_set_exception_handler(UnicornCPU *cpu, ExceptionHandler handler);
+/* NOTE: Legacy per-CPU hook APIs removed (unicorn_set_emulop_handler, unicorn_set_exception_handler)
+ * Use platform API (g_platform.emulop_handler, g_platform.trap_handler) instead.
+ * These are automatically checked by UC_HOOK_INSN_INVALID at CPU creation time.
+ */
 void unicorn_set_memory_hook(UnicornCPU *cpu, MemoryHookCallback callback, void *user_data);
 
 /* Internal access (for exception handler and cpu_unicorn.cpp) */

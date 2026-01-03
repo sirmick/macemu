@@ -75,13 +75,6 @@ static struct {
     // Separate memory for Unicorn
     uint8_t *unicorn_ram;        // Private RAM copy for Unicorn
 } validation_state = {0};
-
-/* Dummy handler to trigger invalid instruction hook registration */
-static void dummy_emulop(uint16_t opcode, void *user_data) {
-    (void)opcode;
-    (void)user_data;
-}
-
 /* Initialize validation */
 bool unicorn_validation_init(void) {
     if (validation_state.initialized) {
@@ -246,12 +239,10 @@ bool unicorn_validation_init(void) {
            unicorn_get_sr(validation_state.unicorn));
     printf("✓ Both CPUs initialized to identical state\n");
 
-    // NOTE: EmulOp/trap handlers are now registered by cpu_dualcpu_install() via platform API
-    // However, we still need to install the code hook on Unicorn so it can intercept
-    // EmulOps before they trigger exceptions. Install a dummy handler to trigger hook
-    // registration (the hook checks g_platform first, so the dummy is never actually called)
-    unicorn_set_emulop_handler(validation_state.unicorn, dummy_emulop, NULL);
-    printf("✓ Unicorn code hook installed (intercepts EmulOps/traps before execution)\n");
+    // NOTE: EmulOp/trap handlers are registered by cpu_dualcpu_install() via platform API
+    // UC_HOOK_INSN_INVALID (registered at CPU creation) automatically intercepts illegal
+    // instructions and checks g_platform handlers. No per-CPU handler registration needed.
+    printf("✓ UC_HOOK_INSN_INVALID installed (intercepts EmulOps/traps via platform API)\n");
     printf("✓ Platform handlers configured by CPU backend\n");
 
     // Open log file
