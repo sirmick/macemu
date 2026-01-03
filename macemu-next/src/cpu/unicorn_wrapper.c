@@ -44,6 +44,16 @@ typedef struct {
     uint16_t trap_opcode;  /* Original trap opcode */
 } TrapContext;
 
+/* Block statistics for timing analysis */
+typedef struct {
+    uint64_t total_blocks;         /* Total number of blocks executed */
+    uint64_t total_instructions;   /* Total instructions executed */
+    uint64_t block_size_histogram[101];  /* Histogram: [0-99] + [100+] */
+    uint32_t min_block_size;       /* Smallest block seen */
+    uint32_t max_block_size;       /* Largest block seen */
+    uint64_t sum_block_sizes;      /* Sum for average calculation */
+} BlockStats;
+
 struct UnicornCPU {
     uc_engine *uc;
     UnicornArch arch;
@@ -64,6 +74,9 @@ struct UnicornCPU {
 
     /* MMIO trap context */
     TrapContext trap_ctx;
+
+    /* Block statistics */
+    BlockStats block_stats;
 };
 
 /* Helper: Convert uc_err to string and store in cpu->error */
@@ -137,10 +150,72 @@ static void trap_mem_fetch_handler(uc_engine *uc, uc_mem_type type,
  * Used for interrupt checking at block boundaries
  */
 static void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-    (void)size;
-    (void)user_data;
+    UnicornCPU *cpu = (UnicornCPU *)user_data;
 
     uint32_t pc = (uint32_t)address;
+
+    /* Count instructions in this block for statistics */
+    /* We estimate instruction count by decoding the block */
+    /* M68K instructions are variable length (2-10 bytes), so we need to decode */
+    uint32_t block_start = pc;
+    uint32_t block_end = pc + size;
+    uint32_t insn_count = 0;
+    uint32_t current_pc = block_start;
+
+    while (current_pc < block_end) {
+        uint16_t opcode = 0;
+        if (uc_mem_read(uc, current_pc, &opcode, 2) != UC_ERR_OK) {
+            break;  /* Can't read opcode, stop counting */
+        }
+        #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        opcode = __builtin_bswap16(opcode);
+        #endif
+
+        insn_count++;
+
+        /* Simple instruction length estimation for M68K */
+        /* This is a rough approximation - actual decoder would be complex */
+        /* Most instructions are 2 or 4 bytes */
+        uint32_t insn_len = 2;  /* Base opcode word */
+
+        /* Check for immediate data or address extensions */
+        /* These patterns commonly have extension words */
+        if ((opcode & 0xF000) == 0x0000 ||  /* ORI, ANDI, SUBI, ADDI, etc. */
+            (opcode & 0xF000) == 0x2000 ||  /* MOVEA, MOVE.L */
+            (opcode & 0xF000) == 0x3000 ||  /* MOVE.W */
+            (opcode & 0xF000) == 0x4000 ||  /* LEA, PEA, etc. */
+            (opcode & 0xF1C0) == 0x41C0 ||  /* LEA */
+            (opcode & 0xF1C0) == 0x4180) {  /* CHK */
+            /* May have extension words - add 2 bytes as estimate */
+            insn_len += 2;
+        }
+
+        current_pc += insn_len;
+        if (current_pc > block_end) {
+            /* Don't count partial instructions */
+            break;
+        }
+    }
+
+    /* Update block statistics */
+    cpu->block_stats.total_blocks++;
+    cpu->block_stats.total_instructions += insn_count;
+    cpu->block_stats.sum_block_sizes += insn_count;
+
+    /* Update min/max */
+    if (cpu->block_stats.min_block_size == 0 || insn_count < cpu->block_stats.min_block_size) {
+        cpu->block_stats.min_block_size = insn_count;
+    }
+    if (insn_count > cpu->block_stats.max_block_size) {
+        cpu->block_stats.max_block_size = insn_count;
+    }
+
+    /* Update histogram */
+    if (insn_count < 100) {
+        cpu->block_stats.block_size_histogram[insn_count]++;
+    } else {
+        cpu->block_stats.block_size_histogram[100]++;  /* 100+ bucket */
+    }
 
     /* Check for pending interrupts (shared interrupt system) */
     extern volatile bool PendingInterrupt;
@@ -395,6 +470,9 @@ UnicornCPU* unicorn_create_with_model(UnicornArch arch, int cpu_model) {
     cpu->trap_ctx.in_emulop = false;
     cpu->trap_ctx.in_trap = false;
     cpu->trap_ctx.trap_opcode = 0;
+
+    /* Initialize block statistics */
+    memset(&cpu->block_stats, 0, sizeof(BlockStats));
 
     /* Install memory trace hook if CPU_TRACE_MEMORY is enabled */
     if (cpu_trace_memory_enabled()) {
@@ -858,4 +936,76 @@ void* unicorn_get_uc(UnicornCPU *cpu) {
 /* Error handling */
 const char* unicorn_get_error(UnicornCPU *cpu) {
     return cpu ? cpu->error : "Invalid CPU handle";
+}
+
+/* Block statistics */
+void unicorn_print_block_stats(UnicornCPU *cpu) {
+    if (!cpu) return;
+
+    BlockStats *stats = &cpu->block_stats;
+
+    fprintf(stderr, "\n=== Unicorn Block Execution Statistics ===\n");
+    fprintf(stderr, "Total blocks executed:      %lu\n", stats->total_blocks);
+    fprintf(stderr, "Total instructions:         %lu\n", stats->total_instructions);
+
+    if (stats->total_blocks > 0) {
+        double avg = (double)stats->sum_block_sizes / (double)stats->total_blocks;
+        fprintf(stderr, "Average block size:         %.2f instructions\n", avg);
+        fprintf(stderr, "Min block size:             %u instructions\n", stats->min_block_size);
+        fprintf(stderr, "Max block size:             %u instructions\n", stats->max_block_size);
+
+        /* Calculate median */
+        uint64_t median_target = stats->total_blocks / 2;
+        uint64_t cumulative = 0;
+        uint32_t median = 0;
+        for (int i = 0; i <= 100; i++) {
+            cumulative += stats->block_size_histogram[i];
+            if (cumulative >= median_target) {
+                median = i;
+                break;
+            }
+        }
+        fprintf(stderr, "Median block size:          ~%u instructions\n", median);
+
+        fprintf(stderr, "\nBlock Size Distribution:\n");
+        fprintf(stderr, "Size (insns) | Count        | Percentage | Cumulative\n");
+        fprintf(stderr, "-------------|--------------|------------|------------\n");
+
+        cumulative = 0;
+        for (int i = 0; i <= 100; i++) {
+            if (stats->block_size_histogram[i] > 0) {
+                cumulative += stats->block_size_histogram[i];
+                double pct = 100.0 * stats->block_size_histogram[i] / stats->total_blocks;
+                double cum_pct = 100.0 * cumulative / stats->total_blocks;
+
+                if (i == 100) {
+                    fprintf(stderr, "100+         | %12lu | %9.2f%% | %9.2f%%\n",
+                            stats->block_size_histogram[i], pct, cum_pct);
+                } else {
+                    fprintf(stderr, "%-12d | %12lu | %9.2f%% | %9.2f%%\n",
+                            i, stats->block_size_histogram[i], pct, cum_pct);
+                }
+            }
+        }
+
+        /* Timing impact analysis */
+        fprintf(stderr, "\n=== Interrupt Timing Impact Analysis ===\n");
+        fprintf(stderr, "Since interrupts are checked at block boundaries:\n");
+        fprintf(stderr, "- Average interrupt latency: %.2f instructions\n", avg);
+        fprintf(stderr, "- Maximum interrupt latency: %u instructions\n", stats->max_block_size);
+        fprintf(stderr, "- Blocks with size > 10:     ");
+        uint64_t large_blocks = 0;
+        for (int i = 11; i <= 100; i++) {
+            large_blocks += stats->block_size_histogram[i];
+        }
+        fprintf(stderr, "%lu (%.2f%%)\n", large_blocks,
+                100.0 * large_blocks / stats->total_blocks);
+    }
+
+    fprintf(stderr, "==========================================\n\n");
+}
+
+void unicorn_reset_block_stats(UnicornCPU *cpu) {
+    if (!cpu) return;
+    memset(&cpu->block_stats, 0, sizeof(BlockStats));
 }

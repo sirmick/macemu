@@ -1,105 +1,132 @@
-# macemu-next Documentation
+# macemu-next
 
-Modern Mac emulator built on BasiliskII's UAE M68K CPU core with dual-CPU validation.
+Modern Mac emulator with Unicorn M68K CPU backend and dual-CPU validation.
 
-## Overview
+---
 
-macemu-next is a clean-room rewrite of the BasiliskII Mac emulator with a modern build system (Meson) and modular architecture. The project focuses on:
+## What Is This?
 
-- **Dual-CPU validation**: Run UAE and Unicorn M68K cores in parallel to validate instruction execution
-- **Clean modular structure**: Separate core logic from platform-specific code
-- **Modern build system**: Meson-based build with clear dependencies
-- **Minimal dependencies**: Start with just CPU emulation, add components incrementally
+**macemu-next** is a clean-room rewrite of the BasiliskII Mac emulator, focused on:
 
-## Project Status
+1. **Unicorn M68K CPU** - Fast JIT-compiled 68020 emulation (primary goal)
+2. **Dual-CPU Validation** - Run UAE and Unicorn in parallel to catch emulation bugs
+3. **Modern Architecture** - Clean platform API, modular design, Meson build
+4. **Legacy Support** - UAE backend retained for compatibility
 
-**Current milestone**: ✅ ROM execution working!
+**Current Status**: ✅ Core CPU emulation working, 514k+ instructions validated
 
-The emulator successfully:
-- Loads Quadra 650 ROM (1MB)
-- Initializes UAE M68K CPU core
-- Executes ROM code starting at ROMBaseMac + 0x2a
-- Hits EMUL_OP traps (illegal instructions for Mac OS API calls)
-
-**Next steps**:
-- Implement EMUL_OP handlers for Mac OS traps
-- Add ROM patching infrastructure
-- Implement basic hardware emulation (VIA, etc.)
-
-## Architecture
-
-```
-macemu-next/
-├── src/
-│   ├── common/include/    # Shared headers (sysdeps.h, etc.)
-│   ├── core/              # Core Mac managers (copied from BasiliskII)
-│   ├── drivers/dummy/     # Dummy driver implementations
-│   ├── cpu/               # CPU emulation
-│   │   ├── uae_cpu/       # UAE M68K CPU core
-│   │   ├── unicorn_wrapper.c
-│   │   ├── uae_wrapper.cpp
-│   │   └── dualcpu.c      # Dual-CPU validation
-│   └── tests/
-│       └── boot/          # Boot test program
-└── docs/                  # Documentation (you are here!)
-```
-
-## Documentation Index
-
-1. [CPU Emulation](CPU.md) - UAE and Unicorn cores, dual-CPU validation
-2. [Memory Layout](Memory.md) - ROM/RAM addressing, direct addressing mode
-3. [UAE CPU Quirks](UAE-Quirks.md) - Byte-swapping, HAVE_GET_WORD_UNSWAPPED, etc.
-4. [Unicorn Quirks](Unicorn-Quirks.md) - API differences, validation approach
-5. [ROM Patching](ROM-Patching.md) - How BasiliskII patches ROMs (TODO)
-6. [Build System](Build.md) - Meson build structure
+---
 
 ## Quick Start
 
 ### Build
-
 ```bash
 cd macemu-next
-meson setup build-dualcpu -Dcpu_backend=dualcpu
-meson compile -C build-dualcpu
+meson setup build
+meson compile -C build
 ```
 
-### Run Boot Test
-
+### Run with Unicorn (primary backend)
 ```bash
-./build-dualcpu/tests/boot/test_boot /path/to/Quadra-650.ROM
+CPU_BACKEND=unicorn ./build/macemu-next ~/quadra.rom
 ```
 
-You should see output showing ROM code execution and EMUL_OP traps.
+### Run with dual-CPU validation
+```bash
+CPU_BACKEND=dualcpu ./build/macemu-next ~/quadra.rom
+```
 
-## Key Concepts
+See **[Commands.md](Commands.md)** for complete build and testing guide.
 
-### Direct Addressing Mode
+---
 
-BasiliskII uses "direct addressing" where Mac memory addresses map directly to host memory via a simple offset (`MEMBaseDiff`). This is much faster than banking/translation but requires contiguous memory allocation.
+## Documentation
 
-See [Memory Layout](Memory.md) for details.
+### Essential Reading
+- **[Architecture.md](Architecture.md)** - How the system fits together (Platform API, backends, memory)
+- **[ProjectGoals.md](ProjectGoals.md)** - Vision and end goals (Unicorn-first approach)
+- **[TodoStatus.md](TodoStatus.md)** - What's done ✅ and what's next ⏳
+- **[Commands.md](Commands.md)** - Build, test, debug, trace commands
 
-### EMUL_OP Instructions
+### Deep Dive (Technical Details)
+- **[deepdive/](deepdive/)** - Detailed technical documentation on specific subsystems
+  - Interrupt timing analysis
+  - A-line/F-line trap handling
+  - Memory architecture
+  - UAE and Unicorn quirks
+  - Platform adapter implementation
 
-BasiliskII replaces certain ROM code sequences with illegal M68K instructions (0x71xx) to trap Mac OS API calls. When the CPU encounters these, it calls back into the emulator to handle the operation.
+### Completed Work (Archive)
+- **[completed/](completed/)** - Historical documentation of completed fixes and implementations
 
-See [ROM Patching](ROM-Patching.md) for details.
+---
 
-### Dual-CPU Validation
+## Project Vision
 
-Every M68K instruction is executed by BOTH UAE and Unicorn, and register state is compared after each instruction. This catches emulation bugs early.
+**End Goal**: Unicorn-based Mac emulator with:
+- Fast JIT execution
+- Clean, maintainable codebase
+- Validated against proven UAE implementation
+- Modern build system and tooling
 
-See [CPU Emulation](CPU.md) for details.
+**Current State**: Unicorn backend executes 200k+ instructions with proper trap/interrupt handling
 
-## Contributing
+**UAE's Role**: Legacy compatibility and validation baseline (will be retained but Unicorn is the focus)
 
-This is a learning/research project. Key principles:
+**Dual-CPU's Role**: Validation tool to ensure Unicorn matches UAE behavior
 
-1. **Reference BasiliskII heavily** - Copy approach, not just code
-2. **Keep it modular** - Clean separation of concerns
-3. **Document quirks** - UAE and Unicorn both have surprising behavior
-4. **Test incrementally** - Add one feature at a time
+See **[ProjectGoals.md](ProjectGoals.md)** for detailed vision.
+
+---
+
+## Key Achievements
+
+- ✅ Unicorn M68K backend working (68020 with JIT)
+- ✅ EmulOps (0x71xx) - Illegal instruction traps
+- ✅ A-line/F-line traps (0xAxxx, 0xFxxx)
+- ✅ Interrupt support (timer, ADB)
+- ✅ Native trap execution (no UAE dependency)
+- ✅ 514k instruction dual-CPU validation
+- ✅ VBR register support
+- ✅ Efficient hook architecture (UC_HOOK_BLOCK, UC_HOOK_INSN_INVALID)
+
+See **[TodoStatus.md](TodoStatus.md)** for complete checklist.
+
+---
+
+## Current Focus
+
+**Timer Interrupt Timing** - Understanding wall-clock vs instruction-count timing differences
+
+See **[deepdive/InterruptTimingAnalysis.md](deepdive/InterruptTimingAnalysis.md)** for details.
+
+---
+
+## Directory Structure
+
+```
+macemu-next/
+├── src/
+│   ├── common/include/    # Shared headers (sysdeps.h, platform.h)
+│   ├── core/              # Core Mac managers (emul_op.cpp, xpram.cpp)
+│   ├── cpu/               # CPU backends
+│   │   ├── uae_cpu/       # UAE M68K interpreter (legacy)
+│   │   ├── cpu_unicorn.cpp     # Unicorn backend (primary)
+│   │   ├── cpu_dualcpu.cpp     # Validation backend
+│   │   └── unicorn_wrapper.c   # Unicorn API wrapper
+│   └── tests/             # Unit and boot tests
+├── docs/                  # Documentation (you are here!)
+└── meson.build            # Build configuration
+```
+
+---
 
 ## License
 
-Based on BasiliskII which is GPL v2. See LICENSE file.
+GPL v2 (based on BasiliskII)
+
+## References
+
+- Original BasiliskII: https://github.com/kanjitalk755/macemu
+- Unicorn Engine: https://www.unicorn-engine.org/
+- M68K Reference: Motorola M68000 Family Programmer's Reference Manual

@@ -45,27 +45,36 @@ A modern rewrite focusing on:
    - Catch emulation bugs immediately
    - Build confidence in new backends
 
-## Current Status (December 2025)
+## Current Status (January 2026)
 
 ### ✅ What Works
 
 1. **Build System**: Meson build compiles cleanly
 2. **UAE CPU**: Full 68K interpreter integrated
-3. **Unicorn CPU**: Integrated as validation backend
-4. **DualCPU**: Validates 23,250+ instructions successfully
+3. **Unicorn CPU**: Full 68020 emulation with JIT
+4. **DualCPU**: Validates **514,000+ instructions** successfully (massive improvement!)
 5. **ROM Loading**: Quadra 650 ROM loads and executes
 6. **EmulOp System**: 0x71xx traps call emulator functions
-7. **XPRAM**: Configuration storage working
-8. **Memory**: Direct addressing mode implemented
-9. **Boot Sequence**: ROM boots, reaches idle loop
+7. **A-line/F-line Traps**: ✅ **COMPLETE** - Mac OS traps (0xAxxx, 0xFxxx) working
+8. **Interrupt Support**: ✅ **COMPLETE** - Timer interrupts processed by all backends
+9. **Native Trap Execution**: ✅ **COMPLETE** - Unicorn executes 68k traps natively
+10. **XPRAM**: Configuration storage working
+11. **Memory**: Direct addressing mode implemented
+12. **Boot Sequence**: ROM boots, executes successfully
 
 ### 🚧 Currently Working On
 
-**A-line/F-line Exception Handling**
-- Unicorn stops at Mac OS traps (0xAxxx, 0xFxxx)
-- Need to simulate M68K exception mechanism
-- Goal: Make Unicorn a drop-in replacement for UAE
-- Design doc: [A-line-F-line-Exception-Design.md](A-line-F-line-Exception-Design.md)
+**Timer Interrupt Timing Analysis**
+- First divergence at instruction #29,518 due to timer interrupt
+- UAE (interpreted) vs Unicorn (JIT) execute at different speeds
+- Wall-clock timers fire at different instruction counts
+- Not a bug, but a characteristic of wall-clock-based timing
+- Investigation doc: [INTERRUPT_TIMING_ANALYSIS.md](INTERRUPT_TIMING_ANALYSIS.md)
+
+**Performance Gap Investigation**
+- Unicorn stops at ~200k instructions vs UAE 250k
+- Likely due to cumulative effects of interrupt timing divergence
+- Need functional testing approach (not just trace comparison)
 
 ### 📋 Roadmap (Not Yet Started)
 
@@ -547,5 +556,5 @@ Based on BasiliskII, which is GPL v2. All code is GPL v2 compatible.
 
 ---
 
-**Last Updated**: December 29, 2025
-**Status**: Active development - A-line/F-line exception handling
+**Last Updated**: January 3, 2026
+**Status**: Active development - Timer interrupt timing analysis and functional testing

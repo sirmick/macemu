@@ -111,6 +111,10 @@ void hook_code(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
 /* Error handling */
 const char* unicorn_get_error(UnicornCPU *cpu);
 
+/* Block statistics (for timing analysis) */
+void unicorn_print_block_stats(UnicornCPU *cpu);
+void unicorn_reset_block_stats(UnicornCPU *cpu);
+
 #ifdef __cplusplus
 }
 #endif

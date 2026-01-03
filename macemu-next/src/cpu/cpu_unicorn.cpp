@@ -280,6 +280,17 @@ static bool unicorn_backend_init(void) {
 	// Initialize CPU tracing from environment variable
 	cpu_trace_init();
 
+	// Register atexit handler to print block statistics on exit
+	static bool atexit_registered = false;
+	if (!atexit_registered) {
+		atexit([]() {
+			if (unicorn_cpu) {
+				unicorn_print_block_stats(unicorn_cpu);
+			}
+		});
+		atexit_registered = true;
+	}
+
 	// Register EmulOp handler via platform API
 	// EmulOps are handled by UC_HOOK_INSN_INVALID which checks g_platform handlers
 	g_platform.emulop_handler = unicorn_platform_emulop_handler;
@@ -325,6 +336,9 @@ static void unicorn_backend_reset(void) {
 
 static void unicorn_backend_destroy(void) {
 	if (unicorn_cpu) {
+		// Print block statistics before destroying
+		unicorn_print_block_stats(unicorn_cpu);
+
 		unicorn_destroy(unicorn_cpu);
 		unicorn_cpu = NULL;
 	}
