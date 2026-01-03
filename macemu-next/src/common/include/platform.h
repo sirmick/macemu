@@ -18,6 +18,9 @@
 extern "C" {
 #endif
 
+// Forward declarations
+struct M68kRegisters;
+
 /*
  *  Platform Structure - All driver function pointers
  */
@@ -152,6 +155,11 @@ typedef struct {
 
     // Interrupts
     void (*cpu_trigger_interrupt)(int level);
+
+    // 68k Trap Execution (for ROM patches and drivers)
+    // Executes a 68k trap with given register state, returns updated registers
+    // This allows ROM patches to call Mac OS traps without depending on specific CPU backend
+    void (*cpu_execute_68k_trap)(uint16_t trap, struct M68kRegisters *r);
 
     /*
      *  Memory System API (backend-independent)

@@ -31,6 +31,7 @@
 #include "readcpu.h"
 #include "newcpu.h"
 #include "compiler/compemu.h"
+#include "platform.h"  // For platform API (cpu_execute_68k_trap)
 
 
 // RAM and ROM pointers
@@ -188,10 +189,21 @@ void Start680x0_until_stopped(void)
 /*
  *  Execute MacOS 68k trap
  *  r->a[7] and r->sr are unused!
+ *
+ *  Now uses platform API to support multiple CPU backends (UAE, Unicorn, DualCPU)
  */
 
 void Execute68kTrap(uint16 trap, struct M68kRegisters *r)
 {
+	// Use platform API if available (supports Unicorn, DualCPU, etc.)
+	if (g_platform.cpu_execute_68k_trap) {
+		g_platform.cpu_execute_68k_trap(trap, r);
+		return;
+	}
+
+	// Fallback to UAE-specific implementation (should not reach here in normal operation)
+	fprintf(stderr, "[WARNING] Execute68kTrap: Platform API not available, using UAE fallback\n");
+
 	int i;
 
 	// Save old PC
